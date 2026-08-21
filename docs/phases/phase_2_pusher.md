@@ -23,8 +23,12 @@ MVP의 컨베이어 3 뒤에 푸셔 전용 컨베이어 4를 추가하고, prism
 - 품질 등급
 - 선택된 `pusher_id`
 - 해당 푸셔 위치 trigger
+- 푸셔 원점 복귀 확인
+- 동일 trigger 체류 중 중복 동작이 아닌 신규 동작 요청
 
 컨베이어 4 진입 trigger의 simulation time과 고정 속도로 예상 도착 시각을 계산하고, 푸셔 위치 trigger에서 최종 존재를 확인한다.
+
+구현 전에는 stroke, 전진·복귀 속도, 최대 force, plate 크기, home position tolerance, trigger 크기와 debounce 시간, 푸셔별 최소 동작 간격을 확정해야 한다. 분류 방향의 exit trigger로 사과가 실제 분류 영역에 진입했는지 확인하고, 체류 중 중복 동작과 jam을 별도 상태로 판정한다.
 
 ## 상태 흐름
 
@@ -42,6 +46,7 @@ WAITING
 - 원점 복귀가 확인되기 전에는 다음 사과의 푸셔 동작을 허용하지 않는다.
 - 미분류, `RECHECK`, timeout 및 놓친 사과는 라인 끝으로 통과시킨다.
 - 상자 용량과 상자 교체는 구현하지 않는다.
+- 시뮬레이션 로직 timeout은 `/clock`을 사용하고, 네트워크 노드 장애 감지는 wall time으로 분리한다.
 
 ## 통신
 
@@ -51,4 +56,4 @@ WAITING
 
 ## 미확정 사항
 
-푸셔의 stroke, 속도, 가속도, 힘과 치수는 사과의 질량·속도 및 컨베이어 폭을 반영한 동역학 시험 후 확정한다. 각 trigger의 크기와 위치, 세 번째 푸셔와 컨베이어 4 출구 사이 안전거리, 실제 분류 영역 진입 판정 방법도 레이아웃 검증 전까지 TBD로 둔다. 푸셔 실패·jam·ID mismatch 복구, 다중 사과 queue, `RECHECK` 사과의 보관 방식, 완료 기준과 반복 시험 횟수는 통합 시험 계획과 함께 결정한다.
+푸셔의 stroke, 전진·복귀 속도, 가속도, 최대 force, plate 크기와 home position tolerance는 사과의 질량·속도 및 컨베이어 폭을 반영한 동역학 시험 후 확정한다. 각 trigger의 크기·debounce·위치, 푸셔별 최소 동작 간격과 세 번째 푸셔에서 컨베이어 4 출구까지의 안전거리도 레이아웃 검증 전까지 TBD로 둔다. 푸셔 실패·jam·ID mismatch 복구, 다중 사과 queue, `RECHECK` 사과의 보관 방식, exit trigger 판정 기준, 완료 기준과 반복 시험 횟수는 통합 시험 계획과 함께 결정한다.

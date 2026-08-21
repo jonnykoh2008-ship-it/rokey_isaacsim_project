@@ -17,7 +17,7 @@
 - 검증 범위: 0.10~0.30m/s
 - 최종 속도는 회전 및 촬영 시험 후 확정한다.
 - encoder 및 belt-state는 사용하지 않는다.
-- 세 모듈 속도는 고정한다.
+- 세 모듈은 동일한 0.30m/s로 운전하며 한 실행 중에는 속도를 변경하지 않는다.
 
 모든 사과는 rigid body와 collider를 가지며 컨베이어 및 다른 사과와 충돌한다.
 
@@ -40,14 +40,20 @@
 - bounding box 검출과 `apple_id` tracker를 상시 수행
 - 검사 ROI 진입 시 프레임 수집 시작
 - ROI 이탈 시 최종 등급 확정
-- trigger collider는 검증 및 디버깅용으로 사용
+- 카메라 ROI는 품질검사 프레임 수집의 시작과 종료를 판단한다.
+- trigger collider는 컨베이어 진입·이탈 시각, 점유시간 및 공정 상태 전환을 측정하며 프레임 선택에는 직접 사용하지 않는다.
 - ID 유실·변경 시 `RECHECK`
 - ROI 통과 중 0.1초 간격으로 후보 프레임을 최대 12장 수집하고, 흔들림·blur·중복 시점을 제외해 대표 4~6장을 선택한다.
+- 대표 프레임은 사과 mask가 영상 경계에 닿지 않고, mask의 90% 이상이 검사 ROI 안에 있으며, 유효 depth 픽셀 비율이 80% 이상이고, Laplacian variance가 100 이상인 프레임 중에서 선택한다.
+- 이전 대표 프레임과 추정 회전 차이가 45° 미만인 후보는 제외한다. 90%, 80%, 100, 45°는 초기 시험값이며 시험 결과에 따라 조정한다.
+- 유효한 대표 프레임이 4장 미만이면 `INSUFFICIENT_VIEWS`로 처리한다.
 - 검사 결과에는 실제 사용한 `frame_index`를 기록한다.
-- 회전 합격 기준: 누적 360° 이상 또는 목표 관측 영역 확보
+- MVP 회전·관측 합격 기준은 유효 대표 프레임 4장 이상과 선택된 대표 프레임 사이의 추정 회전 차이 45° 이상이다.
+- 누적 회전량과 가시 표면 비율은 성능 검증값으로만 기록하고 MVP 필수 합격 조건에는 포함하지 않는다.
 - 롤러 mesh는 우선 시각적으로 회전
 - 이송은 collision surface의 surface velocity 사용
 - 회전은 마찰계수와 angular damping으로 유도
+- 사과 rigid body의 angular velocity를 simulation time으로 적분해 실제 회전량을 추정한다.
 - 회전 부족 시에만 검사 롤러에 revolute joint 적용
 - 0.30m/s 기준 목표 검사 시간은 약 1.3초다.
 
@@ -56,7 +62,7 @@
 - 형식: 평벨트
 - 사과 이동시간을 simulation time으로 측정
 - `apple_id`와 품질 결과의 연결 상태를 확인한다.
-- 정상 판정 및 `RECHECK`, 미분류, 놓친 사과는 라인 끝으로 배출한다.
+- 정상 판정 및 `TIMEOUT`, `LATE_RESULT`, `RECHECK`, `UNCLASSIFIED`, 놓친 사과는 라인 끝으로 배출한다.
 - MVP에서는 가상 푸셔, 실제 푸셔, prismatic joint 및 상자 분류를 모두 구현하지 않는다.
 - 컨베이어 2·3 진입은 trigger collider로 감지한다.
 
@@ -71,6 +77,7 @@
 - ROS wall time이 아닌 Isaac Sim simulation time을 사용한다.
 - 일시정지 시 모든 이송 timer도 정지한다.
 - 실제 이동시간을 시험으로 측정하고 이론값과 비교한다.
+- 품질 결과 deadline은 카메라 ROI 이탈 후 simulation time 0.5초다. deadline까지 결과가 없으면 `TIMEOUT`, 이후 도착하면 `LATE_RESULT`로 기록한다.
 
 ```text
 최소 투입 시간 간격 = max(
@@ -84,4 +91,4 @@
 
 ## 미확정 사항
 
-최종 이송 속도는 사과의 회전량과 대표 프레임 품질을 함께 시험한 뒤 확정한다. 또한 surface velocity 환경에서 사용할 마찰계수와 angular damping, 사과 간 충돌·정체·추월 처리 정책, 품질 결과 지연 시 컨베이어 3의 처리 방식, trigger 크기와 debounce 시간은 구현 시험 결과를 근거로 결정한다. 최소 투입 간격 계산에 필요한 수확시간 P95 산출 방법과 안전 여유시간도 실측 데이터가 확보될 때까지 TBD로 둔다.
+최종 이송 속도는 사과의 회전량과 대표 프레임 품질을 함께 시험한 뒤 확정한다. surface velocity 환경에서 사용할 마찰계수와 angular damping, 사과 간 충돌·정체·추월 처리 정책, trigger 크기와 debounce 시간도 구현 시험 결과를 근거로 결정한다. 최소 투입 간격 계산에 필요한 수확시간 P95 산출 방법과 안전 여유시간은 실측 데이터가 확보될 때까지 TBD로 둔다.

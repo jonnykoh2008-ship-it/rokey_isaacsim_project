@@ -49,10 +49,13 @@ GPU PC 2에서 개인 PC 2로 전달한다.
 - `diameter_mm`
 - `damage_area_cm2`
 - `frames_used`
+- `frame_indices`
 - `result_timestamp`
 - `status`: `VALID`, `RECHECK`, `UNCLASSIFIED`, `TIMEOUT`, `LATE_RESULT`, `ID_MISMATCH`, `INSUFFICIENT_VIEWS`
 
 정확한 모델 출력과 custom message 정의는 TBD다.
+
+카메라 ROI 이탈 후 simulation time 0.5초를 결과 deadline으로 사용한다. deadline까지 결과가 없으면 `TIMEOUT`, 이후 도착한 결과는 `LATE_RESULT`로 기록한다. 컨베이어 2의 tracker ID와 컨베이어 3 trigger의 rigid body prim이 일치하지 않으면 `ID_MISMATCH`로 처리한다.
 
 ## SortCommand
 
