@@ -15,4 +15,3 @@
 - Use Isaac Sim simulation time through `/clock`; all ROS 2 nodes use `use_sim_time:=true`.
 - Preserve the distinction between feature specifications (`docs/features`) and delivery phases (`docs/phases`). Phase documents reference feature documents rather than duplicating them.
 - Unresolved requirements must be written as `TBD`; do not invent final values without user approval.
-

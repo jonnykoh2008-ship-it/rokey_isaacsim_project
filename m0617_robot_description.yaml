@@ -1,0 +1,69 @@
+# M0617 Lula robot description
+#
+# 이 파일은 Lula IK가 M0617의 6개 팔 관절만 계산하도록 정의한다.
+# 3F 그리퍼의 11개 관절은 apple_pick.py에서 별도로 제어한다.
+
+api_version: 1.0
+
+cspace:
+    - joint_1
+    - joint_2
+    - joint_3
+    - joint_4
+    - joint_5
+    - joint_6
+
+root_link: base_link
+
+# IK가 여러 해를 찾을 때 사용하는 기준 자세이다.
+default_q: [0.0, -1.5708, 1.5708, 0.0, 1.5708, 0.0]
+
+acceleration_limits: [4.0, 4.0, 5.0, 8.0, 8.0, 8.0]
+jerk_limits: [2000.0, 2000.0, 2500.0, 4000.0, 4000.0, 4000.0]
+
+# 현재 코드는 Lula IK만 사용한다. 아래 구는 향후 RMPflow를 추가할 때
+# 팔 자체의 대략적인 충돌 형상으로도 사용할 수 있도록 보수적으로 배치했다.
+collision_spheres:
+    - base_link:
+        - "center": [0.0, 0.0, 0.08]
+          "radius": 0.11
+
+    - link_1:
+        - "center": [0.0, 0.0, 0.03]
+          "radius": 0.10
+
+    - link_2:
+        - "center": [0.10, 0.00, 0.04]
+          "radius": 0.09
+        - "center": [0.28, 0.00, 0.08]
+          "radius": 0.085
+        - "center": [0.46, 0.00, 0.11]
+          "radius": 0.08
+        - "center": [0.64, 0.00, 0.14]
+          "radius": 0.075
+        - "center": [0.80, 0.00, 0.16]
+          "radius": 0.07
+
+    - link_3:
+        - "center": [0.0, 0.0, 0.04]
+          "radius": 0.09
+
+    - link_4:
+        - "center": [0.0, 0.10, -0.08]
+          "radius": 0.085
+        - "center": [0.0, 0.25, -0.16]
+          "radius": 0.08
+        - "center": [0.0, 0.40, -0.24]
+          "radius": 0.075
+        - "center": [0.0, 0.55, -0.31]
+          "radius": 0.07
+        - "center": [0.0, 0.68, -0.36]
+          "radius": 0.065
+
+    - link_5:
+        - "center": [0.0, 0.00, 0.03]
+          "radius": 0.07
+
+    - link_6:
+        - "center": [0.0, 0.00, -0.03]
+          "radius": 0.06
