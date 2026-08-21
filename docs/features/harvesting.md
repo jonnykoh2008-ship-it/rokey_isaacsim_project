@@ -21,6 +21,7 @@ TARGET_RECEIVED
   → STEM_BREAK_CHECK
   → TRANSPORT
   → PLACE_ON_CONVEYOR
+  → RELEASE
   → RETRACT
 ```
 
@@ -50,7 +51,7 @@ TARGET_RECEIVED
 5. 당김 기본 속도는 50mm/s다.
 6. 최대 당김 거리는 100mm다.
 7. timeout은 simulation time 기준 3초다.
-8. stem joint가 break되면 수확 성공으로 판정한다.
+8. `PULL` 단계는 stem joint가 break된 것까지 확인해야 성공으로 판정한다.
 
 Stem joint:
 
@@ -62,13 +63,25 @@ Stem joint:
 ## 컨베이어 배치
 
 - 컨베이어 1 상면 30mm 이하까지 사과를 낮춘다.
+- `PLACE`는 목표 pose까지 이동만 수행한다.
+- `RELEASE`는 현재 pose를 유지하고 그리퍼만 개방한다.
 - 사과를 높은 곳에서 떨어뜨리지 않고 벨트에 거의 닿은 상태에서 그리퍼를 연다.
 - 중심선 기준 좌우 배치 오차 목표는 ±30mm다.
+
+## 모션 실행 규칙
+
+- `GRASP`와 `RELEASE` Goal의 `target_pose`는 Goal 전송 시점의 현재 pose로 채운다.
+- `GRASP`는 현재 pose를 유지하고 그리퍼만 폐합한다.
+- 각 단계의 기본 timeout은 `/clock` 기준 simulation time 3초다.
+- 모션 Action 실행 중에는 새 Goal을 받지 않고 cancel만 허용한다.
+- Feedback의 `progress`는 `0.0`에서 `1.0` 범위를 사용한다.
+- 성공 Result의 `error_code`는 빈 문자열이다.
+- 실행 중 실패하면 로봇 동작을 즉시 멈추고 실패 Result를 반환한다. 실패 후 자동 후퇴는 수행하지 않는다.
 
 ## 실패 처리
 
 - IK/경로 실패: 정지 후 실패 상태 보고
-- 예상치 못한 충돌: 정지 또는 안전 후퇴
+- 예상치 못한 충돌: 즉시 정지 후 실패 상태 보고
 - stem 미분리: timeout 후 실패
+- Action cancel: 즉시 정지 후 cancel 결과 보고
 - 사과가 작업영역 밖으로 이탈: 비활성화
-
