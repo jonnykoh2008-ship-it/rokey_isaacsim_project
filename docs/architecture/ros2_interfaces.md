@@ -50,13 +50,13 @@ GPU PC 2에서 개인 PC 2로 전달한다.
 - `damage_area_cm2`
 - `frames_used`
 - `result_timestamp`
-- `status`: `VALID`, `RECHECK`, `UNCLASSIFIED`, `TIMEOUT`, `ID_MISMATCH`, `INSUFFICIENT_VIEWS`
+- `status`: `VALID`, `RECHECK`, `UNCLASSIFIED`, `TIMEOUT`, `LATE_RESULT`, `ID_MISMATCH`, `INSUFFICIENT_VIEWS`
 
 정확한 모델 출력과 custom message 정의는 TBD다.
 
 ## SortCommand
 
-개인 PC 2에서 GPU PC 1로 전달한다. 실제 푸셔 제어는 2차 개발부터 사용한다.
+개인 PC 2에서 GPU PC 1로 전달한다. MVP에서는 사용하지 않으며, 2차 개발의 컨베이어 4 실제 푸셔 제어부터 사용한다.
 
 필수 후보 필드:
 
@@ -75,4 +75,3 @@ GPU PC 2에서 개인 PC 2로 전달한다.
 - `trigger_id`
 - `ENTER` 또는 `EXIT`
 - simulation timestamp
-

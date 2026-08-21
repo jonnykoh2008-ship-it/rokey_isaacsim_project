@@ -15,7 +15,7 @@
 - LulaKinematicsSolver에서 사용할 robot description과 URDF/USD 관절 이름을 일치시킨다.
 - 장착 어댑터 asset은 만들지 않는다.
 
-## AGS-001-MTCP 그리퍼
+## Robotiq AGS-001-MTCP 그리퍼
 
 - 방식: 3-finger soft gripper
 - 시뮬레이션: rigid finger + compliant contact 근사
@@ -70,7 +70,8 @@
 
 ## 컨베이어
 
-- 총 3모듈, 각 0.5m
+- MVP는 총 3모듈, 각 0.5m로 구성해 전체 길이 1.5m로 한다.
+- 2차 개발에서는 푸셔 전용 컨베이어 4를 추가해 총 4모듈, 전체 길이 2.0m로 확장한다.
+- 푸셔 3개는 모두 컨베이어 4에 배치한다.
 - collider와 surface velocity를 이용해 사과를 이송한다.
 - 롤러는 우선 시각적으로 회전시키며 필요할 때만 revolute joint를 적용한다.
-
