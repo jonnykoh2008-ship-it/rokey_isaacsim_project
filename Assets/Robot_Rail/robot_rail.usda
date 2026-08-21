@@ -1,0 +1,238 @@
+#usda 1.0
+(
+    defaultPrim = "RobotRail"
+    metersPerUnit = 1
+    subLayers = [
+        @./robot_rail_collision.usda@
+    ]
+    upAxis = "Z"
+)
+
+def Xform "RobotRail"
+{
+    def Scope "Looks"
+    {
+        def Material "Aluminum"
+        {
+            token outputs:surface.connect = </RobotRail/Looks/Aluminum/PBR.outputs:surface>
+            def Shader "PBR"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.62, 0.65, 0.68)
+                float inputs:metallic = 0.78
+                float inputs:roughness = 0.28
+                token outputs:surface
+            }
+        }
+        def Material "DarkMetal"
+        {
+            token outputs:surface.connect = </RobotRail/Looks/DarkMetal/PBR.outputs:surface>
+            def Shader "PBR"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.055, 0.065, 0.075)
+                float inputs:metallic = 0.55
+                float inputs:roughness = 0.32
+                token outputs:surface
+            }
+        }
+        def Material "Rubber"
+        {
+            token outputs:surface.connect = </RobotRail/Looks/Rubber/PBR.outputs:surface>
+            def Shader "PBR"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.025, 0.025, 0.025)
+                float inputs:metallic = 0.0
+                float inputs:roughness = 0.72
+                token outputs:surface
+            }
+        }
+    }
+
+    def Xform "RailBase"
+    {
+        def Cube "MainBeam"
+        {
+            double size = 1
+            double3 xformOp:scale = (3.0, 0.32, 0.24)
+            double3 xformOp:translate = (0, 0, 0.18)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Aluminum>
+        }
+        def Cube "TopDeck"
+        {
+            double size = 1
+            double3 xformOp:scale = (3.0, 0.46, 0.04)
+            double3 xformOp:translate = (0, 0, 0.32)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Aluminum>
+        }
+        def Cube "GuideLeft"
+        {
+            double size = 1
+            double3 xformOp:scale = (2.88, 0.035, 0.035)
+            double3 xformOp:translate = (0, 0.17, 0.355)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/DarkMetal>
+        }
+        def Cube "GuideRight"
+        {
+            double size = 1
+            double3 xformOp:scale = (2.88, 0.035, 0.035)
+            double3 xformOp:translate = (0, -0.17, 0.355)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/DarkMetal>
+        }
+        def Cube "EndPlateFront"
+        {
+            double size = 1
+            double3 xformOp:scale = (0.055, 0.48, 0.32)
+            double3 xformOp:translate = (-1.51, 0, 0.20)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Aluminum>
+        }
+        def Cube "EndPlateRear"
+        {
+            double size = 1
+            double3 xformOp:scale = (0.055, 0.48, 0.32)
+            double3 xformOp:translate = (1.51, 0, 0.20)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Aluminum>
+        }
+
+        def Xform "Feet"
+        {
+            def Cube "CrossbarA" { double size = 1
+                double3 xformOp:scale = (0.16, 0.82, 0.07)
+                double3 xformOp:translate = (-1.18, 0, 0.07)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Aluminum> }
+            def Cube "CrossbarB" { double size = 1
+                double3 xformOp:scale = (0.16, 0.82, 0.07)
+                double3 xformOp:translate = (0, 0, 0.07)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Aluminum> }
+            def Cube "CrossbarC" { double size = 1
+                double3 xformOp:scale = (0.16, 0.82, 0.07)
+                double3 xformOp:translate = (1.18, 0, 0.07)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Aluminum> }
+            def Cube "PadA1" { double size = 1
+                double3 xformOp:scale = (0.25, 0.20, 0.035)
+                double3 xformOp:translate = (-1.18, -0.37, 0.02)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Rubber> }
+            def Cube "PadA2" { double size = 1
+                double3 xformOp:scale = (0.25, 0.20, 0.035)
+                double3 xformOp:translate = (-1.18, 0.37, 0.02)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Rubber> }
+            def Cube "PadB1" { double size = 1
+                double3 xformOp:scale = (0.25, 0.20, 0.035)
+                double3 xformOp:translate = (0, -0.37, 0.02)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Rubber> }
+            def Cube "PadB2" { double size = 1
+                double3 xformOp:scale = (0.25, 0.20, 0.035)
+                double3 xformOp:translate = (0, 0.37, 0.02)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Rubber> }
+            def Cube "PadC1" { double size = 1
+                double3 xformOp:scale = (0.25, 0.20, 0.035)
+                double3 xformOp:translate = (1.18, -0.37, 0.02)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Rubber> }
+            def Cube "PadC2" { double size = 1
+                double3 xformOp:scale = (0.25, 0.20, 0.035)
+                double3 xformOp:translate = (1.18, 0.37, 0.02)
+                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+                rel material:binding = </RobotRail/Looks/Rubber> }
+        }
+
+        def Cube "MotorHousing"
+        {
+            double size = 1
+            double3 xformOp:scale = (0.27, 0.30, 0.26)
+            double3 xformOp:translate = (1.58, 0, 0.22)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/DarkMetal>
+        }
+    }
+
+    def Xform "Carriage"
+    {
+        double3 xformOp:translate = (-1.25, 0, 0.37)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Cube "SliderBody"
+        {
+            double size = 1
+            double3 xformOp:scale = (0.50, 0.55, 0.10)
+            double3 xformOp:translate = (0, 0, 0.05)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Aluminum>
+        }
+        def Cube "RobotMountPlate"
+        {
+            double size = 1
+            double3 xformOp:scale = (0.46, 0.46, 0.035)
+            double3 xformOp:translate = (0, 0, 0.1175)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/DarkMetal>
+        }
+    }
+
+    def Xform "CableChain"
+    {
+        def Cube "Link00" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-1.20, -0.39, 0.34)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link01" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-1.08, -0.39, 0.30)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link02" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-0.96, -0.39, 0.25)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link03" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-0.84, -0.39, 0.20)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link04" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-0.72, -0.39, 0.17)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link05" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-0.60, -0.39, 0.16)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link06" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-0.48, -0.39, 0.16)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link07" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-0.36, -0.39, 0.16)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link08" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-0.24, -0.39, 0.16)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+        def Cube "Link09" { double size = 1
+            double3 xformOp:scale = (0.12, 0.10, 0.075)
+            double3 xformOp:translate = (-0.12, -0.39, 0.16)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+            rel material:binding = </RobotRail/Looks/Rubber> }
+    }
+}

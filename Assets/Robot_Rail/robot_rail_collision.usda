@@ -1,0 +1,81 @@
+#usda 1.0
+(
+    defaultPrim = "RobotRail"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+over Xform "RobotRail" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI"]
+)
+{
+    over Xform "RailBase"
+    {
+        def Cube "RailCollision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            double3 xformOp:scale = (3.0, 0.46, 0.33)
+            double3 xformOp:translate = (0, 0, 0.165)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+        def Cube "FootCollisionA" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            double3 xformOp:scale = (0.25, 0.92, 0.105)
+            double3 xformOp:translate = (-1.18, 0, 0.0525)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+        def Cube "FootCollisionB" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            double3 xformOp:scale = (0.25, 0.92, 0.105)
+            double3 xformOp:translate = (0, 0, 0.0525)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+        def Cube "FootCollisionC" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            double3 xformOp:scale = (0.25, 0.92, 0.105)
+            double3 xformOp:translate = (1.18, 0, 0.0525)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    over Xform "Carriage" (
+        prepend apiSchemas = ["PhysicsMassAPI", "PhysicsRigidBodyAPI"]
+    )
+    {
+        float physics:mass = 35
+        point3f physics:centerOfMass = (0, 0, 0.06)
+        float3 physics:diagonalInertia = (0.990, 0.747, 1.547)
+        def Cube "CarriageCollision" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double size = 1
+            double3 xformOp:scale = (0.50, 0.55, 0.135)
+            double3 xformOp:translate = (0, 0, 0.0675)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+        }
+    }
+
+    def PhysicsPrismaticJoint "RailJoint"
+    {
+        uniform token physics:axis = "X"
+        rel physics:body1 = </RobotRail/Carriage>
+        float physics:lowerLimit = 0
+        point3f physics:localPos0 = (-1.25, 0, 0.37)
+        point3f physics:localPos1 = (0, 0, 0)
+        quatf physics:localRot0 = (1, 0, 0, 0)
+        quatf physics:localRot1 = (1, 0, 0, 0)
+        float physics:upperLimit = 2.5
+    }
+}
