@@ -1,0 +1,17 @@
+uint8 APPROACH=1
+uint8 GRASP=2
+uint8 TWIST=3
+uint8 PULL=4
+uint8 TRANSPORT=5
+uint8 PLACE=6
+uint8 RETRACT=7
+
+uint8 motion_type
+geometry_msgs/PoseStamped target_pose
+---
+bool success
+string error_code
+string message
+---
+string current_state
+float32 progress
