@@ -77,7 +77,11 @@ URDF_PATH = (
     / "m0617.urdf"
 )
 
+ARTICULATION_PRIM_PATH = "/World/m0617_rail"
+ARTICULATION_ROOT_JOINT_PATH = "/World/m0617_rail/root_joint"
+ROBOT_MOUNT_JOINT_PATH = "/World/FixedJoint"
 ROBOT_PRIM_PATH = "/World/m0617"
+ROBOT_BASE_PATH = "/World/m0617/base_link"
 LINK6_PATH = "/World/m0617/link_6"
 GRIPPER_ROOT_PATH = "/World/m0617/robotiq_3f_gripper_articulated"
 PALM_PATH = "/World/m0617/robotiq_3f_gripper_articulated/palm"
@@ -87,6 +91,7 @@ CONVEYOR_PATH = "/World/ConveyorBelt_A08_PR_NVD_01"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
 
 EE_FRAME_NAME = "link_6"
+RAIL_JOINT = "rail_joint"
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
 
 
@@ -94,7 +99,7 @@ ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
 # 사과 분리와 이동 조건
 # ══════════════════════════════════════════════════════════════
 BREAK_FORCE_N = 15.0
-BREAK_TORQUE_NM = 0.6
+BREAK_TORQUE_NM = 1.0
 
 # 파지 중심은 Palm 로컬 +Y 방향 약 12.5 cm 지점이다.
 # 세 distal link 원점의 배치를 기준으로 한 고정 TCP 근사값이다.
@@ -266,6 +271,17 @@ def gf_quat_to_numpy(quaternion):
     )
 
 
+def get_prim_world_pose(stage, prim_path):
+    """USD Prim의 현재 월드 위치와 회전을 Isaac 형식으로 반환한다."""
+    transform = UsdGeom.XformCache(Usd.TimeCode.Default()).GetLocalToWorldTransform(
+        require_prim(stage, prim_path)
+    )
+    return (
+        np.asarray(transform.ExtractTranslation(), dtype=float),
+        gf_quat_to_numpy(transform.ExtractRotationQuat()),
+    )
+
+
 # ══════════════════════════════════════════════════════════════
 # Stage 검사와 물리 설정
 # ══════════════════════════════════════════════════════════════
@@ -274,6 +290,33 @@ def require_prim(stage, prim_path):
     if not prim.IsValid():
         raise RuntimeError(f"필수 Prim을 찾을 수 없습니다: {prim_path}")
     return prim
+
+
+def validate_articulation_setup(stage):
+    """레일과 M0617이 하나의 Articulation으로 연결됐는지 검사한다."""
+    root_prim = require_prim(stage, ARTICULATION_ROOT_JOINT_PATH)
+    if not root_prim.HasAPI(UsdPhysics.ArticulationRootAPI):
+        raise RuntimeError(
+            f"Articulation Root API가 없습니다: {ARTICULATION_ROOT_JOINT_PATH}"
+        )
+
+    root_joint = UsdPhysics.Joint(root_prim)
+    if not root_joint.GetJointEnabledAttr().Get():
+        raise RuntimeError(
+            f"Articulation Root Joint가 비활성화되었습니다: "
+            f"{ARTICULATION_ROOT_JOINT_PATH}"
+        )
+
+    mount_joint = UsdPhysics.Joint(require_prim(stage, ROBOT_MOUNT_JOINT_PATH))
+    body0 = [str(path) for path in mount_joint.GetBody0Rel().GetTargets()]
+    body1 = [str(path) for path in mount_joint.GetBody1Rel().GetTargets()]
+    expected0 = ["/World/m0617_rail/rail_robot_mount_link"]
+    expected1 = [ROBOT_BASE_PATH]
+    if body0 != expected0 or body1 != expected1:
+        raise RuntimeError(
+            "레일-M0617 FixedJoint 대상이 예상과 다릅니다: "
+            f"Body0={body0}, Body1={body1}"
+        )
 
 
 def open_project_stage():
@@ -290,7 +333,10 @@ def open_project_stage():
 
     stage = omni.usd.get_context().get_stage()
     for prim_path in (
+        ARTICULATION_PRIM_PATH,
+        ARTICULATION_ROOT_JOINT_PATH,
         ROBOT_PRIM_PATH,
+        ROBOT_BASE_PATH,
         LINK6_PATH,
         PALM_PATH,
         APPLE_PATH,
@@ -298,6 +344,8 @@ def open_project_stage():
         CONVEYOR_PATH,
     ):
         require_prim(stage, prim_path)
+
+    validate_articulation_setup(stage)
 
     meters_per_unit = UsdGeom.GetStageMetersPerUnit(stage)
     if not np.isclose(meters_per_unit, 1.0):
@@ -915,10 +963,10 @@ class AppleHarvestFSM:
 # 로봇과 IK 초기화
 # ══════════════════════════════════════════════════════════════
 def create_robot(world):
-    """기존 Stage의 M0617 전체 Articulation을 Python 객체로 등록한다."""
+    """레일, M0617, 3F 그리퍼로 연결된 단일 Articulation을 등록한다."""
     robot = world.scene.add(
         SingleManipulator(
-            prim_path=ROBOT_PRIM_PATH,
+            prim_path=ARTICULATION_PRIM_PATH,
             end_effector_prim_path=PALM_PATH,
             name="m0617_3f_robot",
             gripper=None,
@@ -929,24 +977,34 @@ def create_robot(world):
     # 중복 생성되어 non-root link 관련 경고가 발생할 수 있다.
     world.reset()
 
-    missing = [name for name in ARM_JOINTS + GRIPPER_JOINTS if name not in robot.dof_names]
+    required_joints = [RAIL_JOINT] + ARM_JOINTS + GRIPPER_JOINTS
+    missing = [name for name in required_joints if name not in robot.dof_names]
     if missing:
         raise RuntimeError(f"Articulation에서 관절을 찾을 수 없습니다: {missing}")
 
     print(f"   Articulation {robot.num_dof} DOF")
     for index, name in enumerate(robot.dof_names):
-        group = "arm" if name in ARM_JOINTS else "3f"
+        if name == RAIL_JOINT:
+            group = "rail"
+        elif name in ARM_JOINTS:
+            group = "arm"
+        elif name in GRIPPER_JOINTS:
+            group = "3f"
+        else:
+            group = "other"
         print(f"      [{index:2d}] {name:28s} {group}")
     return robot
 
 
-def create_ik_solver(robot):
+def create_ik_solver(robot, stage):
     """M0617 6축만 제어하는 Lula IK를 만든다."""
     lula = LulaKinematicsSolver(
         robot_description_path=str(DESCRIPTION_PATH),
         urdf_path=str(URDF_PATH),
     )
-    base_position, base_orientation = robot.get_world_pose()
+    # Articulation의 루트는 레일이므로 robot.get_world_pose()를 쓰면 Lula의
+    # 기준이 레일 원점으로 잘못 설정된다. 실제 M0617 base_link pose를 쓴다.
+    base_position, base_orientation = get_prim_world_pose(stage, ROBOT_BASE_PATH)
     lula.set_robot_base_pose(
         robot_position=np.asarray(base_position),
         robot_orientation=np.asarray(base_orientation),
@@ -1224,9 +1282,9 @@ def run_harvest_cycle(
     반드시 ``world.reset()``으로 PhysX handle을 다시 만든 뒤 이 함수를 새로
     호출해야 한다.
     """
-    ik_solver, lula_solver = create_ik_solver(robot)
+    ik_solver, lula_solver = create_ik_solver(robot, stage)
 
-    robot_position, _robot_orientation = robot.get_world_pose()
+    robot_position, _robot_orientation = get_prim_world_pose(stage, ROBOT_BASE_PATH)
     approach_rotation, approach_direction = make_approach_rotation(
         robot_position,
         apple_center,
@@ -1462,12 +1520,8 @@ def main():
     configure_joint_drives(stage)
     apple_center, apple_size = compute_apple_center(stage)
     link6_to_palm_translation, link6_to_palm_rotation = compute_link6_to_palm(stage)
-    stage_xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
-    robot_stage_position = np.array(
-        stage_xform_cache.GetLocalToWorldTransform(
-            require_prim(stage, ROBOT_PRIM_PATH)
-        ).ExtractTranslation(),
-        dtype=float,
+    robot_stage_position, _robot_stage_orientation = get_prim_world_pose(
+        stage, ROBOT_BASE_PATH
     )
     conveyor_start, conveyor_outside, conveyor_top_z, conveyor_direction = (
         compute_conveyor_start(stage, robot_stage_position, apple_size)
