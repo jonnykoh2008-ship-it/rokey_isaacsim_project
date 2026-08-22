@@ -166,6 +166,12 @@ class PendingGoal:
     result: object = None
 
 
+class MotionExecutionError(RuntimeError):
+    def __init__(self, error_code, message):
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class RobotMotionNode(Node):
     """ROS callback에서는 요청만 보관하고 Isaac API는 메인 스레드만 사용한다."""
 
@@ -212,6 +218,32 @@ class MotionEngine:
         self.conveyor = harvest.compute_conveyor_start(stage, robot_position, apple_size)
         self.expected_index = 0
         self.fsm = None
+        self.joint_break = harvest.JointBreakMonitor()
+        self.stem_joint_disarmed = False
+
+    def close(self):
+        if self.stem_joint_disarmed:
+            self._set_stem_joint_armed(True, "ENGINE CLOSE")
+        self.joint_break.close()
+
+    def _set_stem_joint_armed(self, armed, reason):
+        """파지 완료 전 접촉 충격으로 줄기가 끊어지지 않게 한다."""
+        joint_prim = harvest.require_prim(self.stage, harvest.FIXED_JOINT_PATH)
+        joint = harvest.UsdPhysics.Joint(joint_prim)
+        if armed:
+            break_force, break_torque = harvest.configured_break_limits()
+            state = "ARMED"
+        else:
+            maximum = float(harvest.np.finfo(harvest.np.float32).max)
+            break_force, break_torque = maximum, maximum
+            state = "DISARMED"
+        joint.GetBreakForceAttr().Set(break_force)
+        joint.GetBreakTorqueAttr().Set(break_torque)
+        self.stem_joint_disarmed = not armed
+        print(
+            f"   Apple joint  {state} FOR {reason}: "
+            f"force {break_force:.3g} N, torque {break_torque:.3g} N·m"
+        )
 
     @staticmethod
     def result(success, code="", message=""):
@@ -223,6 +255,28 @@ class MotionEngine:
         value = RobotMotion.Feedback()
         value.current_state, value.progress = state, float(progress)
         handle.publish_feedback(value)
+
+    def _require_arm_joint_positions(self):
+        """Lula에 전달할 현재 팔 관절값과 Articulation handle을 검증한다."""
+        joints = self.ik.get_joints_subset()
+        if not joints.is_initialized:
+            raise RuntimeError(
+                "로봇 Articulation handle이 초기화되지 않았습니다. "
+                "Isaac Sim Timeline Stop 이후에는 물리 재초기화가 필요합니다."
+            )
+        positions = joints.get_joint_positions()
+        if positions is None:
+            raise RuntimeError("로봇 팔 관절 위치를 읽지 못했습니다.")
+        positions = harvest.np.asarray(positions, dtype=float)
+        expected_shape = (len(harvest.ARM_JOINTS),)
+        if positions.shape != expected_shape:
+            raise RuntimeError(
+                f"로봇 팔 관절 배열 크기가 잘못되었습니다: "
+                f"{positions.shape}, expected={expected_shape}"
+            )
+        if not harvest.np.all(harvest.np.isfinite(positions)):
+            raise RuntimeError("로봇 팔 관절 위치에 NaN 또는 Inf가 있습니다.")
+        return positions
 
     def execute(self, handle):
         request = handle.request
@@ -236,11 +290,40 @@ class MotionEngine:
             if request.motion_type == RobotMotion.Goal.APPROACH:
                 self._approach(handle, request.target_pose)
             else:
+                if request.motion_type == RobotMotion.Goal.GRASP:
+                    self._set_stem_joint_armed(False, "GRASP")
+                elif request.motion_type == RobotMotion.Goal.PULL:
+                    # 임계값 복원 직후 파손되더라도 PULL 중 정상 분리로
+                    # 기록되도록 물리 스텝 전에 모니터 상태를 전환한다.
+                    self.joint_break.set_state("PULL")
+                    self._set_stem_joint_armed(True, "PULL")
                 self._run_fsm(handle, STOP_STATE[request.motion_type])
+                if request.motion_type == RobotMotion.Goal.GRASP:
+                    self._report_grasp_state()
+                if (
+                    request.motion_type == RobotMotion.Goal.PULL
+                    and not self.joint_break.broken
+                ):
+                    raise MotionExecutionError(
+                        "STEM_NOT_BROKEN",
+                        "PULL 완료 시점까지 사과 FixedJoint가 분리되지 않았습니다.",
+                    )
+        except MotionExecutionError as error:
+            if self.stem_joint_disarmed:
+                self.joint_break.set_state("FAILED")
+                self._set_stem_joint_armed(True, "FAILED GOAL")
+            handle.abort()
+            return self.result(False, error.error_code, str(error))
         except Exception as error:
+            if self.stem_joint_disarmed:
+                self.joint_break.set_state("FAILED")
+                self._set_stem_joint_armed(True, "FAILED GOAL")
             handle.abort()
             return self.result(False, "MOTION_FAILED", str(error))
         if handle.is_cancel_requested:
+            if self.stem_joint_disarmed:
+                self.joint_break.set_state("CANCELED")
+                self._set_stem_joint_armed(True, "CANCELED GOAL")
             handle.canceled()
             return self.result(False, "CANCELED", "사용자가 동작을 취소했습니다.")
         self.expected_index += 1
@@ -259,7 +342,7 @@ class MotionEngine:
             pregrasp, rotation, center, rotation, direction, *self.conveyor,
             start_at_pregrasp=True,
         )
-        initial = harvest.np.asarray(self.ik.get_joints_subset().get_joint_positions())
+        initial = self._require_arm_joint_positions()
         if not harvest.validate_planned_ik(
             planned, self.lula, initial, pregrasp, rotation, self.link_t, self.link_r
         ):
@@ -278,6 +361,32 @@ class MotionEngine:
         )
         self.feedback(handle, "APPROACH", 1.0)
 
+    def _report_grasp_state(self):
+        actual_gripper = harvest.np.asarray(
+            self.robot.get_joint_positions(
+                joint_indices=harvest.np.asarray(
+                    self.gripper_indices, dtype=harvest.np.int32
+                )
+            ),
+            dtype=float,
+        )
+        tcp, _rotation = harvest.current_tcp_pose(self.robot)
+        apple = harvest.compute_live_prim_center(self.stage, harvest.APPLE_PATH)
+        distance = float(harvest.np.linalg.norm(apple - tcp))
+        max_target_error = float(
+            harvest.np.max(harvest.np.abs(harvest.GRIPPER_CLOSED - actual_gripper))
+        )
+        print(
+            f"   [GRASP CHECK] TCP-apple={distance:.4f} m, "
+            f"gripper max target error={max_target_error:.4f} rad, "
+            f"joint_broken={self.joint_break.broken}"
+        )
+        if self.joint_break.broken:
+            raise MotionExecutionError(
+                "GRASP_FAILED",
+                f"사과 FixedJoint가 {self.joint_break.break_state} 중 조기 파손됐습니다.",
+            )
+
     def _run_fsm(self, handle, stop_state):
         if self.fsm is None:
             raise RuntimeError("APPROACH가 먼저 완료되지 않았습니다.")
@@ -285,6 +394,9 @@ class MotionEngine:
         while not self.fsm.done and self.fsm.NAMES[self.fsm.state] != stop_state:
             if handle.is_cancel_requested:
                 return
+            self._require_arm_joint_positions()
+            motion_state = self.fsm.NAMES[self.fsm.state]
+            self.joint_break.set_state(motion_state)
             target, rotation, grip = self.fsm.sample()
             link_position, link_orientation = harvest.tcp_target_to_link6(
                 target, rotation, self.link_t, self.link_r
@@ -309,6 +421,11 @@ class MotionEngine:
             state = self.fsm.NAMES[min(self.fsm.state, len(self.fsm.NAMES) - 1)]
             self.feedback(handle, state, 0.5)
             self.world.step(render=not harvest.args.headless)
+            if self.joint_break.broken and self.joint_break.break_state != "PULL":
+                raise MotionExecutionError(
+                    "GRASP_FAILED",
+                    f"사과 FixedJoint가 {self.joint_break.break_state} 중 조기 파손됐습니다.",
+                )
         self.feedback(handle, stop_state, 1.0)
 
 
@@ -330,20 +447,30 @@ def main():
     executor.add_node(node)
     ros_thread = threading.Thread(target=executor.spin, daemon=True)
     ros_thread.start()
-    world.play()
     try:
+        world.play()
         while harvest.simulation_app.is_running():
             try:
                 pending = node.requests.get_nowait()
             except queue.Empty:
                 world.step(render=not harvest.args.headless)
                 continue
+            if world.is_stopped() or not robot.handles_initialized:
+                node.get_logger().warning(
+                    "Articulation handle이 해제되어 물리와 MotionEngine을 재초기화합니다."
+                )
+                engine.close()
+                world.reset()
+                engine = MotionEngine(world, robot, stage)
+                world.play()
             pending.result = engine.execute(pending.handle)
             pending.finished.set()
     finally:
+        engine.close()
         executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
         world.stop()
         harvest.simulation_app.close()
 

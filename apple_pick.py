@@ -15,7 +15,7 @@ M0617 + Robotiq 3F 그리퍼 사과 수확 동작
 
 중요:
     * 이 코드는 기존 USD/URDF를 저장하거나 수정하지 않는다.
-    * FixedJoint의 파손 한계 15 N / 0.6 N·m는 실행 중인 Stage에만 적용한다.
+    * FixedJoint의 파손 한계는 실행 중인 Stage에만 적용한다.
     * 15 N은 당기는 명령값이 아니라 Joint가 끊어지는 반력 한계다.
     * GUI에서 Stop 후 Play를 누르면 물리와 IK를 초기화하고 처음부터 재실행한다.
 """
@@ -38,6 +38,21 @@ parser.add_argument(
     default=0,
     help="0이면 창을 닫을 때까지 실행, 양수이면 지정한 물리 스텝 뒤 종료",
 )
+parser.add_argument(
+    "--break-test",
+    choices=("both", "force", "torque"),
+    default="both",
+    help=(
+        "FixedJoint 파손 진단: both=15N/지정 torque, "
+        "force=15N/최대 torque, torque=최대 force/지정 torque"
+    ),
+)
+parser.add_argument(
+    "--break-torque-nm",
+    type=float,
+    default=1.0,
+    help="torque/both 진단 모드의 break torque (기본값: 1.0 N·m)",
+)
 args, _unknown = parser.parse_known_args()
 
 simulation_app = SimulationApp(
@@ -49,8 +64,10 @@ simulation_app = SimulationApp(
     }
 )
 
+import omni.physx
 import omni.usd
-from pxr import Gf, Usd, UsdGeom, UsdPhysics
+from omni.physx.bindings._physx import SimulationEvent
+from pxr import Gf, PhysicsSchemaTools, Usd, UsdGeom, UsdPhysics
 
 from isaacsim.core.api import World
 from isaacsim.core.utils.rotations import quat_to_rot_matrix, rot_matrix_to_quat
@@ -79,6 +96,7 @@ URDF_PATH = (
 
 ARTICULATION_PRIM_PATH = "/World/Xform_01/m0617_rail"
 ARTICULATION_ROOT_JOINT_PATH = "/World/Xform_01/m0617_rail/root_joint"
+RAIL_JOINT_PATH = "/World/Xform_01/m0617_rail/joints/rail_joint"
 ROBOT_MOUNT_JOINT_PATH = "/World/FixedJoint"
 ROBOT_PRIM_PATH = "/World/Xform_01/m0617"
 ROBOT_BASE_PATH = "/World/Xform_01/m0617/base_link"
@@ -87,8 +105,10 @@ GRIPPER_ROOT_PATH = "/World/Xform_01/m0617/robotiq_3f_gripper_articulated"
 PALM_PATH = "/World/Xform_01/m0617/robotiq_3f_gripper_articulated/palm"
 APPLE_PATH = "/World/Xform/applebody/apple1"
 FIXED_JOINT_PATH = "/World/Xform/FixedJoint"
+BRANCH_BODY_PATH = "/World/Xform/branchbody"
 CONVEYOR_PATH = "/World/ConveyorBelt_A08_PR_NVD_01"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
+FIXED_CAMERA_ROOT_PATHS = ["/World/base_rsd455", "/conv_rsd455"]
 
 EE_FRAME_NAME = "link_6"
 RAIL_JOINT = "rail_joint"
@@ -111,6 +131,7 @@ RETREAT_DISTANCE_M = 0.25
 RETREAT_HEIGHT_M = 0.15
 TWIST_DEG = 45.0
 TWIST_STEPS = 60  # Stage가 60 Hz일 때 약 1초
+GRASP_STEPS = 240  # 접촉 충격을 줄이기 위해 약 4초에 걸쳐 폐합한다.
 
 # 한 물리 스텝에서 TCP 목표가 이동하는 최대 거리이다.
 TCP_STEP_M = 0.002
@@ -129,9 +150,10 @@ SAFE_CARRY_CLEARANCE_M = 0.15
 # 작업반경을 벗어난다. 실제 IK 결과에서 LOWER는 성공했으므로 12 cm 상공에서
 # 정렬한 뒤 저속 하강한다.
 PLACE_APPROACH_HEIGHT_M = 0.12
-# 손가락이 상판에 닿기 전에 사과를 놓는다. 사과는 약 2 cm만 자유낙하하므로
+# 손가락이 상판에 닿기 전에 사과를 놓는다. 사과는 약 3 cm만 자유낙하하므로
 # 컨베이어와 직접 충돌하면서 억지로 밀어 넣는 것보다 충격이 작다.
-RELEASE_CLEARANCE_M = 0.020
+RELEASE_CLEARANCE_M = 0.030
+PLACE_VERTICAL_LIFT_M = 0.060
 PLACE_TRANSIT_STEP_M = 0.0015
 PLACE_DESCENT_STEP_M = 0.0005
 PLACE_ROTATE_STEPS = 180
@@ -148,6 +170,9 @@ APPLE_GRASP_MAX_DISTANCE_M = 0.14
 ARM_DRIVE_STIFFNESS = 1.0e6
 ARM_DRIVE_DAMPING = 1.0e4
 ARM_DRIVE_MAX_FORCE = 2.0e3
+GRIPPER_DRIVE_STIFFNESS = 50.0
+GRIPPER_DRIVE_DAMPING = 5.0
+GRIPPER_DRIVE_MAX_FORCE = 0.5
 
 # 시작 자세에서 사과 앞까지는 매 프레임 Cartesian IK를 다시 풀지 않는다.
 # 사과 앞 pregrasp 자세의 IK를 한 번만 구한 뒤, 현재 관절값과 가장 가까운
@@ -357,7 +382,7 @@ def open_project_stage():
 
 
 def configure_breakable_joint(stage):
-    """사과-가지 FixedJoint의 연결과 파손 한계를 실행 Stage에 적용한다."""
+    """USD에 저장된 사과-가지 FixedJoint를 검증하고 그대로 사용한다."""
     joint_prim = require_prim(stage, FIXED_JOINT_PATH)
     joint = UsdPhysics.Joint(joint_prim)
 
@@ -371,19 +396,136 @@ def configure_breakable_joint(stage):
             f"Body0={body0}, Body1={body1}"
         )
 
-    joint.GetBreakForceAttr().Set(BREAK_FORCE_N)
-    joint.GetBreakTorqueAttr().Set(BREAK_TORQUE_NM)
+    break_force, break_torque = configured_break_limits()
+    joint.GetBreakForceAttr().Set(break_force)
+    joint.GetBreakTorqueAttr().Set(break_torque)
     joint.GetJointEnabledAttr().Set(True)
     joint.GetCollisionEnabledAttr().Set(False)
 
+    # USD 단독 Play에서 검증된 원본 구성을 유지한다. branchbody는
+    # kinematic rigid body이며, 이 body와 applebody 사이의 authored
+    # anchor가 사과를 가지에 고정한다.
+    branch_prim = require_prim(stage, BRANCH_BODY_PATH)
+    if not branch_prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        raise RuntimeError(f"가지 RigidBodyAPI가 없습니다: {BRANCH_BODY_PATH}")
+    branch_rigid_body = UsdPhysics.RigidBodyAPI(branch_prim)
+    branch_rigid_body.GetRigidBodyEnabledAttr().Set(True)
+    branch_rigid_body.GetKinematicEnabledAttr().Set(True)
+
     print(
-        f"   Apple joint  break force {BREAK_FORCE_N:.1f} N, "
-        f"torque {BREAK_TORQUE_NM:.2f} N·m"
+        f"   Apple joint  authored {FIXED_JOINT_PATH}, "
+        "body0 /World/Xform/branchbody, body1 /World/Xform/applebody"
     )
+    print(
+        f"   Apple joint  break test {args.break_test}: "
+        f"force {break_force:.3g} N, torque {break_torque:.3g} N·m"
+    )
+
+
+def configured_break_limits():
+    """선택한 진단 모드에 따라 한쪽 파손 한계만 격리한다."""
+    maximum = float(np.finfo(np.float32).max)
+    break_torque = float(args.break_torque_nm)
+    if not np.isfinite(break_torque) or break_torque <= 0.0:
+        raise RuntimeError(
+            f"--break-torque-nm은 0보다 큰 유한값이어야 합니다: {break_torque}"
+        )
+    if args.break_test == "force":
+        return BREAK_FORCE_N, maximum
+    if args.break_test == "torque":
+        return maximum, break_torque
+    return BREAK_FORCE_N, break_torque
+
+
+class JointBreakMonitor:
+    """사과 FixedJoint의 실제 PhysX 파손 시점과 FSM 상태를 기록한다."""
+
+    def __init__(self):
+        self.broken = False
+        self.break_state = None
+        self.current_state = "SETUP"
+        events = omni.physx.get_physx_interface().get_simulation_event_stream_v2()
+        self._subscription = events.create_subscription_to_pop(self._on_event)
+
+    def set_state(self, state):
+        self.current_state = state
+
+    def reset(self):
+        self.broken = False
+        self.break_state = None
+        self.current_state = "SETUP"
+
+    def close(self):
+        self._subscription = None
+
+    def _on_event(self, event):
+        if event.type != int(SimulationEvent.JOINT_BREAK):
+            return
+        encoded_path = event.payload.get("jointPath", None)
+        if encoded_path is None:
+            return
+        joint_path = PhysicsSchemaTools.decodeSdfPath(
+            encoded_path[0], encoded_path[1]
+        )
+        if str(joint_path) != FIXED_JOINT_PATH:
+            return
+        self.broken = True
+        self.break_state = self.current_state
+        break_force, break_torque = configured_break_limits()
+        print(
+            f"   [JOINT BREAK] {FIXED_JOINT_PATH} state={self.break_state}, "
+            f"test={args.break_test}, "
+            f"limit={break_force:.3g} N/{break_torque:.3g} N·m"
+        )
 
 
 def configure_joint_drives(stage):
     """팔은 위치를 잘 추종하고, 손가락은 과도한 충격 없이 닫히게 한다."""
+    # 고정 설치된 base/conv D455 payload에 포함된 RigidBodyAPI를 실행
+    # Stage에서 비활성화한다. Collider는 정적으로 남고 센서는 중력에 떨어지지
+    # 않는다. 로봇에 장착된 hand D455는 articulation을 따라야 하므로 제외한다.
+    fixed_camera_bodies = 0
+    for camera_root_path in FIXED_CAMERA_ROOT_PATHS:
+        camera_root = require_prim(stage, camera_root_path)
+        camera_body_count = 0
+        for prim in Usd.PrimRange(camera_root):
+            rigid_body_enabled = prim.GetAttribute("physics:rigidBodyEnabled")
+            if (
+                not prim.HasAPI(UsdPhysics.RigidBodyAPI)
+                and not rigid_body_enabled.IsValid()
+            ):
+                continue
+            if rigid_body_enabled.IsValid():
+                rigid_body_enabled.Set(False)
+            else:
+                UsdPhysics.RigidBodyAPI(prim).GetRigidBodyEnabledAttr().Set(False)
+            camera_body_count += 1
+        if camera_body_count == 0:
+            # NVIDIA D455 payload의 내부 schema가 instance/payload 구성 때문에
+            # PrimRange에 노출되지 않는 경우가 있다. 알려진 payload 루트에 더
+            # 강한 session-layer override를 작성해 동적 rigid body를 끈다.
+            payload_root = stage.OverridePrim(f"{camera_root_path}/RSD455")
+            rigid_body = UsdPhysics.RigidBodyAPI.Apply(payload_root)
+            rigid_body.CreateRigidBodyEnabledAttr(False)
+            camera_body_count = 1
+        fixed_camera_bodies += camera_body_count
+
+    # 저장된 rail_joint는 초기 state=0.0 m인데 drive target=1.283 m라서 Play
+    # 직후 오른쪽으로 이동한다. 임의의 튜닝값 대신 authored 초기 state를
+    # 그대로 위치 유지 target으로 사용한다.
+    rail_joint_prim = require_prim(stage, RAIL_JOINT_PATH)
+    rail_drive = UsdPhysics.DriveAPI.Get(rail_joint_prim, "linear")
+    if not rail_drive:
+        raise RuntimeError(f"레일 linear Drive가 없습니다: {RAIL_JOINT_PATH}")
+    initial_rail_position = rail_joint_prim.GetAttribute(
+        "state:linear:physics:position"
+    ).Get()
+    if initial_rail_position is None or not np.isfinite(initial_rail_position):
+        raise RuntimeError(
+            f"레일 초기 위치가 유효하지 않습니다: {initial_rail_position}"
+        )
+    rail_drive.GetTargetPositionAttr().Set(float(initial_rail_position))
+
     arm_count = 0
     gripper_count = 0
     root = require_prim(stage, ROBOT_PRIM_PATH)
@@ -400,9 +542,9 @@ def configure_joint_drives(stage):
             drive.GetMaxForceAttr().Set(ARM_DRIVE_MAX_FORCE)
             arm_count += 1
         elif name in GRIPPER_JOINTS:
-            drive.GetStiffnessAttr().Set(200.0)
-            drive.GetDampingAttr().Set(20.0)
-            drive.GetMaxForceAttr().Set(20.0)
+            drive.GetStiffnessAttr().Set(GRIPPER_DRIVE_STIFFNESS)
+            drive.GetDampingAttr().Set(GRIPPER_DRIVE_DAMPING)
+            drive.GetMaxForceAttr().Set(GRIPPER_DRIVE_MAX_FORCE)
             gripper_count += 1
 
     if arm_count != len(ARM_JOINTS):
@@ -410,7 +552,16 @@ def configure_joint_drives(stage):
     if gripper_count != len(GRIPPER_JOINTS):
         raise RuntimeError(f"그리퍼 Drive 수가 잘못되었습니다: {gripper_count}")
 
-    print(f"   Drives       arm {arm_count}, gripper {gripper_count}")
+    print(
+        f"   Drives       rail hold {float(initial_rail_position):.3f} m, "
+        f"arm {arm_count}, gripper {gripper_count}"
+    )
+    print(
+        f"   Gripper drive stiffness {GRIPPER_DRIVE_STIFFNESS:.1f}, "
+        f"damping {GRIPPER_DRIVE_DAMPING:.1f}, "
+        f"max force {GRIPPER_DRIVE_MAX_FORCE:.2f} N·m"
+    )
+    print(f"   Fixed cameras rigid bodies disabled {fixed_camera_bodies}")
 
 
 def configure_contact_colliders(stage):
@@ -764,6 +915,7 @@ class AppleHarvestFSM:
         "TO_BELT",
         "RELEASE",
         "LIFT",
+        "EXIT",
         "DONE",
     ]
 
@@ -812,9 +964,10 @@ class AppleHarvestFSM:
             safe_z,
             place_above[2],
         )
-        # 같은 X/Y에서 수직 상승하는 자세는 IK가 실패했다. 사과를 놓은 뒤
-        # 도달 가능성이 확인된 측면 경유점으로 비스듬히 빠져나간다.
-        place_lift = outside_safe.copy()
+        # 사과를 놓은 직후 측면으로 빠지면 열린 손가락이 사과를 쓸어
+        # 친다. 먼저 같은 X/Y에서 짧게 수직 상승한 뒤 측면으로 이동한다.
+        place_lift = place + np.array([0.0, 0.0, PLACE_VERTICAL_LIFT_M])
+        place_exit = outside_safe.copy()
 
         approach_steps = int(
             np.clip(
@@ -827,7 +980,7 @@ class AppleHarvestFSM:
         specs = [
             (pregrasp, approach_rotation, approach_steps, 0.0, 0.0),
             (apple_center, approach_rotation, 100, 0.0, 0.0),
-            (apple_center, approach_rotation, 120, 0.0, 1.0),
+            (apple_center, approach_rotation, GRASP_STEPS, 0.0, 1.0),
             (apple_center, self.twisted_rotation, TWIST_STEPS, 1.0, 1.0),
             (pull, self.twisted_rotation, 120, 1.0, 1.0),
             (retreat, self.twisted_rotation, 180, 1.0, 1.0),
@@ -867,6 +1020,21 @@ class AppleHarvestFSM:
             ),
             (place, self.place_rotation, RELEASE_STEPS, 1.0, 0.0),
             (place_lift, self.place_rotation, PLACE_LIFT_STEPS, 0.0, 0.0),
+            (
+                place_exit,
+                self.place_rotation,
+                max(
+                    MIN_MOVE_STEPS,
+                    int(
+                        np.ceil(
+                            np.linalg.norm(place_exit - place_lift)
+                            / PLACE_TRANSIT_STEP_M
+                        )
+                    ),
+                ),
+                0.0,
+                0.0,
+            ),
         ]
 
         names = self.NAMES[:-1]

@@ -77,6 +77,7 @@ class BaseAppleDetector(Node):
         self.declare_parameter("minimum_depth_m", 0.2)
         self.declare_parameter("maximum_depth_m", 10.0)
         self.declare_parameter("maximum_sync_error_sec", 0.08)
+        self.declare_parameter("apple_radius_m", 0.04)
         self.declare_parameter("target_frame", "world")
         self.declare_parameter("show_debug_window", True)
 
@@ -92,6 +93,12 @@ class BaseAppleDetector(Node):
         self.maximum_sync_error_ns = int(
             float(self.get_parameter("maximum_sync_error_sec").value) * 1e9
         )
+        self.apple_radius_m = float(self.get_parameter("apple_radius_m").value)
+        if not math.isfinite(self.apple_radius_m) or self.apple_radius_m < 0.0:
+            raise ValueError(
+                f"apple_radius_m은 0 이상의 유한값이어야 합니다: "
+                f"{self.apple_radius_m}"
+            )
         self.target_frame = str(self.get_parameter("target_frame").value)
         self.show_debug_window = bool(
             self.get_parameter("show_debug_window").value
@@ -252,6 +259,15 @@ class BaseAppleDetector(Node):
             dtype=float,
         )
 
+    @staticmethod
+    def surface_point_to_center(surface_point, apple_radius_m):
+        """카메라에 보이는 사과 표면점을 구의 중심점으로 보정한다."""
+        surface_point = np.asarray(surface_point, dtype=float)
+        ray_length = float(np.linalg.norm(surface_point))
+        if ray_length <= 1e-9 or not np.isfinite(ray_length):
+            raise ValueError(f"사과 표면점이 유효하지 않습니다: {surface_point}")
+        return surface_point + surface_point / ray_length * apple_radius_m
+
     def make_camera_pose(self, rgb_message, point_camera):
         pose = PoseStamped()
         pose.header = rgb_message.header
@@ -367,7 +383,11 @@ class BaseAppleDetector(Node):
             return
 
         u, v = center
-        point_camera = self.deproject(u, v, depth_value, camera_info)
+        surface_point_camera = self.deproject(u, v, depth_value, camera_info)
+        point_camera = self.surface_point_to_center(
+            surface_point_camera,
+            self.apple_radius_m,
+        )
         camera_pose = self.make_camera_pose(rgb_message, point_camera)
         self.camera_pose_publisher.publish(camera_pose)
 
@@ -398,7 +418,11 @@ class BaseAppleDetector(Node):
             self.last_detection_log_ns < 0
             or now_ns - self.last_detection_log_ns >= 1_000_000_000
         ):
-            message = f"사과 camera xyz = {point_camera.round(4).tolist()} m"
+            message = (
+                f"사과 surface camera xyz = "
+                f"{surface_point_camera.round(4).tolist()} m, "
+                f"center camera xyz = {point_camera.round(4).tolist()} m"
+            )
             if world_pose is not None:
                 position = world_pose.pose.position
                 message += (
