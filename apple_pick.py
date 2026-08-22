@@ -77,14 +77,14 @@ URDF_PATH = (
     / "m0617.urdf"
 )
 
-ARTICULATION_PRIM_PATH = "/World/m0617_rail"
-ARTICULATION_ROOT_JOINT_PATH = "/World/m0617_rail/root_joint"
+ARTICULATION_PRIM_PATH = "/World/Xform_01/m0617_rail"
+ARTICULATION_ROOT_JOINT_PATH = "/World/Xform_01/m0617_rail/root_joint"
 ROBOT_MOUNT_JOINT_PATH = "/World/FixedJoint"
-ROBOT_PRIM_PATH = "/World/m0617"
-ROBOT_BASE_PATH = "/World/m0617/base_link"
-LINK6_PATH = "/World/m0617/link_6"
-GRIPPER_ROOT_PATH = "/World/m0617/robotiq_3f_gripper_articulated"
-PALM_PATH = "/World/m0617/robotiq_3f_gripper_articulated/palm"
+ROBOT_PRIM_PATH = "/World/Xform_01/m0617"
+ROBOT_BASE_PATH = "/World/Xform_01/m0617/base_link"
+LINK6_PATH = "/World/Xform_01/m0617/link_6"
+GRIPPER_ROOT_PATH = "/World/Xform_01/m0617/robotiq_3f_gripper_articulated"
+PALM_PATH = "/World/Xform_01/m0617/robotiq_3f_gripper_articulated/palm"
 APPLE_PATH = "/World/Xform/applebody/apple1"
 FIXED_JOINT_PATH = "/World/Xform/FixedJoint"
 CONVEYOR_PATH = "/World/ConveyorBelt_A08_PR_NVD_01"
@@ -310,7 +310,7 @@ def validate_articulation_setup(stage):
     mount_joint = UsdPhysics.Joint(require_prim(stage, ROBOT_MOUNT_JOINT_PATH))
     body0 = [str(path) for path in mount_joint.GetBody0Rel().GetTargets()]
     body1 = [str(path) for path in mount_joint.GetBody1Rel().GetTargets()]
-    expected0 = ["/World/m0617_rail/rail_robot_mount_link"]
+    expected0 = ["/World/Xform_01/m0617_rail/rail_robot_mount_link"]
     expected1 = [ROBOT_BASE_PATH]
     if body0 != expected0 or body1 != expected1:
         raise RuntimeError(
