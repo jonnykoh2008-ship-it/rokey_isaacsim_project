@@ -216,8 +216,7 @@ class RobotMotionNode(Node):
         self.scene_version = 0
         self.simulation_state = SimulationState.INITIALIZING
         self.scene_message = None
-        self.motion_blocked = False
-        self.motion_failure_reset_id = None
+        self.last_motion_failure = None
         latched_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -270,7 +269,6 @@ class RobotMotionNode(Node):
             )
             if (
                 self.busy
-                or self.motion_blocked
                 or request.motion_type not in MOTION_SEQUENCE
                 or not valid_state
                 or not valid_version
@@ -281,22 +279,26 @@ class RobotMotionNode(Node):
                     f"busy={self.busy}, state={self.simulation_state}, "
                     f"goal version={request.reset_id}/{request.scene_version}, "
                     f"current={self.reset_id}/{self.scene_version}, "
-                    f"waypoints={len(request.waypoints)}, "
-                    f"motion_blocked={self.motion_blocked}"
+                    f"waypoints={len(request.waypoints)}"
                 )
                 return GoalResponse.REJECT
             self.busy = True
         return GoalResponse.ACCEPT
 
     def on_motion_status(self, message):
-        """개인 PC의 Goal 전 계획 실패를 reset 전까지 latch한다."""
+        """개인 PC의 Goal 전 계획 실패를 기록하되 Goal은 차단하지 않는다."""
         if message.success:
             return
         with self.lock:
-            self.motion_blocked = True
-            self.motion_failure_reset_id = self.reset_id
+            self.last_motion_failure = (
+                message.current_state,
+                message.error_code,
+                message.message,
+                self.reset_id,
+                self.scene_version,
+            )
         self.get_logger().warning(
-            "motion status 실패 latch: "
+            "motion status 실패 기록: "
             f"state={message.current_state}, code={message.error_code}, "
             f"message={message.message}"
         )
@@ -314,22 +316,6 @@ class RobotMotionNode(Node):
             self.simulation_state = int(state)
             reset_id = self.reset_id
             scene_version = self.scene_version
-            scene = self.scene_message
-            if (
-                self.motion_blocked
-                and self.motion_failure_reset_id is not None
-                and reset_id > self.motion_failure_reset_id
-                and state in (SimulationState.READY, SimulationState.PLAYING)
-                and scene is not None
-                and scene.reset_id == reset_id
-                and scene.scene_version == scene_version
-            ):
-                self.motion_blocked = False
-                self.motion_failure_reset_id = None
-                self.get_logger().info(
-                    "reset 후 READY/PLAYING + PlanningScene 동기화 완료: "
-                    "motion status 실패 latch를 해제합니다."
-                )
         value = SimulationState()
         value.header.stamp = self.get_clock().now().to_msg()
         value.header.frame_id = "world"
@@ -461,7 +447,9 @@ class MotionEngine:
         self.active_handle = None
         self.active_reset_id = None
         self.active_scene_version = None
-        self.action_start_time = None
+        self.action_last_progress_time = None
+        self.progress_tcp_position = None
+        self.progress_tcp_rotation = None
 
     def close(self):
         self.joint_break.close()
@@ -520,13 +508,34 @@ class MotionEngine:
                     "Goal 승인 후 reset_id/scene_version 또는 simulation 상태가 "
                     "변경됐습니다.",
                 )
-        if self.action_start_time is not None:
-            elapsed = float(self.world.current_time) - self.action_start_time
+        if self.action_last_progress_time is not None:
+            position, rotation = self._current_tcp_pose()
+            if self.progress_tcp_position is None:
+                self.progress_tcp_position = position.copy()
+                self.progress_tcp_rotation = rotation.copy()
+            else:
+                position_delta = float(
+                    harvest.np.linalg.norm(position - self.progress_tcp_position)
+                )
+                rotation_delta = harvest.rotation_error_deg(
+                    rotation, self.progress_tcp_rotation
+                )
+                if (
+                    position_delta >= harvest.RMPFLOW_STALL_POSITION_DELTA_M
+                    or rotation_delta >= harvest.RMPFLOW_STALL_ROTATION_DELTA_DEG
+                ):
+                    self.action_last_progress_time = float(self.world.current_time)
+                    self.progress_tcp_position = position.copy()
+                    self.progress_tcp_rotation = rotation.copy()
+            elapsed = (
+                float(self.world.current_time) - self.action_last_progress_time
+            )
             if elapsed >= ACTION_TIMEOUT_S:
                 raise MotionExecutionError(
                     "304:MOTION_TIMEOUT",
-                    f"Action 단계가 simulation time {ACTION_TIMEOUT_S:.1f}초를 "
-                    "초과했습니다.",
+                    f"Action 단계에서 simulation time "
+                    f"{ACTION_TIMEOUT_S:.1f}초 동안 유의미한 TCP 진전이 "
+                    "없습니다.",
                 )
 
     def _set_gripper_drive_max_force(self, max_force, state, report=False):
@@ -683,7 +692,9 @@ class MotionEngine:
         self.active_handle = handle
         self.active_reset_id = int(reset_id)
         self.active_scene_version = int(scene_version)
-        self.action_start_time = float(self.world.current_time)
+        self.action_last_progress_time = float(self.world.current_time)
+        self.progress_tcp_position = None
+        self.progress_tcp_rotation = None
         try:
             self._check_execution_guard()
             if request.motion_type == RobotMotion.Goal.APPROACH:
@@ -736,7 +747,9 @@ class MotionEngine:
             return self.result(False, "312:INTERNAL_ERROR", str(error))
         finally:
             self.active_handle = None
-            self.action_start_time = None
+            self.action_last_progress_time = None
+            self.progress_tcp_position = None
+            self.progress_tcp_rotation = None
         self.expected_index += 1
         if self.expected_index == len(MOTION_SEQUENCE):
             self._reset_action_sequence("CYCLE_COMPLETE")
@@ -746,7 +759,7 @@ class MotionEngine:
     def _approach(self, handle, pose, waypoint_messages):
         if self.joint_break.broken:
             raise MotionExecutionError(
-                "305:STEM_NOT_BROKEN",
+                "308:SIMULATION_RESET",
                 "사과 FixedJoint가 이미 분리됐습니다. 시뮬레이션을 Reset한 뒤 "
                 "다시 실행하세요.",
             )

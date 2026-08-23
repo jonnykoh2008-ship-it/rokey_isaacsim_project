@@ -112,7 +112,7 @@ RMPflow gain, proxy voxel 크기, proxy 수 제한 및 영향 반경은 시뮬�
 4. M0617이 줄기 반대 방향으로 일직선 당김을 수행한다.
 5. 당김 기본 속도는 50mm/s다.
 6. 최대 당김 거리는 100mm다.
-7. timeout은 simulation time 기준 3초다.
+7. 당김 중 유의미한 TCP 진전이 연속 3초 없으면 timeout이다.
 8. `PULL` 단계는 stem joint가 break된 것까지 확인해야 성공으로 판정한다.
 
 Stem joint:
@@ -134,13 +134,18 @@ Stem joint:
 
 - `GRASP`와 `RELEASE` Goal의 `target_pose`는 Goal 전송 시점의 현재 pose로 채운다.
 - `GRASP`는 현재 pose를 유지하고 그리퍼만 폐합한다.
-- 각 단계의 기본 timeout은 `/clock` 기준 simulation time 3초다.
+- 각 단계의 timeout은 `/clock` 기준으로 유의미한 TCP 위치
+  또는 자세 진전이 연속 3초 없을 때 발생한다. Timeline Pause 중에는
+  simulation time이 정지하므로 watchdog도 진행하지 않는다.
 - 모션 Action 실행 중에는 새 Goal을 받지 않고 cancel만 허용한다.
 - Feedback의 `progress`는 `0.0`에서 `1.0` 범위를 사용한다.
 - 성공 Result의 `error_code`는 빈 문자열이다.
 - 실행 중 실패하면 로봇 동작을 즉시 멈추고 실패 Result를 반환한다. 실패 후 자동 후퇴는 수행하지 않는다.
 - Goal 전 계획·검증 실패는 `/harvest/motion_status`로 GPU PC 1에 전달한다.
 - 계획·검증 실패 상태 메시지는 `success=false`, 기존 300번대 `error_code`, 실패 상태와 설명을 포함한다.
+- GPU PC 1은 `MotionStatus` 실패를 기록·로그하지만 이 기록만으로
+  후속 RobotMotion Goal을 차단하지 않는다. Goal 허용은 현재
+  `SimulationState`, `reset_id`, `scene_version`, busy 상태로 판정한다.
 
 ## 실패 처리
 
