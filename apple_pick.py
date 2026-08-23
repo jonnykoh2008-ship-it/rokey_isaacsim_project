@@ -153,11 +153,10 @@ RETREAT_DISTANCE_M = 0.25
 RETREAT_HEIGHT_M = 0.15
 TWIST_DEG = 45.0
 TWIST_STEPS = 60  # Stage가 60 Hz일 때 약 1초
-# GRASP 중 1 N·m stem torque 한계를 넘지 않도록 ENTER 완료 후 2초간
-# 팔을 정착시키고, 그리퍼는 약 6초에 걸쳐 폐합한다. 시뮬레이션 접촉 시험용
-# 임시값이며 stem break 한계 자체는 변경하지 않는다.
-GRASP_SETTLE_STEPS = 120
-GRASP_STEPS = 360
+# Action 단계별 3초 simulation-time 제한 안에서 팔 정착과 폐합을
+# 마친다. stem break 한계 자체는 변경하지 않는다.
+GRASP_SETTLE_STEPS = 30
+GRASP_STEPS = 120
 
 # 한 물리 스텝에서 TCP 목표가 이동하는 최대 거리이다.
 TCP_STEP_M = 0.002
@@ -1406,6 +1405,14 @@ class ApproachUnreachableError(RuntimeError):
     """충돌 없는 pre-grasp 경로를 만들거나 실행할 수 없을 때 발생한다."""
 
 
+class CollisionRiskError(ApproachUnreachableError):
+    """외부 경로가 GPU planning proxy와 겹치는 경우 발생한다."""
+
+
+class IkFailedError(ApproachUnreachableError):
+    """외부 waypoint의 순차 IK 검증이 실패한 경우 발생한다."""
+
+
 def _point_to_segment_distances(points, start, end):
     """각 점과 월드 선분 사이의 최단거리를 계산한다."""
     points = np.asarray(points, dtype=float)
@@ -2035,12 +2042,15 @@ def move_arm_to_pregrasp(
     max_physics_steps=0,
     contact_guard=None,
     external_waypoints=None,
+    external_waypoint_rotations=None,
+    execution_guard=None,
     pause_callback=None,
     resume_callback=None,
 ):
     """사과 obstacle staging을 거쳐 충돌 없는 pregrasp 경로를 실행한다."""
     lateral_axis = np.asarray(approach_rotation[:, 2], dtype=float)
-    approach_axis = np.asarray(approach_rotation[:, 1], dtype=float)
+    # 개인 PC planner 규약: staging/pre-grasp/사과 진입은 항상 world +Z.
+    approach_axis = np.array([0.0, 0.0, 1.0], dtype=float)
     release_offset = APPLE_OBSTACLE_RELEASE_DISTANCE_M - PREGRASP_DISTANCE_M
     if release_offset <= 0.0:
         raise RuntimeError(
@@ -2078,12 +2088,16 @@ def move_arm_to_pregrasp(
         best_orientation_error = float("inf")
         steps_without_progress = 0
         for frame in range(RMPFLOW_SEGMENT_STEPS):
+            if execution_guard is not None:
+                execution_guard()
             if not simulation_app.is_running():
                 return None
             if max_physics_steps > 0 and physics_steps >= max_physics_steps:
                 return None
             pause_reported = False
             while not world.is_playing():
+                if execution_guard is not None:
+                    execution_guard()
                 if world.is_stopped() or not simulation_app.is_running():
                     return None
                 if not pause_reported and pause_callback is not None:
@@ -2213,7 +2227,7 @@ def move_arm_to_pregrasp(
         print(f"   Outside IK   {candidate['name']:13s} OK (3 poses)")
         return True
 
-    def external_route_has_ik(waypoints):
+    def external_route_has_ik(waypoints, rotations):
         """개인 PC가 만든 waypoint를 현재 관절 자세에서 순차 IK 검사한다."""
         arm_indices = np.asarray(
             [robot.get_dof_index(name) for name in ARM_JOINTS], dtype=np.int32
@@ -2226,10 +2240,12 @@ def move_arm_to_pregrasp(
         warm_start = np.asarray(warm_start, dtype=float)
         if not np.all(np.isfinite(warm_start)):
             raise ApproachUnreachableError("외부 waypoint IK seed가 유효하지 않습니다.")
-        for index, waypoint in enumerate(waypoints):
+        for index, (waypoint, waypoint_rotation) in enumerate(
+            zip(waypoints, rotations)
+        ):
             link_position, link_rotation = tcp_target_to_link6(
                 waypoint,
-                approach_rotation,
+                waypoint_rotation,
                 collision_motion.link6_to_palm_translation,
                 collision_motion.link6_to_palm_rotation,
             )
@@ -2250,10 +2266,31 @@ def move_arm_to_pregrasp(
 
     if external_waypoints is not None:
         waypoints = [np.asarray(point, dtype=float) for point in external_waypoints]
+        if external_waypoint_rotations is None:
+            rotations = [np.asarray(approach_rotation, dtype=float)] * len(waypoints)
+        else:
+            rotations = [
+                np.asarray(rotation, dtype=float)
+                for rotation in external_waypoint_rotations
+            ]
         if not waypoints:
             raise ApproachUnreachableError("개인 PC의 APPROACH waypoint가 비어 있습니다.")
+        if len(rotations) != len(waypoints):
+            raise ApproachUnreachableError(
+                "외부 waypoint 위치와 자세 개수가 다릅니다."
+            )
         if any(point.shape != (3,) or not np.all(np.isfinite(point)) for point in waypoints):
             raise ApproachUnreachableError("개인 PC의 APPROACH waypoint가 유효하지 않습니다.")
+        if any(
+            rotation.shape != (3, 3)
+            or not np.all(np.isfinite(rotation))
+            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4)
+            or np.linalg.det(rotation) < 0.999
+            for rotation in rotations
+        ):
+            raise ApproachUnreachableError(
+                "개인 PC의 APPROACH waypoint orientation이 유효하지 않습니다."
+            )
         if np.linalg.norm(waypoints[-1] - np.asarray(pregrasp_tcp)) > 0.01:
             raise ApproachUnreachableError(
                 "외부 경로의 마지막 waypoint가 GPU pregrasp 목표와 일치하지 않습니다."
@@ -2263,17 +2300,19 @@ def move_arm_to_pregrasp(
             [current_tcp, *waypoints]
         )
         if clearance < 0.0:
-            raise ApproachUnreachableError(
+            raise CollisionRiskError(
                 f"GPU proxy 재검사에서 외부 경로가 {obstacle_name}과 "
                 f"{clearance:.3f} m 겹칩니다."
             )
-        if not external_route_has_ik(waypoints):
-            raise ApproachUnreachableError("외부 APPROACH 경로의 순차 IK 검사에 실패했습니다.")
+        if not external_route_has_ik(waypoints, rotations):
+            raise IkFailedError("외부 APPROACH 경로의 순차 IK 검사에 실패했습니다.")
         print(
             f"   External plan {len(waypoints)} waypoints, "
             f"GPU clearance {clearance:.3f} m to {obstacle_name}"
         )
-        for index, waypoint in enumerate(waypoints):
+        for index, (waypoint, waypoint_rotation) in enumerate(
+            zip(waypoints, rotations)
+        ):
             if index == len(waypoints) - 1:
                 collision_motion.disable_target_apple()
             reached = follow_waypoint(
@@ -2281,7 +2320,7 @@ def move_arm_to_pregrasp(
                 index + 1,
                 len(waypoints),
                 waypoint,
-                approach_rotation,
+                waypoint_rotation,
             )
             if reached is None:
                 return physics_steps, False
