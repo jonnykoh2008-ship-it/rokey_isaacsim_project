@@ -613,7 +613,7 @@ def find_robot_tree_physx_overlap(stage):
     scene_query = omni.physx.get_physx_scene_query_interface()
     robot_root = require_prim(stage, ROBOT_PRIM_PATH)
     for prim in Usd.PrimRange(robot_root):
-        if not prim.IsA(UsdGeom.GPrim) or not prim.HasAPI(UsdPhysics.CollisionAPI):
+        if not prim.IsA(UsdGeom.Gprim) or not prim.HasAPI(UsdPhysics.CollisionAPI):
             continue
         collision = UsdPhysics.CollisionAPI(prim)
         enabled = collision.GetCollisionEnabledAttr().Get()
