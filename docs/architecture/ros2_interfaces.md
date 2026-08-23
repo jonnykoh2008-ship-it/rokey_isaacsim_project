@@ -17,6 +17,7 @@
 |---|---|---|---|---|
 | Topic | `/harvest/target_pose` | `geometry_msgs/msg/PoseStamped` | GPU PC 1 | 개인 PC 1 |
 | Action | `/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | 개인 PC 1 |
+| Topic | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | 개인 PC 1 | GPU PC 1 |
 | Topic | `/quality/inspection_images` | `appleproj_interfaces/msg/InspectionImage` | GPU PC 1 | GPU PC 2 |
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
 | Service | `/quality/retry_inspection` | `appleproj_interfaces/srv/RetryInspection` | GPU PC 1 | 개인 PC 2 |
@@ -149,7 +150,35 @@ Feedback:
 - cancel, timeout, 충돌 또는 모션 실패가 발생하면 GPU PC 1의 Action Server는 로봇 동작을 즉시 멈추고 실패 Result를 반환한다.
 - 실패 후 자동 후퇴는 수행하지 않는다.
 - 성공 Result의 `error_code`는 빈 문자열이다.
-- 개인 PC 1에서 Goal 전송 전 발생한 계획·검증 실패를 GPU PC 1에 알리는 별도 상태 인터페이스는 TBD다.
+
+### MotionStatus
+
+개인 PC 1이 RobotMotion Goal을 보내기 전 발생한 계획·검증 결과를 GPU PC 1에 전달한다.
+
+```text
+토픽: /harvest/motion_status
+타입: appleproj_interfaces/msg/MotionStatus
+송신: 개인 PC 1
+수신: GPU PC 1
+```
+
+필드:
+
+- `header`: `/clock` 기준 상태 발생 시각
+- `current_state`: 수확 상태 머신의 현재 상태
+- `success`: 상태 또는 계획 성공 여부
+- `progress`: `0.0`에서 `1.0` 범위
+- `error_code`: 기존 300번대 오류 코드 문자열. 성공 시 빈 문자열
+- `message`: 사람이 읽을 수 있는 상세 설명
+
+개인 PC 1은 Goal 전 `IK_FAILED`, `APPROACH_UNREACHABLE`, `COLLISION_RISK`,
+`SINGULARITY_RISK`, `INVALID_TARGET_POSE`, `TF_UNAVAILABLE`,
+`JOINT_STATE_UNAVAILABLE` 등의 실패가 발생하면 `success=false`와 기존 오류 코드를
+발행한다. GPU PC 1은 이 메시지를 수신하면 해당 수확 실행을 실패 상태로 기록하고,
+새 RobotMotion Goal을 받기 전에 원인을 확인한다.
+
+이 토픽은 상태·결과 전달용으로 Reliable QoS를 사용하며, 기본 history depth는 10으로
+한다. 상태 메시지의 timestamp는 simulation time을 사용한다.
 
 ### 오류 코드
 

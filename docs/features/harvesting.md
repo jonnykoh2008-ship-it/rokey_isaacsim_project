@@ -77,10 +77,13 @@ Stem joint:
 - Feedback의 `progress`는 `0.0`에서 `1.0` 범위를 사용한다.
 - 성공 Result의 `error_code`는 빈 문자열이다.
 - 실행 중 실패하면 로봇 동작을 즉시 멈추고 실패 Result를 반환한다. 실패 후 자동 후퇴는 수행하지 않는다.
+- Goal 전 계획·검증 실패는 `/harvest/motion_status`로 GPU PC 1에 전달한다.
+- 계획·검증 실패 상태 메시지는 `success=false`, 기존 300번대 `error_code`, 실패 상태와 설명을 포함한다.
 
 ## 실패 처리
 
 - IK/경로 실패: 정지 후 실패 상태 보고
+- Goal 전 IK/경로 실패: `/harvest/motion_status` 발행 후 실패 상태 종료
 - 예상치 못한 충돌: 즉시 정지 후 실패 상태 보고
 - stem 미분리: timeout 후 실패
 - Action cancel: 즉시 정지 후 cancel 결과 보고
