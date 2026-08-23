@@ -17,6 +17,20 @@
 
 ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고, 흔들림·blur·중복 시점을 제외한 대표 프레임 4~6장을 추론에 사용한다. 결과에는 실제 사용한 `frame_index`를 기록한다.
 
+## GPU PC 2 입력 및 모델
+
+- GPU PC 1은 각 대표 프레임의 압축 RGB, RGB에 정렬된 depth 및 해당 시점의 `CameraInfo`를 GPU PC 2로 전달한다.
+- GPU PC 2가 RGB/depth 기반 품질 추론과 직경·손상 면적 기하 측정을 담당한다.
+- RGB 모델 입력은 640×640으로 resize/letterbox하고 학습과 추론에 동일한 정규화를 적용한다.
+- depth는 신경망 입력에 직접 사용하지 않고 직경과 손상 면적 계산에 사용한다.
+- 모델은 등급을 직접 출력하지 않고 착색률, 손상률 또는 손상 면적, 심각 결함 여부와 각 측정의 confidence를 출력한다.
+- 직경은 정렬된 depth와 실행 시 전달받은 camera intrinsics로 계산한다. intrinsics를 코드 상수로 고정하지 않는다.
+- 프레임 confidence는 유효한 모델 출력 confidence의 평균이다. 초기 유효 threshold는 0.5이며 핵심 측정의 confidence가 0.5 미만이면 해당 측정값을 무효 처리한다.
+- 모델 배포 형식은 ONNX를 기본으로 하고 GPU PC 2의 MVP 실행 백엔드는 ONNX Runtime CUDA를 사용한다. 성능이 부족하면 TensorRT 변환을 검토한다.
+- annotation 최소 단위는 착색 영역, 표면 손상 영역 및 심각 결함 여부다. 부패와 형상 이상은 데이터셋에서 신뢰성 있게 구분할 수 있을 때 별도 클래스로 확장한다.
+
+`InspectionImage`의 depth 및 `CameraInfo` 필드와 검사 완료 이벤트의 정확한 ROS 메시지 계약은 `docs/architecture/ros2_interfaces.md`에 반영되어야 한다. 해당 아키텍처 문서가 갱신되기 전까지 현재 RGB 전용 메시지로는 이 절의 전체 측정을 수행할 수 없다.
+
 ## 대표 프레임 선택
 
 - 사과 mask가 영상 경계에 닿지 않아야 한다.
@@ -73,6 +87,16 @@ ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고
 - 유효한 손상 면적 측정 프레임이 2장 미만이면 `RECHECK`로 처리한다.
 - 사과 구면 모델 투영과 mask 비율·추정 표면적 방식은 대안으로 기록하며 MVP 기본 방식으로 사용하지 않는다.
 
+## 다중 프레임 통합
+
+- 착색률은 유효 대표 프레임 측정값의 평균을 사용한다.
+- 직경은 유효 측정값의 중앙값을 사용한다.
+- 손상 면적 또는 손상률은 유효 대표 프레임 측정값 중 최댓값을 사용한다.
+- 심각 결함은 유효 프레임 한 장에서라도 검출되면 `true`로 통합한다.
+- 프레임별로 등급을 확정하거나 등급 투표를 하지 않는다. 측정값을 사과 단위로 통합한 뒤 등급 규칙을 한 번 적용한다.
+- 일부 프레임 처리가 실패해도 정상 처리된 대표 프레임이 4장 이상이면 통합한다. 4장 미만이면 `INSUFFICIENT_VIEWS`로 처리한다.
+- 최종 confidence는 유효 프레임별 confidence의 평균을 사용한다.
+
 ## ID 예외 처리
 
 - ID가 변경되면 `RECHECK`로 처리한다.
@@ -83,10 +107,15 @@ ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고
 
 ## 결과 시간 처리
 
+- GPU PC 1은 사과가 카메라 ROI를 이탈하면 검사 완료 이벤트를 GPU PC 2로 전달한다. 이벤트는 검사와 사과를 식별할 값, `total_frames`, ROI 이탈 simulation timestamp를 포함해야 한다.
+- GPU PC 2는 검사 완료 이벤트의 ROI 이탈 timestamp를 deadline 시작점으로 사용한다.
+- 완료 이벤트 수신 시 누락된 `frame_index`가 있으면 deadline까지 기다리고, 이후에도 누락된 프레임은 실패 프레임으로 처리한다.
 - 결과 deadline은 카메라 ROI 이탈 후 simulation time 0.5초다.
 - deadline 안에 결과가 도착하면 정상 처리한다.
 - deadline까지 결과가 없으면 `TIMEOUT`으로 처리한다.
 - deadline 이후 결과가 도착하면 `LATE_RESULT`로 기록한다.
+- `TIMEOUT`과 `LATE_RESULT` 판정은 GPU PC 2가 담당한다. deadline 이후 계산된 정상 등급을 최종 정상 결과로 다시 사용하지 않는다.
+- `ID_MISMATCH`는 tracker ID와 rigid body prim 정보를 함께 가진 공정·추적 관리 노드가 판정하며 GPU PC 2는 입력 검사 내부의 `apple_id` 일치만 검증한다.
 - `TIMEOUT`, `LATE_RESULT`, `RECHECK`, `UNCLASSIFIED`는 푸셔와 연결하지 않고 컨베이어 3 라인 끝으로 통과시킨다.
 - 공정 시간은 `/clock` 기준 simulation time을 사용한다.
 
@@ -95,7 +124,9 @@ ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고
 ```text
 GPU PC 1
 후보 프레임 수집 및 대표 프레임 선택
-  → inspection_id + apple_id + frame_index + compressed image
+  → inspection_id + apple_id + frame_index
+    + compressed RGB + aligned depth + CameraInfo
+  → ROI 이탈 검사 완료 이벤트
 
 GPU PC 2
 이미지별 품질 추론 및 사과 단위 통합
@@ -116,4 +147,4 @@ QualityResult와 apple_id 연결 확인 후 컨베이어 3 라인 끝으로 배�
 
 ## 미확정 사항
 
-품질 모델 구조와 세부 출력 필드, confidence threshold 및 등급별 목표 정확도는 협동 데이터 학습과 검증 후 확정한다. 착색률·윤택·부패·형상 이상의 annotation 규칙과 프레임별 결과 통합 규칙도 데이터 특성을 확인할 때까지 TBD로 둔다. 일시 누락 후 동일 ID 복구를 허용할 구체적인 연속성 기준, 네트워크 장애 감지용 wall-time timeout 및 다중 사과 상황의 ID 복구 규칙은 통신 시험을 거쳐 확정한다.
+세부 모델 구조, 등급별 목표 정확도, 정규화 세부값과 confidence 보정 방식은 학습 및 검증 후 확정한다. 착색·손상 annotation의 경계 기준과 실제 단위 손상 면적 검증 기준도 추가 데이터가 필요하다. 검사 완료 이벤트의 토픽·메시지 필드, depth encoding과 압축 방식은 ROS 인터페이스 문서에서 확정해야 한다. `TIMEOUT` 발행 후 뒤늦은 완료를 `LATE_RESULT`로 추가 발행할지 내부 기록만 할지는 단일 최종 결과 원칙에 맞춰 명확히 해야 한다. 네트워크 장애 감지용 heartbeat 토픽과 다중 사과 ID 복구 규칙은 통신 시험을 거쳐 확정한다.

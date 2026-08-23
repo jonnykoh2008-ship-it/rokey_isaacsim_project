@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+trial_and_error/
+install/
+log/
+/apple_data/
