@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+/appleproj_interfaces/install/
+/appleproj_interfaces/log/
 develop-eggs/
 dist/
 downloads/
