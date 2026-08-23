@@ -8,12 +8,17 @@ import numpy as np
 SHAPE_SPHERE = 1
 SHAPE_BOX = 2
 SHAPE_CAPSULE = 3
+CLASS_TRUNK = 1
+CLASS_BRANCH = 2
 
 PREGRASP_DISTANCE_M = 0.15
 STAGING_DISTANCE_M = 0.30
 OUTSIDE_OFFSET_M = 0.45
 SIDE_OFFSET_M = 0.20
 SAMPLE_SPACING_M = 0.03
+PLANNING_CORRIDOR_RADIUS_M = 0.25
+START_PROXY_EXCLUSION_RADIUS_M = 0.18
+MAX_BRANCH_PROXIES = 48
 
 
 class RoutePlanningError(RuntimeError):
@@ -28,6 +33,7 @@ class Proxy:
     orientation_xyzw: np.ndarray
     dimensions: np.ndarray
     safety_margin: float
+    obstacle_class: int = 0
 
     def __post_init__(self):
         position = np.asarray(self.position, dtype=float)
@@ -39,10 +45,24 @@ class Proxy:
             raise ValueError(f"{self.obstacle_id}: proxy orientation이 유효하지 않습니다.")
         if dimensions.shape != (3,) or not np.all(np.isfinite(dimensions)):
             raise ValueError(f"{self.obstacle_id}: proxy dimensions가 유효하지 않습니다.")
+        if np.any(dimensions < 0.0):
+            raise ValueError(f"{self.obstacle_id}: proxy dimensions가 음수입니다.")
+        if self.shape not in (SHAPE_SPHERE, SHAPE_BOX, SHAPE_CAPSULE):
+            raise ValueError(f"{self.obstacle_id}: 지원하지 않는 proxy shape입니다: {self.shape}")
         if np.linalg.norm(orientation) <= 1e-12:
             raise ValueError(f"{self.obstacle_id}: proxy quaternion이 0입니다.")
         if not np.isfinite(self.safety_margin) or self.safety_margin < 0.0:
             raise ValueError(f"{self.obstacle_id}: safety margin이 유효하지 않습니다.")
+        if self.shape == SHAPE_SPHERE and dimensions[0] <= 0.0:
+            raise ValueError(f"{self.obstacle_id}: sphere 반지름이 0 이하입니다.")
+        if self.shape == SHAPE_BOX and np.any(dimensions <= 0.0):
+            raise ValueError(f"{self.obstacle_id}: box 크기가 0 이하입니다.")
+        if self.shape == SHAPE_CAPSULE and (
+            dimensions[0] <= 0.0 or dimensions[1] <= 0.0
+        ):
+            raise ValueError(
+                f"{self.obstacle_id}: capsule 반지름 또는 중심선 길이가 0 이하입니다."
+            )
         object.__setattr__(self, "position", position)
         object.__setattr__(self, "orientation_xyzw", orientation / np.linalg.norm(orientation))
         object.__setattr__(self, "dimensions", dimensions)
@@ -160,8 +180,8 @@ def point_clearance(point, proxy):
     if proxy.shape == SHAPE_CAPSULE:
         radius = float(proxy.dimensions[0] + proxy.safety_margin)
         half_segment = max(0.0, 0.5 * float(proxy.dimensions[1]))
-        closest_z = np.clip(local[2], -half_segment, half_segment)
-        return float(np.linalg.norm(local - np.array([0.0, 0.0, closest_z])) - radius)
+        closest_y = np.clip(local[1], -half_segment, half_segment)
+        return float(np.linalg.norm(local - np.array([0.0, closest_y, 0.0])) - radius)
     raise ValueError(f"지원하지 않는 proxy shape입니다: {proxy.shape}")
 
 
@@ -199,9 +219,40 @@ def _proxy_world_bounds(proxy):
         half = rotation @ (0.5 * proxy.dimensions + margin)
         return proxy.position - half, proxy.position + half
     radius = float(proxy.dimensions[0]) + margin
-    half_local = np.array([radius, radius, radius + 0.5 * proxy.dimensions[1]])
+    half_local = np.array([radius, radius + 0.5 * proxy.dimensions[1], radius])
     half = np.abs(_quaternion_matrix_xyzw(proxy.orientation_xyzw)) @ half_local
     return proxy.position - half, proxy.position + half
+
+
+def _select_corridor_proxies(start_tcp, route_points, proxies):
+    """경로 주변 proxy만 가까운 순서로 선택한다.
+
+    시작 TCP와 이미 겹친 proxy는 현재 자세를 가두는 원인이 될 수 있으므로
+    개인 PC 1의 후보 경로 검사에서는 제외한다. GPU PC 1은 실행 직전 실제
+    PhysX overlap을 별도로 검사해야 한다.
+    """
+    selected = []
+    for proxy in proxies:
+        start_clearance = point_clearance(start_tcp, proxy)
+        if (
+            start_clearance < START_PROXY_EXCLUSION_RADIUS_M
+            and proxy.shape != SHAPE_BOX
+        ):
+            continue
+        clearance, _obstacle = route_clearance(route_points, [proxy])
+        if clearance <= PLANNING_CORRIDOR_RADIUS_M:
+            selected.append((clearance, proxy))
+    selected.sort(key=lambda item: item[0])
+    trunks = [item for item in selected if item[1].obstacle_class == CLASS_TRUNK]
+    branches = [item for item in selected if item[1].obstacle_class == CLASS_BRANCH]
+    unclassified = [
+        item
+        for item in selected
+        if item[1].obstacle_class not in (CLASS_TRUNK, CLASS_BRANCH)
+    ]
+    selected = trunks + branches[:MAX_BRANCH_PROXIES] + unclassified[:MAX_BRANCH_PROXIES]
+    selected.sort(key=lambda item: item[0])
+    return tuple(proxy for _clearance, proxy in selected)
 
 
 def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
@@ -222,7 +273,8 @@ def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
     pregrasp = apple_position - np.array([0.0, 0.0, PREGRASP_DISTANCE_M])
 
     direct = [start_tcp, staging, pregrasp]
-    clearance, obstacle = route_clearance(direct, proxies)
+    corridor_proxies = _select_corridor_proxies(start_tcp, direct, proxies)
+    clearance, obstacle = route_clearance(direct, corridor_proxies)
     if clearance >= 0.0:
         return PlannedRoute(
             "direct", tuple(np.asarray(p, dtype=float) for p in direct[1:]), orientation, clearance, obstacle
@@ -230,7 +282,7 @@ def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
     if not proxies:
         raise RoutePlanningError("planning scene에 obstacle proxy가 없습니다.")
 
-    bounds = [_proxy_world_bounds(proxy) for proxy in proxies]
+    bounds = [_proxy_world_bounds(proxy) for proxy in corridor_proxies]
     minimum = np.min(np.asarray([item[0] for item in bounds]), axis=0)
     maximum = np.max(np.asarray([item[1] for item in bounds]), axis=0)
     center = 0.5 * (minimum + maximum)
@@ -269,7 +321,7 @@ def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
         if abs(lateral_offset) > 1e-9:
             points.append(near_staging)
         points.extend([staging, pregrasp])
-        clearance, obstacle = route_clearance(points, proxies)
+        clearance, obstacle = route_clearance(points, corridor_proxies)
         attempted.append(f"{name}={clearance:.3f}m/{obstacle}")
         if clearance >= 0.0:
             return PlannedRoute(
