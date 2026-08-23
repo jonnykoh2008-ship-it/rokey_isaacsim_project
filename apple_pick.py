@@ -67,7 +67,7 @@ simulation_app = SimulationApp(
 import omni.physx
 import omni.usd
 from omni.physx.bindings._physx import SimulationEvent
-from pxr import Gf, PhysicsSchemaTools, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, PhysicsSchemaTools, PhysxSchema, Usd, UsdGeom, UsdPhysics
 
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import VisualCuboid, VisualSphere
@@ -529,6 +529,113 @@ class JointBreakMonitor:
             f"test={args.break_test}, "
             f"limit={break_force:.3g} N/{break_torque:.3g} N·m"
         )
+
+
+class RobotTreeContactMonitor:
+    """실제 PhysX collider의 로봇-나무 접촉을 physics step마다 감시한다."""
+
+    def __init__(self, stage):
+        self.detected = False
+        self.state = "IDLE"
+        self.robot_path = None
+        self.tree_path = None
+        articulation = require_prim(stage, ARTICULATION_PRIM_PATH)
+        report = PhysxSchema.PhysxContactReportAPI.Apply(articulation)
+        report.CreateThresholdAttr(0.0)
+        self._subscription = (
+            omni.physx.get_physx_simulation_interface()
+            .subscribe_contact_report_events(self._on_contact_report)
+        )
+
+    @staticmethod
+    def _decode_path(encoded):
+        try:
+            return str(PhysicsSchemaTools.intToSdfPath(encoded))
+        except (TypeError, AttributeError):
+            return str(PhysicsSchemaTools.decodeSdfPath(encoded[0], encoded[1]))
+
+    @staticmethod
+    def _is_robot_path(path):
+        return path.startswith(ROBOT_PRIM_PATH) or path.startswith(
+            ARTICULATION_PRIM_PATH
+        )
+
+    @staticmethod
+    def _is_tree_path(path):
+        lowered = path.lower()
+        return (
+            path.startswith(TREE_ROOT_PATH)
+            or path.startswith(BRANCH_BODY_PATH)
+            or "/trunk/" in lowered
+            or "/sticks/" in lowered
+            or "/sticks02/" in lowered
+        )
+
+    def set_state(self, state):
+        self.state = state
+
+    def reset(self):
+        self.detected = False
+        self.robot_path = None
+        self.tree_path = None
+
+    def close(self):
+        self._subscription = None
+
+    def _on_contact_report(self, headers, _data):
+        if self.detected:
+            return
+        for header in headers:
+            if int(header.num_contact_data) <= 0:
+                continue
+            paths = [
+                self._decode_path(header.actor0),
+                self._decode_path(header.actor1),
+                self._decode_path(header.collider0),
+                self._decode_path(header.collider1),
+            ]
+            robot_paths = [path for path in paths if self._is_robot_path(path)]
+            tree_paths = [path for path in paths if self._is_tree_path(path)]
+            if not robot_paths or not tree_paths:
+                continue
+            self.detected = True
+            self.robot_path = robot_paths[0]
+            self.tree_path = tree_paths[0]
+            print(
+                f"   [PHYSX CONTACT] state={self.state}, "
+                f"robot={self.robot_path}, tree={self.tree_path}"
+            )
+            return
+
+
+def find_robot_tree_physx_overlap(stage):
+    """현재 자세의 실제 로봇 collider와 나무 collider 겹침을 반환한다."""
+    scene_query = omni.physx.get_physx_scene_query_interface()
+    robot_root = require_prim(stage, ROBOT_PRIM_PATH)
+    for prim in Usd.PrimRange(robot_root):
+        if not prim.IsA(UsdGeom.GPrim) or not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        collision = UsdPhysics.CollisionAPI(prim)
+        enabled = collision.GetCollisionEnabledAttr().Get()
+        if enabled is False:
+            continue
+        encoded = PhysicsSchemaTools.encodeSdfPath(prim.GetPath())
+        tree_hit = []
+
+        def report_hit(hit):
+            paths = [str(hit.collision), str(hit.rigid_body)]
+            for path in paths:
+                if RobotTreeContactMonitor._is_tree_path(path):
+                    tree_hit.append(path)
+                    return False
+            return True
+
+        scene_query.overlap_shape(
+            encoded[0], encoded[1], report_hit, False
+        )
+        if tree_hit:
+            return str(prim.GetPath()), tree_hit[0]
+    return None
 
 
 def configure_joint_drives(stage):
@@ -1389,6 +1496,86 @@ def _visual_cuboid(stage, path, position, size):
     )
 
 
+def extract_static_planning_proxy_specs(stage):
+    """reset 단위로 전송할 전체 나무 box/sphere proxy 명세를 만든다.
+
+    반환 dimensions는 안전거리 적용 전 형상 크기이며, 수신 측은
+    ``safety_margin``을 별도로 더한다. 잎과 목표 사과는 포함하지 않는다.
+    """
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    bbox_cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+        useExtentsHint=True,
+    )
+    branch_points = []
+    trunk_meshes = []
+    for root_path in (TREE_ROOT_PATH, BRANCH_BODY_PATH):
+        root = require_prim(stage, root_path)
+        for prim in Usd.PrimRange(root):
+            path_text = str(prim.GetPath()).lower()
+            if "/foli/" in path_text or not prim.IsA(UsdGeom.Mesh):
+                continue
+            if "/trunk/" in path_text:
+                trunk_meshes.append(prim)
+            elif (
+                "/sticks/" in path_text
+                or "/sticks02/" in path_text
+                or "branchbody" in path_text
+            ):
+                branch_points.append(_mesh_world_points(prim, xform_cache))
+
+    if not trunk_meshes:
+        raise RuntimeError("planning scene용 나무 몸통 mesh를 찾지 못했습니다.")
+    specs = []
+    for index, trunk_mesh in enumerate(trunk_meshes):
+        box = bbox_cache.ComputeWorldBound(trunk_mesh).ComputeAlignedBox()
+        minimum = np.asarray(box.GetMin(), dtype=float)
+        maximum = np.asarray(box.GetMax(), dtype=float)
+        specs.append(
+            {
+                "obstacle_id": f"trunk_{index:03d}",
+                "shape": "box",
+                "obstacle_class": "trunk",
+                "position": 0.5 * (minimum + maximum),
+                "orientation_xyzw": np.array([0.0, 0.0, 0.0, 1.0]),
+                "dimensions": maximum - minimum,
+                "safety_margin": THICK_BRANCH_CLEARANCE_M,
+            }
+        )
+
+    combined = (
+        np.concatenate(branch_points, axis=0)
+        if branch_points
+        else np.empty((0, 3), dtype=float)
+    )
+    if combined.size:
+        voxel_keys = np.floor(combined / BRANCH_PROXY_VOXEL_M).astype(np.int64)
+        _unique, first_indices = np.unique(voxel_keys, axis=0, return_index=True)
+        branch_centers = combined[np.sort(first_indices)]
+    else:
+        branch_centers = np.empty((0, 3), dtype=float)
+    for index, center in enumerate(branch_centers):
+        specs.append(
+            {
+                "obstacle_id": f"branch_{index:04d}",
+                "shape": "sphere",
+                "obstacle_class": "branch",
+                "position": np.asarray(center, dtype=float),
+                "orientation_xyzw": np.array([0.0, 0.0, 0.0, 1.0]),
+                "dimensions": np.array(
+                    [0.5 * BRANCH_PROXY_VOXEL_M, 0.0, 0.0], dtype=float
+                ),
+                "safety_margin": SMALL_BRANCH_CLEARANCE_M,
+            }
+        )
+    print(
+        f"   Scene proxy  trunk {len(trunk_meshes)}, "
+        f"branch {len(branch_centers)}, leaf 0"
+    )
+    return specs
+
+
 def create_planning_obstacles(stage, path_start, pregrasp_tcp, apple_center):
     """USD 나무 mesh를 경로 주변의 planning-only proxy로 단순화한다."""
     if stage.GetPrimAtPath(PLANNING_OBSTACLE_ROOT_PATH).IsValid():
@@ -1847,6 +2034,9 @@ def move_arm_to_pregrasp(
     approach_rotation,
     max_physics_steps=0,
     contact_guard=None,
+    external_waypoints=None,
+    pause_callback=None,
+    resume_callback=None,
 ):
     """사과 obstacle staging을 거쳐 충돌 없는 pregrasp 경로를 실행한다."""
     lateral_axis = np.asarray(approach_rotation[:, 2], dtype=float)
@@ -1892,10 +2082,16 @@ def move_arm_to_pregrasp(
                 return None
             if max_physics_steps > 0 and physics_steps >= max_physics_steps:
                 return None
+            pause_reported = False
             while not world.is_playing():
                 if world.is_stopped() or not simulation_app.is_running():
                     return None
+                if not pause_reported and pause_callback is not None:
+                    pause_callback()
+                    pause_reported = True
                 world.step(render=not args.headless)
+            if pause_reported and resume_callback is not None:
+                resume_callback()
 
             if contact_guard is not None and contact_guard():
                 raise ApproachUnreachableError(
@@ -2016,6 +2212,85 @@ def move_arm_to_pregrasp(
             warm_start = np.asarray(joint_goal, dtype=float)
         print(f"   Outside IK   {candidate['name']:13s} OK (3 poses)")
         return True
+
+    def external_route_has_ik(waypoints):
+        """개인 PC가 만든 waypoint를 현재 관절 자세에서 순차 IK 검사한다."""
+        arm_indices = np.asarray(
+            [robot.get_dof_index(name) for name in ARM_JOINTS], dtype=np.int32
+        )
+        warm_start = robot.get_joint_positions(joint_indices=arm_indices)
+        if warm_start is None:
+            raise ApproachUnreachableError(
+                "외부 waypoint IK 검사 전에 로봇 관절 위치를 읽지 못했습니다."
+            )
+        warm_start = np.asarray(warm_start, dtype=float)
+        if not np.all(np.isfinite(warm_start)):
+            raise ApproachUnreachableError("외부 waypoint IK seed가 유효하지 않습니다.")
+        for index, waypoint in enumerate(waypoints):
+            link_position, link_rotation = tcp_target_to_link6(
+                waypoint,
+                approach_rotation,
+                collision_motion.link6_to_palm_translation,
+                collision_motion.link6_to_palm_rotation,
+            )
+            joint_goal, solved = lula_solver.compute_inverse_kinematics(
+                frame_name=EE_FRAME_NAME,
+                target_position=link_position,
+                target_orientation=rot_matrix_to_quat(link_rotation),
+                warm_start=warm_start,
+                position_tolerance=0.005,
+                orientation_tolerance=np.deg2rad(5.0),
+            )
+            if not solved:
+                print(f"   External IK  waypoint {index + 1} FAILED {vec(waypoint)}")
+                return False
+            warm_start = np.asarray(joint_goal, dtype=float)
+        print(f"   External IK  {len(waypoints)} waypoints OK")
+        return True
+
+    if external_waypoints is not None:
+        waypoints = [np.asarray(point, dtype=float) for point in external_waypoints]
+        if not waypoints:
+            raise ApproachUnreachableError("개인 PC의 APPROACH waypoint가 비어 있습니다.")
+        if any(point.shape != (3,) or not np.all(np.isfinite(point)) for point in waypoints):
+            raise ApproachUnreachableError("개인 PC의 APPROACH waypoint가 유효하지 않습니다.")
+        if np.linalg.norm(waypoints[-1] - np.asarray(pregrasp_tcp)) > 0.01:
+            raise ApproachUnreachableError(
+                "외부 경로의 마지막 waypoint가 GPU pregrasp 목표와 일치하지 않습니다."
+            )
+        current_tcp, _ = current_tcp_pose(robot)
+        clearance, obstacle_name = collision_motion._route_clearance(
+            [current_tcp, *waypoints]
+        )
+        if clearance < 0.0:
+            raise ApproachUnreachableError(
+                f"GPU proxy 재검사에서 외부 경로가 {obstacle_name}과 "
+                f"{clearance:.3f} m 겹칩니다."
+            )
+        if not external_route_has_ik(waypoints):
+            raise ApproachUnreachableError("외부 APPROACH 경로의 순차 IK 검사에 실패했습니다.")
+        print(
+            f"   External plan {len(waypoints)} waypoints, "
+            f"GPU clearance {clearance:.3f} m to {obstacle_name}"
+        )
+        for index, waypoint in enumerate(waypoints):
+            if index == len(waypoints) - 1:
+                collision_motion.disable_target_apple()
+            reached = follow_waypoint(
+                "EXTERNAL APPROACH",
+                index + 1,
+                len(waypoints),
+                waypoint,
+                approach_rotation,
+            )
+            if reached is None:
+                return physics_steps, False
+            if not reached:
+                raise ApproachUnreachableError(
+                    f"외부 APPROACH waypoint {index + 1}/{len(waypoints)}에 "
+                    "도달하지 못했습니다."
+                )
+        return physics_steps, True
 
     print(
         f"   Staging TCP  {vec(staging_tcp)} "

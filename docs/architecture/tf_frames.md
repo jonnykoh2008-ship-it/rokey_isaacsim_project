@@ -44,6 +44,16 @@ M0617이 고정 설치된 MVP에서는 `odom → base_link`가 변하지 않는�
 - orientation: MVP에서는 월드 좌표축과 동일
 - 다중 사과 단계에서 ID를 도입한다.
 
+## 분산 planning scene 좌표계
+
+- `/planning_scene`의 `header.frame_id`, 모든 obstacle pose,
+  `robot_base_pose`, `robot_tcp_pose`는 `world`를 사용한다.
+- `RobotMotion`의 `target_pose`와 `waypoints`도 모두 `world`를 사용한다.
+- 개인 PC 1은 frame이 다르거나 `reset_id/scene_version`이 현재 simulation
+  상태와 다른 scene 및 waypoint를 사용하지 않는다.
+- GPU PC 1은 외부 waypoint를 물리 TCP 목표로 해석한 뒤 `link_6` 제어 목표로
+  변환한다.
+
 ## 시간
 
 - Isaac Sim이 `/clock`을 발행한다.

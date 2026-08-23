@@ -20,6 +20,10 @@
 - LulaKinematicsSolver 사용
 - world `+Z` 기본 접근만 사용
 - 굵은 가지 충돌 회피
+- GPU PC 1이 몸통/가지 planning proxy snapshot과 명시적 simulation 상태를
+  발행하고, 개인 PC 1이 APPROACH 전역 waypoint를 계획한다.
+- GPU PC 1은 동일한 scene version을 재검증하고 RMPflow로 waypoint를 실행하며,
+  실제 로봇-나무 PhysX 접촉 시 Action을 중단한다.
 - 급격한 joint 변화 및 singularity 방지
 - 45°/1초 손목 회전
 - 50mm/s, 최대 100mm 직선 당김

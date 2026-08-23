@@ -50,11 +50,16 @@ import omni.graph.core as og
 import rclpy
 import usdrt.Sdf
 from appleproj_interfaces.action import RobotMotion
+from appleproj_interfaces.msg import ObstacleProxy, PlanningScene, SimulationState
+from appleproj_interfaces.srv import GetPlanningScene
+from geometry_msgs.msg import PoseStamped
 from isaacsim.core.utils.extensions import enable_extension
 from pxr import Usd, UsdGeom
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 
 MOTION_SEQUENCE = [
@@ -176,10 +181,32 @@ class RobotMotionNode(Node):
     """ROS callback에서는 요청만 보관하고 Isaac API는 메인 스레드만 사용한다."""
 
     def __init__(self):
-        super().__init__("isaac_robot_motion_server")
+        super().__init__(
+            "isaac_robot_motion_server",
+            parameter_overrides=[Parameter("use_sim_time", value=True)],
+        )
         self.requests = queue.Queue(maxsize=1)
         self.busy = False
         self.lock = threading.Lock()
+        self.reset_id = 0
+        self.scene_version = 0
+        self.simulation_state = SimulationState.INITIALIZING
+        self.scene_message = None
+        latched_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.state_publisher = self.create_publisher(
+            SimulationState, "/simulation/state", latched_qos
+        )
+        self.scene_publisher = self.create_publisher(
+            PlanningScene, "/planning_scene", latched_qos
+        )
+        self.scene_service = self.create_service(
+            GetPlanningScene, "/planning_scene/get_snapshot", self.get_scene
+        )
         self.server = ActionServer(
             self,
             RobotMotion,
@@ -191,7 +218,32 @@ class RobotMotionNode(Node):
 
     def accept_goal(self, request):
         with self.lock:
-            if self.busy or request.motion_type not in MOTION_SEQUENCE:
+            valid_state = self.simulation_state in (
+                SimulationState.READY,
+                SimulationState.PLAYING,
+            )
+            valid_version = (
+                request.reset_id == self.reset_id
+                and request.scene_version == self.scene_version
+            )
+            valid_waypoints = (
+                request.motion_type != RobotMotion.Goal.APPROACH
+                or len(request.waypoints) > 0
+            )
+            if (
+                self.busy
+                or request.motion_type not in MOTION_SEQUENCE
+                or not valid_state
+                or not valid_version
+                or not valid_waypoints
+            ):
+                self.get_logger().warning(
+                    "RobotMotion Goal 거부: "
+                    f"busy={self.busy}, state={self.simulation_state}, "
+                    f"goal version={request.reset_id}/{request.scene_version}, "
+                    f"current={self.reset_id}/{self.scene_version}, "
+                    f"waypoints={len(request.waypoints)}"
+                )
                 return GoalResponse.REJECT
             self.busy = True
         return GoalResponse.ACCEPT
@@ -204,12 +256,116 @@ class RobotMotionNode(Node):
             self.busy = False
         return pending.result
 
+    def publish_state(self, state, message=""):
+        with self.lock:
+            self.simulation_state = int(state)
+            reset_id = self.reset_id
+            scene_version = self.scene_version
+        value = SimulationState()
+        value.header.stamp = self.get_clock().now().to_msg()
+        value.header.frame_id = "world"
+        value.state = int(state)
+        value.reset_id = int(reset_id)
+        value.scene_version = int(scene_version)
+        value.message = message
+        self.state_publisher.publish(value)
+
+    @staticmethod
+    def _pose_stamped(position, quaternion_xyzw, stamp):
+        value = PoseStamped()
+        value.header.stamp = stamp
+        value.header.frame_id = "world"
+        value.pose.position.x = float(position[0])
+        value.pose.position.y = float(position[1])
+        value.pose.position.z = float(position[2])
+        value.pose.orientation.x = float(quaternion_xyzw[0])
+        value.pose.orientation.y = float(quaternion_xyzw[1])
+        value.pose.orientation.z = float(quaternion_xyzw[2])
+        value.pose.orientation.w = float(quaternion_xyzw[3])
+        return value
+
+    def publish_scene(self, reset_id, scene_version, specs, base_pose, tcp_pose):
+        stamp = self.get_clock().now().to_msg()
+        scene = PlanningScene()
+        scene.header.stamp = stamp
+        scene.header.frame_id = "world"
+        scene.reset_id = int(reset_id)
+        scene.scene_version = int(scene_version)
+        base_position, base_quaternion_wxyz = base_pose
+        tcp_position, tcp_rotation = tcp_pose
+        base_xyzw = harvest.np.array(
+            [
+                base_quaternion_wxyz[1],
+                base_quaternion_wxyz[2],
+                base_quaternion_wxyz[3],
+                base_quaternion_wxyz[0],
+            ]
+        )
+        tcp_wxyz = harvest.rot_matrix_to_quat(tcp_rotation)
+        tcp_xyzw = harvest.np.array(
+            [tcp_wxyz[1], tcp_wxyz[2], tcp_wxyz[3], tcp_wxyz[0]]
+        )
+        scene.robot_base_pose = self._pose_stamped(base_position, base_xyzw, stamp)
+        scene.robot_tcp_pose = self._pose_stamped(tcp_position, tcp_xyzw, stamp)
+        for spec in specs:
+            proxy = ObstacleProxy()
+            proxy.obstacle_id = spec["obstacle_id"]
+            proxy.shape = {
+                "sphere": ObstacleProxy.SHAPE_SPHERE,
+                "box": ObstacleProxy.SHAPE_BOX,
+                "capsule": ObstacleProxy.SHAPE_CAPSULE,
+            }[spec["shape"]]
+            proxy.obstacle_class = {
+                "trunk": ObstacleProxy.CLASS_TRUNK,
+                "branch": ObstacleProxy.CLASS_BRANCH,
+            }[spec["obstacle_class"]]
+            position = spec["position"]
+            orientation = spec["orientation_xyzw"]
+            dimensions = spec["dimensions"]
+            proxy.pose.position.x = float(position[0])
+            proxy.pose.position.y = float(position[1])
+            proxy.pose.position.z = float(position[2])
+            proxy.pose.orientation.x = float(orientation[0])
+            proxy.pose.orientation.y = float(orientation[1])
+            proxy.pose.orientation.z = float(orientation[2])
+            proxy.pose.orientation.w = float(orientation[3])
+            proxy.dimensions.x = float(dimensions[0])
+            proxy.dimensions.y = float(dimensions[1])
+            proxy.dimensions.z = float(dimensions[2])
+            proxy.safety_margin = float(spec["safety_margin"])
+            scene.obstacles.append(proxy)
+        with self.lock:
+            self.reset_id = int(reset_id)
+            self.scene_version = int(scene_version)
+            self.scene_message = scene
+        self.scene_publisher.publish(scene)
+        self.get_logger().info(
+            f"planning scene 발행: reset={reset_id}, version={scene_version}, "
+            f"obstacles={len(scene.obstacles)}"
+        )
+
+    def get_scene(self, _request, response):
+        with self.lock:
+            scene = self.scene_message
+        response.success = scene is not None
+        if scene is not None:
+            response.scene = scene
+            response.message = "latest planning scene"
+        else:
+            response.message = "planning scene이 아직 준비되지 않았습니다."
+        return response
+
+    def execution_version(self):
+        with self.lock:
+            return self.reset_id, self.scene_version, self.simulation_state
+
 
 class MotionEngine:
     """기존 FSM을 Action 단계 경계에서 정지시키는 메인 스레드 실행기."""
 
-    def __init__(self, world, robot, stage):
+    def __init__(self, world, robot, stage, state_callback=None):
         self.world, self.robot, self.stage = world, robot, stage
+        self.state_callback = state_callback
         self.ik, self.lula = harvest.create_ik_solver(robot, stage)
         self.gripper_indices = [robot.get_dof_index(n) for n in harvest.GRIPPER_JOINTS]
         self.arm_indices = harvest.np.asarray(
@@ -223,10 +379,12 @@ class MotionEngine:
         self.fsm = None
         self.collision_motion = None
         self.joint_break = harvest.JointBreakMonitor()
+        self.tree_contact = harvest.RobotTreeContactMonitor(stage)
         self.gripper_drive_max_force = harvest.GRIPPER_GRASP_MAX_FORCE
 
     def close(self):
         self.joint_break.close()
+        self.tree_contact.close()
 
     def _reset_action_sequence(self, reason):
         """실패한 Goal의 부분 FSM을 폐기하고 다음 요청을 APPROACH로 맞춘다."""
@@ -239,6 +397,7 @@ class MotionEngine:
         self.expected_index = 0
         self.fsm = None
         self.collision_motion = None
+        self.tree_contact.reset()
 
     def _set_gripper_drive_max_force(self, max_force, state, report=False):
         """동작 단계에 맞춰 그리퍼 Drive 토크 한계를 갱신한다."""
@@ -265,6 +424,20 @@ class MotionEngine:
         value.current_state, value.progress = state, float(progress)
         handle.publish_feedback(value)
 
+    def _publish_pause(self):
+        if self.state_callback is not None:
+            self.state_callback(
+                SimulationState.PAUSED,
+                "Timeline Pause: 실행 중 Goal을 유지하고 로봇 명령을 보류합니다.",
+            )
+
+    def _publish_resume(self):
+        if self.state_callback is not None:
+            self.state_callback(
+                SimulationState.PLAYING,
+                "Timeline 재개: 보류한 Goal 실행을 계속합니다.",
+            )
+
     def _require_arm_joint_positions(self):
         """Lula에 전달할 현재 팔 관절값과 Articulation handle을 검증한다."""
         joints = self.ik.get_joints_subset()
@@ -287,8 +460,25 @@ class MotionEngine:
             raise RuntimeError("로봇 팔 관절 위치에 NaN 또는 Inf가 있습니다.")
         return positions
 
-    def execute(self, handle):
+    def execute(self, handle, reset_id, scene_version, simulation_state):
         request = handle.request
+        if (
+            request.reset_id != reset_id
+            or request.scene_version != scene_version
+        ):
+            handle.abort()
+            return self.result(
+                False,
+                "SCENE_MISMATCH",
+                "Goal 생성 이후 planning scene 버전이 변경됐습니다.",
+            )
+        if simulation_state not in (SimulationState.READY, SimulationState.PLAYING):
+            handle.abort()
+            return self.result(
+                False,
+                "SIMULATION_NOT_READY",
+                f"Isaac Sim 실행 상태가 준비되지 않았습니다: {simulation_state}",
+            )
         if request.motion_type != MOTION_SEQUENCE[self.expected_index]:
             expected = MOTION_SEQUENCE[self.expected_index]
             self._reset_action_sequence("INVALID_SEQUENCE")
@@ -304,7 +494,13 @@ class MotionEngine:
             return self.result(False, "INVALID_FRAME", "target_pose frame_id는 world여야 합니다.")
         try:
             if request.motion_type == RobotMotion.Goal.APPROACH:
-                self._approach(handle, request.target_pose)
+                overlap = harvest.find_robot_tree_physx_overlap(self.stage)
+                if overlap is not None:
+                    raise MotionExecutionError(
+                        "INITIAL_COLLISION",
+                        f"실행 전 실제 PhysX collider가 겹쳐 있습니다: {overlap}",
+                    )
+                self._approach(handle, request.target_pose, request.waypoints)
             else:
                 self._run_fsm(handle, STOP_STATE[request.motion_type])
                 if request.motion_type == RobotMotion.Goal.GRASP:
@@ -339,7 +535,7 @@ class MotionEngine:
         handle.succeed()
         return self.result(True, "", "동작 완료")
 
-    def _approach(self, handle, pose):
+    def _approach(self, handle, pose, waypoint_messages):
         if self.joint_break.broken:
             raise MotionExecutionError(
                 "APPLE_ALREADY_DETACHED",
@@ -373,7 +569,27 @@ class MotionEngine:
             pregrasp_tcp=pregrasp,
         )
         self.joint_break.set_state("PRE_GRASP")
+        self.tree_contact.reset()
+        self.tree_contact.set_state("APPROACH")
         self.feedback(handle, "APPROACH", 0.1)
+        external_waypoints = []
+        for waypoint in waypoint_messages:
+            if waypoint.header.frame_id != "world":
+                raise MotionExecutionError(
+                    "INVALID_FRAME", "모든 APPROACH waypoint frame_id는 world여야 합니다."
+                )
+            p = waypoint.pose.position
+            external_waypoints.append(harvest.np.array([p.x, p.y, p.z], dtype=float))
+
+        def contact_guard():
+            if self.tree_contact.detected:
+                raise MotionExecutionError(
+                    "UNEXPECTED_CONTACT",
+                    "APPROACH 중 실제 로봇 collider가 나무 collider에 접촉했습니다: "
+                    f"robot={self.tree_contact.robot_path}, tree={self.tree_contact.tree_path}",
+                )
+            return self.joint_break.broken
+
         _steps, complete = harvest.move_arm_to_pregrasp(
             world=self.world,
             robot=self.robot,
@@ -383,9 +599,16 @@ class MotionEngine:
             pregrasp_tcp=pregrasp,
             approach_rotation=rotation,
             max_physics_steps=0,
-            contact_guard=lambda: self.joint_break.broken,
+            contact_guard=contact_guard,
+            external_waypoints=external_waypoints,
+            pause_callback=self._publish_pause,
+            resume_callback=self._publish_resume,
         )
         if not complete:
+            if self.world.is_stopped() or not harvest.simulation_app.is_running():
+                raise MotionExecutionError(
+                    "SIMULATION_STOPPED", "Isaac Sim Timeline이 Stop되었습니다."
+                )
             raise harvest.ApproachUnreachableError(
                 "pregrasp 이동을 완료하지 못했습니다."
             )
@@ -430,10 +653,27 @@ class MotionEngine:
         grasp_settle_remaining = harvest.GRASP_SETTLE_STEPS
         reported_force_state = None
         while not self.fsm.done and self.fsm.NAMES[self.fsm.state] != stop_state:
+            if self.world.is_stopped() or not harvest.simulation_app.is_running():
+                raise MotionExecutionError(
+                    "SIMULATION_STOPPED", "Isaac Sim Timeline이 Stop되었습니다."
+                )
+            pause_reported = False
+            while not self.world.is_playing():
+                if self.world.is_stopped() or not harvest.simulation_app.is_running():
+                    raise MotionExecutionError(
+                        "SIMULATION_STOPPED", "Isaac Sim Timeline이 Stop되었습니다."
+                    )
+                if not pause_reported:
+                    self._publish_pause()
+                    pause_reported = True
+                harvest.simulation_app.update()
+            if pause_reported:
+                self._publish_resume()
             if handle.is_cancel_requested:
                 return
             current_arm_positions = self._require_arm_joint_positions()
             motion_state = self.fsm.NAMES[self.fsm.state]
+            self.tree_contact.set_state(motion_state)
 
             if motion_state == "GRASP" and grasp_hold_positions is None:
                 grasp_hold_positions = current_arm_positions.copy()
@@ -473,6 +713,13 @@ class MotionEngine:
                 )
                 self.world.step(render=not harvest.args.headless)
                 grasp_settle_remaining -= 1
+                if self.tree_contact.detected:
+                    raise MotionExecutionError(
+                        "UNEXPECTED_CONTACT",
+                        "GRASP_SETTLE 중 실제 로봇 collider가 나무 collider에 "
+                        f"접촉했습니다: robot={self.tree_contact.robot_path}, "
+                        f"tree={self.tree_contact.tree_path}",
+                    )
                 if self.joint_break.broken:
                     raise MotionExecutionError(
                         "GRASP_FAILED",
@@ -550,6 +797,13 @@ class MotionEngine:
             state = self.fsm.NAMES[min(self.fsm.state, len(self.fsm.NAMES) - 1)]
             self.feedback(handle, state, 0.5)
             self.world.step(render=not harvest.args.headless)
+            if self.tree_contact.detected:
+                raise MotionExecutionError(
+                    "UNEXPECTED_CONTACT",
+                    f"{motion_state} 중 실제 로봇 collider가 나무 collider에 "
+                    f"접촉했습니다: robot={self.tree_contact.robot_path}, "
+                    f"tree={self.tree_contact.tree_path}",
+                )
             if (
                 self.joint_break.broken
                 and self.joint_break.break_state not in {"TWIST", "PULL"}
@@ -572,16 +826,80 @@ def main():
         physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0,
     )
     robot = harvest.create_robot(world)
-    engine = MotionEngine(world, robot, stage)
     rclpy.init()
     node = RobotMotionNode()
+    engine = MotionEngine(world, robot, stage, node.publish_state)
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     ros_thread = threading.Thread(target=executor.spin, daemon=True)
     ros_thread.start()
+    reset_id = 1
+    scene_version = 1
+
+    def publish_current_scene():
+        specs = harvest.extract_static_planning_proxy_specs(stage)
+        base_pose = harvest.get_prim_world_pose(stage, harvest.ROBOT_BASE_PATH)
+        tcp_pose = harvest.current_tcp_pose(robot)
+        node.publish_scene(
+            reset_id,
+            scene_version,
+            specs,
+            base_pose,
+            tcp_pose,
+        )
+
     try:
+        node.publish_state(SimulationState.INITIALIZING, "Stage와 물리를 초기화합니다.")
         world.play()
+        world.step(render=not harvest.args.headless)
+        publish_current_scene()
+        node.publish_state(SimulationState.READY, "planning scene 동기화가 완료됐습니다.")
+        node.publish_state(SimulationState.PLAYING, "Isaac Sim Timeline이 실행 중입니다.")
+        published_state = SimulationState.PLAYING
+        stopped_needs_reset = False
         while harvest.simulation_app.is_running():
+            if world.is_stopped():
+                if published_state != SimulationState.STOPPED:
+                    node.publish_state(
+                        SimulationState.STOPPED,
+                        "Timeline Stop: 실행 중 Goal과 이전 계획을 폐기합니다.",
+                    )
+                    published_state = SimulationState.STOPPED
+                stopped_needs_reset = True
+                harvest.simulation_app.update()
+                continue
+            if not world.is_playing():
+                if published_state != SimulationState.PAUSED:
+                    node.publish_state(
+                        SimulationState.PAUSED,
+                        "Timeline Pause: Goal 실행을 일시 정지합니다.",
+                    )
+                    published_state = SimulationState.PAUSED
+                harvest.simulation_app.update()
+                continue
+            if stopped_needs_reset:
+                node.publish_state(
+                    SimulationState.INITIALIZING,
+                    "Stop 이후 Articulation과 planning scene을 재초기화합니다.",
+                )
+                engine.close()
+                world.reset()
+                engine = MotionEngine(world, robot, stage, node.publish_state)
+                world.play()
+                world.step(render=not harvest.args.headless)
+                reset_id += 1
+                scene_version += 1
+                publish_current_scene()
+                node.publish_state(
+                    SimulationState.READY,
+                    "새 reset의 planning scene 동기화가 완료됐습니다.",
+                )
+                stopped_needs_reset = False
+            if published_state != SimulationState.PLAYING:
+                node.publish_state(
+                    SimulationState.PLAYING, "Isaac Sim Timeline이 실행 중입니다."
+                )
+                published_state = SimulationState.PLAYING
             try:
                 pending = node.requests.get_nowait()
             except queue.Empty:
@@ -591,11 +909,25 @@ def main():
                 node.get_logger().warning(
                     "Articulation handle이 해제되어 물리와 MotionEngine을 재초기화합니다."
                 )
+                node.publish_state(
+                    SimulationState.INITIALIZING,
+                    "Articulation handle 재초기화 중입니다.",
+                )
                 engine.close()
                 world.reset()
-                engine = MotionEngine(world, robot, stage)
+                engine = MotionEngine(world, robot, stage, node.publish_state)
                 world.play()
-            pending.result = engine.execute(pending.handle)
+                world.step(render=not harvest.args.headless)
+                reset_id += 1
+                scene_version += 1
+                publish_current_scene()
+                node.publish_state(
+                    SimulationState.PLAYING,
+                    "Articulation과 planning scene 재동기화가 완료됐습니다.",
+                )
+            pending.result = engine.execute(
+                pending.handle, *node.execution_version()
+            )
             pending.finished.set()
     finally:
         engine.close()

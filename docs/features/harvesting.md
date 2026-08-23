@@ -5,7 +5,8 @@
 - 로봇: Doosan M0617
 - 그리퍼: AGS-001-MTCP
 - solver: LulaKinematicsSolver
-- end-effector frame: `gripper_frame`
+- 물리 목표: palm 로컬 `+Y 0.093 m`의 수확 TCP
+- Lula/RMPflow 제어 frame: `link_6`
 
 ## 상태 흐름
 
@@ -38,8 +39,16 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
 
 ## 수확 경로 및 충돌 회피
 
-- 홈 자세에서 pre-grasp까지의 transit은 단순 관절 보간을 사용하지 않고
-  Lula/RMPflow의 로봇 collision sphere와 planning obstacle을 사용한다.
+- GPU PC 1은 reset마다 전체 몸통 box와 가지 sphere planning proxy snapshot을
+  `world` 좌표로 발행한다. 잎과 목표 사과는 정적 snapshot에서 제외한다.
+- 개인 PC 1은 현재 `reset_id/scene_version`의 snapshot만 사용해 홈 자세에서
+  pre-grasp까지 direct, 좌우, 추가 외측 전역 waypoint 후보를 계획한다.
+- 개인 PC 1의 APPROACH 경로 마지막 waypoint는 사과 중심에서 world `-Z`
+  방향 `0.15 m`의 pre-grasp pose여야 한다.
+- GPU PC 1은 외부 waypoint의 frame, scene version, 순차 IK와 자체 planning
+  proxy 여유를 다시 검사한다. 검사를 통과하지 못하면 로봇을 움직이지 않는다.
+- GPU PC 1의 transit 실행은 단순 관절 보간을 사용하지 않고 Lula/RMPflow의
+  로봇 collision sphere와 planning obstacle을 사용한다.
 - M0617 전체 링크는 굵은 가지 planning proxy와 충돌하지 않아야 한다.
 - 그리퍼와 손목은 작은 가지 planning proxy와 충돌하지 않아야 한다.
 - 몸통 mesh가 여러 개인 경우 각 mesh를 별도 planning obstacle로 유지한다.
@@ -73,6 +82,17 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
 수확을 중단한다. 실행 중 목표 사과가 pre-grasp 전에 이동하거나 stem joint가
 파손되면 즉시 명령을 중지하고 실패를 보고한다. 안전한 후퇴 경로가 검증된
 경우에만 후퇴하며, 그렇지 않으면 현재 자세에서 정지한다.
+
+개인 PC 1이 계획을 만들지 못하면 `APPROACH_UNREACHABLE`로 해당 사과를
+수확하지 않는다. GPU PC 1은 Action 실행 직전에 실제 PhysX collider가 이미
+겹쳐 있는지 검사하고, 실행 중 Contact Report에서 로봇-나무 접촉을 감지하면
+`UNEXPECTED_CONTACT`로 Action을 중단한다. 사과와 그리퍼의 의도된 접촉 및
+로봇 자체 접촉은 이 나무 접촉 감시 조건에 포함하지 않는다.
+
+Timeline Stop/Reset 시 GPU PC 1은 실행 중 Action을 종료하고 `reset_id`를
+증가시킨 뒤 새 snapshot을 발행한다. 개인 PC 1은 이전 waypoint, IK seed 및
+실패 대상 캐시를 폐기하고 `READY/PLAYING`과 snapshot 동기화를 확인한 후에만
+다음 계획을 시작한다.
 
 RMPflow gain, proxy voxel 크기, proxy 수 제한 및 영향 반경은 시뮬레이션 충돌
 시험 후 조정한다. 조정값은 물리 collider 크기와 planning proxy 크기를 구분해
