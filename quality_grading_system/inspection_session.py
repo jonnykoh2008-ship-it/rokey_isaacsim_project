@@ -67,6 +67,8 @@ class InspectionFrame:
     image_format: str
     apple_mask_data: bytes
     apple_mask_format: str
+    ignore_mask_data: bytes
+    ignore_mask_format: str
     depth_data: bytes
     depth_format: str
     camera_width: int
@@ -96,6 +98,7 @@ class InspectionFrame:
         for name, value in (
             ("image_data", self.image_data),
             ("apple_mask_data", self.apple_mask_data),
+            ("ignore_mask_data", self.ignore_mask_data),
             ("depth_data", self.depth_data),
         ):
             if not isinstance(value, bytes) or not value:
@@ -103,6 +106,7 @@ class InspectionFrame:
         for name, value in (
             ("image_format", self.image_format),
             ("apple_mask_format", self.apple_mask_format),
+            ("ignore_mask_format", self.ignore_mask_format),
             ("depth_format", self.depth_format),
             ("frame_id", self.frame_id),
         ):

@@ -53,6 +53,7 @@ def make_message(
         total_frames=total_frames,
         image=compressed(f"jpeg-{frame_index}".encode(), "rgb8; jpeg compressed bgr8"),
         apple_mask=compressed(b"png-mask", "mono8; png"),
+        ignore_mask=compressed(b"png-ignore", "mono8; png"),
         aligned_depth=compressed(b"png-depth", "16UC1; compressedDepth png"),
         camera_info=SimpleNamespace(
             header=header(),
@@ -85,6 +86,7 @@ class MessageAdapterTest(unittest.TestCase):
         self.assertEqual(frame.frame_index, 1)
         self.assertEqual(frame.image_data, b"jpeg-1")
         self.assertEqual(frame.apple_mask_data, b"png-mask")
+        self.assertEqual(frame.ignore_mask_data, b"png-ignore")
         self.assertEqual(frame.depth_data, b"png-depth")
         self.assertEqual(frame.camera_width, 100)
         self.assertEqual(frame.frame_id, "quality_camera_optical_frame")
@@ -98,6 +100,11 @@ class MessageAdapterTest(unittest.TestCase):
     def test_rejects_empty_component_data(self) -> None:
         message = make_message(0)
         message.apple_mask.data = bytearray()
+        with self.assertRaises(InspectionContractError):
+            inspection_frame_from_message(message)
+
+        message = make_message(0)
+        message.ignore_mask.data = bytearray()
         with self.assertRaises(InspectionContractError):
             inspection_frame_from_message(message)
 

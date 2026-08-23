@@ -33,7 +33,13 @@ class FramePredictor(Protocol[PredictionT]):
 @dataclass(frozen=True)
 class IndexedPrediction(Generic[PredictionT]):
     frame_index: int
-    value: PredictionT
+    value: PredictionT | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.error_type is None
 
 
 @dataclass(frozen=True)
@@ -325,7 +331,21 @@ def predict_declared_frames(
             f"inspection {session.inspection_id!r} has {session.received_count}/"
             f"{session.total_frames} declared frames"
         )
-    return tuple(
-        IndexedPrediction(frame.frame_index, predictor.predict(frame))
-        for frame in session.ordered_frames
-    )
+
+    results: list[IndexedPrediction[PredictionT]] = []
+    for frame in session.ordered_frames:
+        try:
+            value = predictor.predict(frame)
+        except PredictorNotConfigured:
+            raise
+        except Exception as exc:
+            results.append(
+                IndexedPrediction(
+                    frame_index=frame.frame_index,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                )
+            )
+        else:
+            results.append(IndexedPrediction(frame.frame_index, value=value))
+    return tuple(results)

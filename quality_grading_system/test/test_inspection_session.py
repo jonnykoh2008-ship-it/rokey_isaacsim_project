@@ -41,6 +41,8 @@ def make_frame(
         image_format="rgb8; jpeg compressed bgr8",
         apple_mask_data=b"png-mask",
         apple_mask_format="mono8; png",
+        ignore_mask_data=b"png-ignore",
+        ignore_mask_format="mono8; png",
         depth_data=b"png-depth",
         depth_format="16UC1; compressedDepth png",
         camera_width=100,
@@ -109,6 +111,8 @@ class InspectionStoreTest(unittest.TestCase):
         with self.assertRaises(InspectionContractError):
             InspectionFrame(**{**values, "apple_mask_data": b""})
         with self.assertRaises(InspectionContractError):
+            InspectionFrame(**{**values, "ignore_mask_data": b""})
+        with self.assertRaises(InspectionContractError):
             InspectionFrame(**{**values, "depth_data": b""})
         with self.assertRaises(InspectionContractError):
             InspectionFrame(**{**values, "camera_k": (0.0,) * 9})
@@ -165,6 +169,26 @@ class PredictorBoundaryTest(unittest.TestCase):
         session = InspectionStore().accept(make_frame(0)).session
         with self.assertRaises(IncompleteInspectionError):
             predict_declared_frames(session, UnconfiguredPredictor())
+
+    def test_one_frame_failure_does_not_abort_other_predictions(self) -> None:
+        store = InspectionStore()
+        for index in range(5):
+            session = store.accept(make_frame(index, total_frames=5)).session
+
+        class OneFrameFailurePredictor:
+            def predict(self, frame: InspectionFrame) -> int:
+                if frame.frame_index == 1:
+                    raise RuntimeError("synthetic frame failure")
+                return frame.frame_index
+
+        predictions = predict_declared_frames(session, OneFrameFailurePredictor())
+        self.assertEqual(len(predictions), 5)
+        self.assertFalse(predictions[1].succeeded)
+        self.assertEqual(predictions[1].error_type, "RuntimeError")
+        self.assertEqual(
+            tuple(item.value for item in predictions if item.succeeded), (0, 2, 3, 4)
+        )
+
 
     def test_unconfigured_predictor_never_fabricates_result(self) -> None:
         store = InspectionStore()

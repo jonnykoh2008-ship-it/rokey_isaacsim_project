@@ -125,12 +125,13 @@ QoS: Reliable, Volatile, Keep Last 6
 - `total_frames`: 해당 검사에서 전송할 전체 대표 프레임 수
 - `image`: 압축 RGB 이미지
 - `apple_mask`: RGB 픽셀 좌표계의 사과 표면 binary PNG mask
+- `ignore_mask`: 착색·손상 판정에서 제외할 RGB 픽셀 좌표계의 binary PNG mask. 제외할 영역이 없으면 같은 해상도의 all-zero mask
 - `aligned_depth`: RGB 픽셀 좌표계에 정렬한 optical Z-depth
-- `camera_info`: RGB·mask·depth 좌표계에 맞춘 calibration
+- `camera_info`: RGB·apple mask·ignore mask·depth 좌표계에 맞춘 calibration
 
-`aligned_depth.format`은 `16UC1; compressedDepth png`이고 단위는 mm, invalid 값은 0이다. 방사 거리(distance-to-camera)가 아니라 optical frame의 `+Z` 깊이를 사용한다. RGB, mask, depth의 디코딩 해상도와 `camera_info.width/height`는 같아야 하며 crop·resize 시 `K`와 `P`를 같이 보정한다.
+`aligned_depth.format`은 `16UC1; compressedDepth png`이고 단위는 mm, invalid 값은 0이다. 방사 거리(distance-to-camera)가 아니라 optical frame의 `+Z` 깊이를 사용한다. RGB, apple mask, ignore mask, depth의 디코딩 해상도와 `camera_info.width/height`는 같아야 하며 crop·resize 시 `K`와 `P`를 같이 보정한다.
 
-`InspectionImage.header`, `image.header`, `apple_mask.header`, `aligned_depth.header`, `camera_info.header`의 timestamp와 frame ID는 모두 정확히 같아야 한다. GPU PC 2는 하나라도 다르거나 `K[0]`/`K[4]`가 0이면 해당 프레임을 거부한다.
+`InspectionImage.header`, `image.header`, `apple_mask.header`, `ignore_mask.header`, `aligned_depth.header`, `camera_info.header`의 timestamp와 frame ID는 모두 정확히 같아야 한다. GPU PC 2는 하나라도 다르거나 `K[0]`/`K[4]`가 0이면 해당 프레임을 거부한다.
 
 ## InspectionCompleted
 

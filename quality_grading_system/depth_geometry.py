@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 from inspection_session import InspectionContractError, InspectionFrame
@@ -23,6 +23,7 @@ class GeometryMeasurements:
     diameter_mm: float
     diameter_confidence: float
     apple_mask: Any
+    ignore_mask: Any
     depth_m: Any
 
 
@@ -58,6 +59,17 @@ def _decode_rgb_shape(frame: InspectionFrame) -> tuple[int, int]:
     if width <= 0 or height <= 0:
         raise GeometryMeasurementError("compressed RGB image has invalid dimensions")
     return height, width
+
+
+def decode_ignore_mask(frame: InspectionFrame):
+    import numpy as np
+
+    if "png" not in frame.ignore_mask_format.lower():
+        raise GeometryMeasurementError("ignore_mask must use lossless PNG")
+    return np.asarray(
+        _decode_png(frame.ignore_mask_data, "ignore_mask") > 0,
+        dtype=bool,
+    )
 
 
 def decode_apple_mask(frame: InspectionFrame):
@@ -109,15 +121,17 @@ def measure_geometry(frame: InspectionFrame) -> GeometryMeasurements:
 
     rgb_shape = _decode_rgb_shape(frame)
     apple_mask = decode_apple_mask(frame)
+    ignore_mask = decode_ignore_mask(frame)
     depth_m = decode_aligned_depth_m(frame)
     expected_shape = (frame.camera_height, frame.camera_width)
     if (
         rgb_shape != expected_shape
         or apple_mask.shape != expected_shape
+        or ignore_mask.shape != expected_shape
         or depth_m.shape != expected_shape
     ):
         raise GeometryMeasurementError(
-            "RGB, apple_mask, aligned_depth and CameraInfo dimensions must match"
+            "RGB, apple_mask, ignore_mask, aligned_depth and CameraInfo dimensions must match"
         )
     fx, fy, cx, cy = _intrinsics(frame)
     valid = apple_mask & np.isfinite(depth_m) & (depth_m > 0.0)
@@ -140,6 +154,7 @@ def measure_geometry(frame: InspectionFrame) -> GeometryMeasurements:
         diameter_confidence=min(1.0, valid_count / apple_count),
         apple_mask=apple_mask,
         depth_m=depth_m,
+        ignore_mask=ignore_mask,
     )
 
 
@@ -206,16 +221,11 @@ def combine_prediction_with_geometry(frame: InspectionFrame, prediction: Any) ->
     geometry = measure_geometry(frame)
     expected_shape = geometry.apple_mask.shape
 
-    if isinstance(prediction, FrameMeasurements):
-        return replace(
-            prediction,
-            diameter_mm=geometry.diameter_mm,
-            diameter_confidence=geometry.diameter_confidence,
-        )
-
     color_mask = _prediction_mask(prediction, "color_mask", expected_shape)
     damage_mask = _prediction_mask(prediction, "damage_mask", expected_shape)
-    valid_surface = geometry.apple_mask
+    valid_surface = geometry.apple_mask & ~geometry.ignore_mask
+    if not bool(valid_surface.any()):
+        raise GeometryMeasurementError("ignore_mask excludes the entire apple surface")
     color_ratio = (
         float((color_mask & valid_surface).sum() / valid_surface.sum())
         if color_mask is not None
@@ -227,7 +237,7 @@ def combine_prediction_with_geometry(frame: InspectionFrame, prediction: Any) ->
     if damage_mask is not None:
         damage_area, damage_geometry_confidence = _surface_area_cm2(
             damage_mask,
-            geometry.apple_mask,
+            valid_surface,
             geometry.depth_m,
             frame,
         )

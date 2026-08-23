@@ -22,7 +22,7 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 
 상태: `DECIDED`
 
-- `InspectionImage`는 압축 RGB, 사과 mask, aligned depth와 `CameraInfo`를 한 메시지로 전달한다.
+- `InspectionImage`는 압축 RGB, 사과 mask, ignore mask, aligned depth와 `CameraInfo`를 한 메시지로 전달한다.
 - 모든 영상 성분은 같은 픽셀 좌표계와 header를 사용한다.
 - MVP의 직경 및 손상 면적 계산은 사과 mask, 정렬된 depth와 camera intrinsics를 요구한다.
 
@@ -44,7 +44,7 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 - GPU PC 1은 대표 프레임의 RGB, 사과 mask, 정렬된 depth, CameraInfo를 GPU PC 2로 전달한다.
 - GPU PC 2가 RGB/depth 기반 품질 추론과 직경·손상 면적 등 기하 측정을 담당한다.
 - 품질검사 연산을 GPU PC 2에 집중해 PC 간 기능 경계를 명확히 한다.
-- MVP에서는 RGB, 사과 mask, 정렬된 depth, CameraInfo를 하나의 custom `InspectionImage`에 함께 포함해 동일 대표 프레임 단위로 전달한다.
+- MVP에서는 RGB, 사과 mask, ignore mask, 정렬된 depth, CameraInfo를 하나의 custom `InspectionImage`에 함께 포함해 동일 대표 프레임 단위로 전달한다.
 - depth는 optical Z-depth, `16UC1` millimeter, invalid 0, `compressedDepth png`를 사용한다.
 
 ### G2-02. 프레임별 품질 모델 입출력
@@ -189,9 +189,9 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 결정:
 
 - 기준 timestamp와 frame ID는 `InspectionImage.header`를 단일 기준으로 사용한다.
-- `image.header`, `apple_mask.header`, `aligned_depth.header`, `camera_info.header`에도 동일한 timestamp와 frame ID를 복사한다.
+- `image.header`, `apple_mask.header`, `ignore_mask.header`, `aligned_depth.header`, `camera_info.header`에도 동일한 timestamp와 frame ID를 복사한다.
 - frame ID는 `quality_camera_optical_frame`을 사용하고 frame index는 0부터 시작한다.
-- GPU PC 2는 다섯 header 중 하나라도 다르면 해당 프레임을 거부한다.
+- GPU PC 2는 여섯 header 중 하나라도 다르면 해당 프레임을 거부한다.
 - 중복 header는 MVP custom message에서 유지한다.
 
 선택 근거:

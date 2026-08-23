@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Generic, TypeVar
 
-from depth_geometry import GeometryMeasurementError, combine_prediction_with_geometry
+from depth_geometry import combine_prediction_with_geometry
 from inspection_session import (
     InspectionCompletion,
     InspectionContractError,
@@ -115,6 +115,7 @@ def inspection_frame_from_message(message: Any) -> InspectionFrame:
         ("InspectionImage", message.header),
         ("CompressedImage", message.image.header),
         ("apple_mask", message.apple_mask.header),
+        ("ignore_mask", message.ignore_mask.header),
         ("aligned_depth", message.aligned_depth.header),
         ("CameraInfo", message.camera_info.header),
     )
@@ -136,6 +137,8 @@ def inspection_frame_from_message(message: Any) -> InspectionFrame:
         image_format=str(message.image.format),
         apple_mask_data=bytes(message.apple_mask.data),
         apple_mask_format=str(message.apple_mask.format),
+        ignore_mask_data=bytes(message.ignore_mask.data),
+        ignore_mask_format=str(message.ignore_mask.format),
         depth_data=bytes(message.aligned_depth.data),
         depth_format=str(message.aligned_depth.format),
         camera_width=int(message.camera_info.width),
@@ -458,8 +461,18 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
         if session is None:
             return
         measurements = []
-        indices = []
+        successful_indices = []
+        failed_indices = []
         for indexed in event.predictions:
+            if not indexed.succeeded:
+                failed_indices.append(indexed.frame_index)
+                self.get_logger().warning(
+                    f"FRAME_INFERENCE_FAILED inspection_id={event.inspection_id} "
+                    f"frame_index={indexed.frame_index} error_type={indexed.error_type} "
+                    f"error={indexed.error_message}"
+                )
+                continue
+
             frame = next(
                 item for item in session.ordered_frames
                 if item.frame_index == indexed.frame_index
@@ -468,11 +481,13 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
                 measurements.append(
                     combine_prediction_with_geometry(frame, indexed.value)
                 )
-                indices.append(indexed.frame_index)
-            except GeometryMeasurementError as exc:
+                successful_indices.append(indexed.frame_index)
+            except Exception as exc:
+                failed_indices.append(indexed.frame_index)
                 self.get_logger().warning(
-                    f"Rejected geometry frame {indexed.frame_index} "
-                    f"for {event.inspection_id}: {exc}"
+                    f"FRAME_MEASUREMENT_FAILED inspection_id={event.inspection_id} "
+                    f"frame_index={indexed.frame_index} error_type={type(exc).__name__} "
+                    f"error={exc}"
                 )
 
         if (
@@ -480,14 +495,16 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
             and self._simulation_time_ns() >= event.deadline_time_ns
         ):
             self.get_logger().warning(
-                f"Late computation discarded for {event.inspection_id}"
+                f"LATE_RESULT inspection_id={event.inspection_id} "
+                f"successful_frame_indices={successful_indices} "
+                f"failed_frame_indices={failed_indices}"
             )
             self._publish_timeout(event)
             return
 
         result = aggregate_measurement_frames(
             measurements,
-            indices,
+            successful_indices,
             confidence_threshold=self._confidence_threshold,
         )
         self._publish_result(event, result)

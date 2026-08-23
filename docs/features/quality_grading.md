@@ -19,7 +19,7 @@ ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고
 
 ## GPU PC 2 입력 및 모델
 
-- GPU PC 1은 각 대표 프레임의 압축 RGB, 사과 표면 mask, RGB에 정렬된 depth 및 해당 시점의 `CameraInfo`를 GPU PC 2로 전달한다.
+- GPU PC 1은 각 대표 프레임의 압축 RGB, 사과 표면 mask, 평가 제외 ignore mask, RGB에 정렬된 depth 및 해당 시점의 `CameraInfo`를 GPU PC 2로 전달한다.
 - GPU PC 2가 RGB/depth 기반 품질 추론과 직경·손상 면적 기하 측정을 담당한다.
 - RGB 모델 입력은 640×640으로 resize/letterbox하고 학습과 추론에 동일한 정규화를 적용한다.
 - depth는 신경망 입력에 직접 사용하지 않고 직경과 손상 면적 계산에 사용한다.
@@ -30,7 +30,7 @@ ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고
 - 모델 배포 형식은 ONNX를 기본으로 하고 GPU PC 2의 MVP 실행 백엔드는 ONNX Runtime CUDA를 사용한다. 성능이 부족하면 TensorRT 변환을 검토한다.
 - annotation 최소 단위는 사과 표면, 목표 착색 영역, 손상 영역, 무시 영역 mask와 심각 결함 여부다. MVP는 동일 적색 사과 품종군을 대상으로 하며 정상적인 과피 거침은 손상에서 제외하고 검은별무늬병(scab)은 손상에 포함한다.
 
-`InspectionImage`는 RGB, 사과 mask, `16UC1; compressedDepth png` 형식의 optical Z-depth와 `CameraInfo`를 한 프레임으로 전달한다. 완료 이벤트는 `/quality/inspection_completed`의 `InspectionCompleted`를 사용한다. 정확한 필드와 QoS는 `docs/architecture/ros2_interfaces.md`를 따른다.
+`InspectionImage`는 RGB, 사과 mask, ignore mask, `16UC1; compressedDepth png` 형식의 optical Z-depth와 `CameraInfo`를 한 프레임으로 전달한다. 완료 이벤트는 `/quality/inspection_completed`의 `InspectionCompleted`를 사용한다. 정확한 필드와 QoS는 `docs/architecture/ros2_interfaces.md`를 따른다.
 
 ## 대표 프레임 선택
 
@@ -129,7 +129,7 @@ ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고
 GPU PC 1
 후보 프레임 수집 및 대표 프레임 선택
   → inspection_id + apple_id + frame_index
-    + compressed RGB + apple mask + aligned depth + CameraInfo
+    + compressed RGB + apple mask + ignore mask + aligned depth + CameraInfo
   → ROI 이탈 검사 완료 이벤트
 
 GPU PC 2

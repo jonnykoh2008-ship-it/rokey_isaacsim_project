@@ -27,6 +27,7 @@ def make_frame(frame_index: int = 0) -> InspectionFrame:
     width = height = 100
     apple_mask = np.zeros((height, width), dtype=np.uint8)
     apple_mask[20:80, 10:90] = 255
+    ignore_mask = np.zeros((height, width), dtype=np.uint8)
     depth_mm = np.zeros((height, width), dtype=np.uint16)
     depth_mm[apple_mask > 0] = 500
     camera_k = (500.0, 0.0, 50.0, 0.0, 500.0, 50.0, 0.0, 0.0, 1.0)
@@ -44,6 +45,8 @@ def make_frame(frame_index: int = 0) -> InspectionFrame:
         image_format="rgb8; jpeg compressed bgr8",
         apple_mask_data=png_bytes(apple_mask),
         apple_mask_format="mono8; png",
+        ignore_mask_data=png_bytes(ignore_mask),
+        ignore_mask_format="mono8; png",
         depth_data=png_bytes(depth_mm, prefix=b"compressed!!"),
         depth_format="16UC1; compressedDepth png",
         camera_width=width,
@@ -90,6 +93,17 @@ class DepthGeometryTest(unittest.TestCase):
         self.assertLess(result.damage_area_cm2, 1.0)
         self.assertEqual(result.severe_defect, False)
         self.assertGreaterEqual(result.diameter_confidence, 0.5)
+
+    def test_ignore_mask_is_excluded_from_color_ratio_denominator(self) -> None:
+        frame = make_frame()
+        ignore_mask = np.zeros((100, 100), dtype=np.uint8)
+        ignore_mask[20:80, 78:90] = 255
+        frame = InspectionFrame(
+            **{**frame.__dict__, "ignore_mask_data": png_bytes(ignore_mask)}
+        )
+        result = combine_prediction_with_geometry(frame, make_prediction())
+        self.assertAlmostEqual(result.color_ratio, 1.0, places=2)
+
 
     def test_four_real_geometry_frames_can_reach_valid_high(self) -> None:
         values = [
