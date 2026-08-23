@@ -241,10 +241,17 @@
 				</geometry>
 			</visual>
 		</link>
-		<!-- <link name="tool0"/>
-		<joint name="joint_6-tool0" type="fixed">
-			<origin rpy="3.1415926535 -1.570796327 0" xyz="0 0 0"/>
-			<parent link="link_6"/>
-			<child link="tool0"/>
-		</joint> -->
+			<!--
+				보조 gripper collision frame이다. 실제 수확 TCP 목표는 이 고정 RPY를
+				직접 사용하지 않고, 실행 중 USD에서 읽은 link_6 -> palm 변환으로
+				link_6 목표 pose로 변환한다.
+			-->
+			<link name="gripper_frame"/>
+			<joint name="link_6-gripper_frame" type="fixed">
+				<origin
+					rpy="-1.869670219 -0.156350649 -0.936767921"
+					xyz="-0.018632895 -0.036789604 -0.118001442"/>
+				<parent link="link_6"/>
+				<child link="gripper_frame"/>
+			</joint>
 </robot>

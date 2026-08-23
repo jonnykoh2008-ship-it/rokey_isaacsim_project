@@ -26,10 +26,15 @@
 - 센서 데이터는 필요한 경우 compressed transport로 전달한다.
 - RGB는 JPEG 기반 압축, depth는 `compressedDepth` 또는 PNG 기반 무손실 압축을 우선한다.
 - 가능하면 GPU PC 1에서 원본 센서를 처리하고 네트워크에는 pose나 선별 이미지처럼 축소된 결과를 전달한다.
+- 정적인 나무 planning scene은 전체 snapshot 한 개로 전달한다. QoS는
+  `Reliable + Transient Local + Keep Last 1`을 사용하고, 개인 PC 1은 누락 또는
+  버전 불일치 시 `/planning_scene/get_snapshot`으로 최신 snapshot을 요청한다.
 
 ## 운영 규칙
 
 - 모든 PC의 ROS_DOMAIN_ID, RMW 설정 및 메시지 버전을 실행 전에 확인한다.
+- `RobotMotion`, `PlanningScene`, `SimulationState`가 변경되면 GPU PC 1의 Isaac
+  Python 3.11 인터페이스와 개인 PC 1의 ROS Python 3.12 인터페이스를 함께
+  재빌드한다. 한쪽만 이전 인터페이스를 사용한 상태에서는 실행하지 않는다.
 - Wi-Fi와 Ethernet의 라우팅 우선순위가 ROS 2 discovery를 방해하지 않도록 인터페이스를 고정한다.
 - 네트워크 대역폭과 추론 지연은 통합 시험에서 측정한다.
-

@@ -11,8 +11,15 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CheckpointEvent.msg"
   "msg/InspectionImage.msg"
+<<<<<<< HEAD
   "msg/MotionStatus.msg"
+=======
+  "msg/ObstacleProxy.msg"
+  "msg/PlanningScene.msg"
+>>>>>>> c63dbbeda5940850c737707fbb89d6220c9417c8
   "msg/QualityResult.msg"
+  "msg/SimulationState.msg"
+  "srv/GetPlanningScene.srv"
   "srv/RetryInspection.srv"
   "action/RobotMotion.action"
   DEPENDENCIES

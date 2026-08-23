@@ -29,12 +29,18 @@ Isaac Sim에서 단일 사과나무의 사과를 협동로봇으로 수확하고
 
 ## PC 역할
 
-- GPU PC 1: Isaac Sim, 물리, 센서, tracker, ROS 2 Bridge
+- GPU PC 1: Isaac Sim, 물리, 센서, tracker, planning scene 발행, 로봇 실행 및
+  실제 PhysX collider 기반 최종 안전 감시
 - GPU PC 2: 품질 영상 추론 및 사과 단위 결과 통합
-- 개인 PC 1: 로봇 계획·상태 머신 및 개발 지원
+- 개인 PC 1: planning proxy 기반 전역 waypoint 계획, 수확 상태 머신 및 개발 지원
 - 개인 PC 2: 모니터링 및 2차 개발의 푸셔 선택
 
 역할은 통합 시험 결과에 따라 조정할 수 있다.
+
+수확 충돌 회피는 혼합형으로 분담한다. 개인 PC 1은 GPU PC 1이 발행한 동일한
+`reset_id/scene_version`의 obstacle snapshot으로 전역 경로를 만들고, GPU PC 1은
+그 경로를 다시 검사한 뒤 RMPflow로 실행한다. GPU PC 1은 실행 중 실제
+로봇-나무 PhysX 접촉을 감지하면 현재 Action을 중단한다.
 
 ## 기능 경계
 
