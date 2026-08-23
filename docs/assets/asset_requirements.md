@@ -62,10 +62,21 @@
 ## 나무
 
 - 나무 1그루를 수확 대상 3D asset으로 사용한다.
-- 굵은 가지: rigid collider 활성화, 로봇 충돌 회피 대상
-- 얇은 가지와 잎: visual/occlusion 유지, 물리 collision 비활성화
-- 경로 계획에서는 작은 가지와 잎을 단순 obstacle proxy로 사용할 수 있다.
-- visual mesh와 planning collision proxy를 분리한다.
+- 굵은 가지는 rigid collider를 활성화하고 로봇 전체 링크의 planning obstacle로
+  사용한다.
+- 작은 가지는 물리 collision을 비활성화하되 별도의 capsule/sphere/convex
+  planning proxy를 유지한다.
+- 잎은 visual-only로 유지한다. 물리 collision을 비활성화하고 Lula/RMPflow
+  planning obstacle에도 전달하지 않는다.
+- visual mesh, PhysX collision mesh, planning collision proxy를 서로 분리한다.
+- 복잡한 가지 visual mesh를 planning에 직접 전달하지 않고 capsule, sphere,
+  convex 또는 voxel proxy로 단순화한다.
+- planning proxy에는 자산 분류(`trunk`, `branch`)와 적용한 안전거리
+  값을 기록한다.
+
+작은 가지의 물리 collision 비활성화는 경로 계획 장애물 제외를 의미하지
+않으며 Lula/RMPflow 회피 대상으로 유지한다. 잎은 최신 수확 동작 규약에 따라
+PhysX와 Lula/RMPflow 양쪽에서 제외한다.
 - 자산 라이선스 정보는 현재 없음. 외부 배포 전 출처와 사용 권한을 확인해야 한다.
 
 ## 컨베이어

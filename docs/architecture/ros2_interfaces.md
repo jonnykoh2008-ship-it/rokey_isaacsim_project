@@ -16,6 +16,9 @@
 | 종류 | 이름 | 타입 | 송신/서버 | 수신/클라이언트 |
 |---|---|---|---|---|
 | Topic | `/harvest/target_pose` | `geometry_msgs/msg/PoseStamped` | GPU PC 1 | 개인 PC 1 |
+| Topic | `/simulation/state` | `appleproj_interfaces/msg/SimulationState` | GPU PC 1 | 개인 PC 1 |
+| Topic | `/planning_scene` | `appleproj_interfaces/msg/PlanningScene` | GPU PC 1 | 개인 PC 1 |
+| Service | `/planning_scene/get_snapshot` | `appleproj_interfaces/srv/GetPlanningScene` | GPU PC 1 | 개인 PC 1 |
 | Action | `/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | 개인 PC 1 |
 | Topic | `/quality/inspection_images` | `appleproj_interfaces/msg/InspectionImage` | GPU PC 1 | GPU PC 2 |
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
@@ -43,6 +46,63 @@ frame_id: world
 ```
 
 MVP에서는 Isaac Sim ground-truth pose를 사용한다. 다중 사과 단계의 ID 포함 메시지 구조는 TBD다.
+
+## SimulationState
+
+GPU PC 1이 `/clock`만으로 구별할 수 없는 Timeline 상태와 scene 세대를
+명시적으로 전달한다.
+
+```text
+토픽: /simulation/state
+타입: appleproj_interfaces/msg/SimulationState
+QoS: Reliable, Transient Local, Keep Last 1
+```
+
+필드:
+
+- `header`: `/clock` 기준 시각, `frame_id=world`
+- `state`: `STOPPED`, `INITIALIZING`, `READY`, `PLAYING`, `PAUSED`
+- `reset_id`: Timeline Stop 후 물리 재초기화마다 증가
+- `scene_version`: 새 obstacle snapshot마다 증가
+- `message`: 상태 전환 원인
+
+개인 PC 1은 `READY` 또는 `PLAYING`에서만 새 계획을 시작한다. `STOPPED` 또는
+`INITIALIZING`을 받으면 실행 Goal을 취소하고 이전 계획을 폐기한다. `PAUSED`는
+새 계획과 Goal 전송을 금지하되 현재 실행 문맥은 재개 가능하도록 유지한다.
+
+## PlanningScene 및 ObstacleProxy
+
+```text
+토픽: /planning_scene
+타입: appleproj_interfaces/msg/PlanningScene
+QoS: Reliable, Transient Local, Keep Last 1
+```
+
+`PlanningScene` 필드:
+
+- `header`: snapshot 생성 simulation time, `frame_id=world`
+- `reset_id`, `scene_version`
+- `robot_base_pose`: 계획 시점 M0617 base pose
+- `robot_tcp_pose`: 계획 시작점의 물리 수확 TCP pose
+- `obstacles`: 전체 정적 나무 proxy 배열
+
+`ObstacleProxy` 필드:
+
+- `obstacle_id`
+- `shape`: `SHAPE_SPHERE`, `SHAPE_BOX`, `SHAPE_CAPSULE`
+- `obstacle_class`: `CLASS_TRUNK`, `CLASS_BRANCH`
+- `pose`: world 기준 proxy 중심과 자세
+- `dimensions`: box는 전체 XYZ 크기, sphere는 X에 반지름, capsule은 X에
+  반지름과 Y에 중심선 길이
+- `safety_margin`: 형상 크기와 별도로 적용할 최소 안전거리
+
+MVP snapshot은 몸통 box와 가지 sphere만 사용한다. 잎은 포함하지 않는다.
+snapshot에는 안전거리가 적용되기 전 형상 크기를 넣고 개인 PC 1이
+`safety_margin`을 더한다. GPU PC 1도 같은 안전거리를 독립적으로 적용한다.
+
+개인 PC 1이 snapshot을 받지 못했거나 version 누락을 감지하면
+`/planning_scene/get_snapshot`을 호출한다. 성공 응답에는 최신 전체
+`PlanningScene` 한 개가 포함된다.
 
 ## InspectionImage
 
@@ -121,6 +181,9 @@ Goal:
 
 - `motion_type`: `APPROACH`, `GRASP`, `TWIST`, `PULL`, `TRANSPORT`, `PLACE`, `RETRACT`
 - `target_pose`: 동작 목표 pose
+- `reset_id`, `scene_version`: 계획에 사용한 planning scene 세대
+- `waypoints`: 개인 PC 1이 계획한 world 기준 TCP waypoint 배열. MVP에서는
+  `APPROACH`에 필수이며 다른 단계에서는 빈 배열이다.
 
 Result:
 
@@ -134,6 +197,9 @@ Feedback:
 - `progress`
 
 각 모션 단계는 별도 Goal로 요청한다. 단계 순서와 실패 복구는 개인 PC 1의 수확 상태 머신이 관리한다.
+GPU PC 1은 scene 세대가 현재 값과 다르거나 `APPROACH.waypoints`가 비어 있으면
+Goal을 거부한다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`, 실제
+로봇-나무 접촉이 발생하면 `UNEXPECTED_CONTACT`로 중단한다.
 
 ## RetryInspection
 
