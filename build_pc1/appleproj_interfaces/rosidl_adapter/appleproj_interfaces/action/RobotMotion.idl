@@ -1,0 +1,43 @@
+// generated from rosidl_adapter/resource/action.idl.em
+// with input from appleproj_interfaces/action/RobotMotion.action
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/PoseStamped.idl"
+
+module appleproj_interfaces {
+  module action {
+    module RobotMotion_Goal_Constants {
+      const uint8 APPROACH = 1;
+      const uint8 GRASP = 2;
+      const uint8 TWIST = 3;
+      const uint8 PULL = 4;
+      const uint8 TRANSPORT = 5;
+      const uint8 PLACE = 6;
+      const uint8 RETRACT = 7;
+      const uint8 RELEASE = 8;
+    };
+    struct RobotMotion_Goal {
+      uint8 motion_type;
+
+      geometry_msgs::msg::PoseStamped target_pose;
+
+      uint64 reset_id;
+
+      uint64 scene_version;
+
+      sequence<geometry_msgs::msg::PoseStamped> waypoints;
+    };
+    struct RobotMotion_Result {
+      boolean success;
+
+      string error_code;
+
+      string message;
+    };
+    struct RobotMotion_Feedback {
+      string current_state;
+
+      float progress;
+    };
+  };
+};

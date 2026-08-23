@@ -1,0 +1,20 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from appleproj_interfaces/srv/GetPlanningScene.srv
+// generated code does not contain a copyright notice
+
+#include "appleproj_interfaces/msg/PlanningScene.idl"
+
+module appleproj_interfaces {
+  module srv {
+    struct GetPlanningScene_Request {
+      uint8 structure_needs_at_least_one_member;
+    };
+    struct GetPlanningScene_Response {
+      boolean success;
+
+      appleproj_interfaces::msg::PlanningScene scene;
+
+      string message;
+    };
+  };
+};

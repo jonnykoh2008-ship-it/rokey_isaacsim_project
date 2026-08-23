@@ -1,0 +1,1 @@
+ament_cmake_symlink_install_targets("TARGET_FILES" "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_generator_py/appleproj_interfaces/appleproj_interfaces_s__rosidl_typesupport_fastrtps_c.so" "TARGETS" "appleproj_interfaces_s__rosidl_typesupport_fastrtps_c" "DESTINATION" "lib/python3.12/site-packages/appleproj_interfaces")

@@ -1,0 +1,10 @@
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/CheckpointEvent.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/InspectionImage.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/MotionStatus.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/ObstacleProxy.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/PlanningScene.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/QualityResult.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/SimulationState.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:srv/GetPlanningScene.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:srv/RetryInspection.idl
+/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:action/RobotMotion.idl

@@ -1,0 +1,25 @@
+{
+  "package_name": "appleproj_interfaces",
+  "output_dir": "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_generator_type_description/appleproj_interfaces",
+  "idl_tuples": [
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/CheckpointEvent.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/InspectionImage.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/MotionStatus.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/ObstacleProxy.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/PlanningScene.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/QualityResult.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:msg/SimulationState.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:srv/GetPlanningScene.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:srv/RetryInspection.idl",
+    "/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_adapter/appleproj_interfaces:action/RobotMotion.idl"
+  ],
+  "include_paths": [
+    "builtin_interfaces:/opt/ros/jazzy/share/builtin_interfaces",
+    "geometry_msgs:/opt/ros/jazzy/share/geometry_msgs",
+    "std_msgs:/opt/ros/jazzy/share/std_msgs",
+    "sensor_msgs:/opt/ros/jazzy/share/sensor_msgs",
+    "service_msgs:/opt/ros/jazzy/share/service_msgs",
+    "action_msgs:/opt/ros/jazzy/share/action_msgs",
+    "unique_identifier_msgs:/opt/ros/jazzy/share/unique_identifier_msgs"
+  ]
+}

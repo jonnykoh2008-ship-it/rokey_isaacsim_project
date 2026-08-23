@@ -166,8 +166,9 @@ class HarvestCoordinator(Node):
         self.samples.clear()
 
     def _report_plan_failure(self, center, error):
-        self.failed_target = np.asarray(center, dtype=float)
         code = self._planning_error_code(error)
+        if code != "308:SIMULATION_RESET":
+            self.failed_target = np.asarray(center, dtype=float)
         self._publish_status("PRE_GRASP_PLANNING", False, 0.0, code, str(error))
         self.get_logger().warning(f"APPROACH 계획 실패 {code}: {error}")
 
@@ -315,6 +316,26 @@ class HarvestCoordinator(Node):
             obstacle_class=int(message.obstacle_class),
         )
 
+    def _planning_inputs_synchronized(self):
+        state = self.simulation_state
+        if state is None or state.state not in (
+            SimulationState.READY,
+            SimulationState.PLAYING,
+        ):
+            return False
+        scene = self.planning_scene
+        if scene is None:
+            self.request_snapshot()
+            return False
+        if (
+            scene.reset_id != state.reset_id
+            or scene.scene_version != state.scene_version
+        ):
+            self.planning_scene = None
+            self.request_snapshot()
+            return False
+        return True
+
     def _prepare_approach_plan(self, center, target_header):
         if self.simulation_state is None or self.simulation_state.state not in (
             SimulationState.READY,
@@ -384,6 +405,9 @@ class HarvestCoordinator(Node):
             return
         sample = self._xyz(message.pose.position)
         if not np.all(np.isfinite(sample)):
+            return
+        if not self._planning_inputs_synchronized():
+            self.samples.clear()
             return
         self.samples.append(sample)
         if len(self.samples) < self.samples.maxlen:

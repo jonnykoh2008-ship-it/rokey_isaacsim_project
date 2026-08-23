@@ -1,0 +1,4 @@
+source;share/appleproj_interfaces/local_setup.bash
+source;share/appleproj_interfaces/local_setup.dsv
+source;share/appleproj_interfaces/local_setup.sh
+source;share/appleproj_interfaces/local_setup.zsh
