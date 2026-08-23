@@ -217,11 +217,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-
 trial_and_error/
 /apple_data/
+
 # ROS 2 / colcon workspace artifacts
 /build/
 /install/
 /log/
-

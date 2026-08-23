@@ -1,0 +1,35 @@
+name: Quality grading tests
+
+on:
+  pull_request:
+    paths:
+      - "quality_grading_system/**"
+      - "appleproj_interfaces/**"
+      - "docs/features/quality_grading.md"
+      - "docs/architecture/ros2_interfaces.md"
+      - "docs/architecture/tf_frames.md"
+      - ".github/workflows/quality-grading-tests.yml"
+  push:
+    paths:
+      - "quality_grading_system/**"
+      - "appleproj_interfaces/**"
+      - ".github/workflows/quality-grading-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check numpy pillow
+      - name: Run quality grading tests
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: quality_grading_system
+        run: python -m unittest discover -s quality_grading_system/test -v

@@ -1,23 +1,19 @@
-"""Replaceable inference boundary for GPU PC 2 quality models.
-
-The model architecture and output contract are still TBD.  A generic protocol
-keeps frame collection testable without selecting a temporary model or output
-schema.
-"""
+"""Replaceable segmentation inference boundary for GPU PC 2."""
 
 from __future__ import annotations
 
 import io
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generic, Protocol, TypeVar, runtime_checkable
+from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
-from apple_quality_dataset import TARGET_NAMES, letterbox_rgb
 from inspection_session import InspectionFrame, InspectionSession
-from quality_rules import FrameMeasurements
 
 
 PredictionT = TypeVar("PredictionT")
+MODEL_ARCHITECTURE = "quality_segmentation_v1"
+MASK_TARGETS = ("target_color_mask", "damage_mask")
+CONFIDENCE_TARGETS = ("color", "damage", "severe")
 
 
 class PredictorNotConfigured(RuntimeError):
@@ -30,89 +26,197 @@ class IncompleteInspectionError(ValueError):
 
 @runtime_checkable
 class FramePredictor(Protocol[PredictionT]):
-    """Protocol implemented later by the approved quality model adapter."""
-
     def predict(self, frame: InspectionFrame) -> PredictionT:
-        """Return one model-specific prediction for ``frame``."""
+        """Return one model-specific prediction for frame."""
 
 
 @dataclass(frozen=True)
 class IndexedPrediction(Generic[PredictionT]):
-    """Associate an opaque prediction with its original frame index."""
-
     frame_index: int
     value: PredictionT
 
 
-class UnconfiguredPredictor:
-    """Safe runtime default that never fabricates a quality prediction."""
+@dataclass(frozen=True)
+class FrameModelPrediction:
+    """Per-pixel quality masks and image-level severe-defect output."""
 
+    color_mask: Any | None = None
+    damage_mask: Any | None = None
+    severe_defect: bool | None = None
+    color_confidence: float | None = None
+    damage_confidence: float | None = None
+    severe_confidence: float | None = None
+
+
+@dataclass(frozen=True)
+class LetterboxTransform:
+    original_width: int
+    original_height: int
+    resized_width: int
+    resized_height: int
+    offset_x: int
+    offset_y: int
+    image_size: int
+
+
+class UnconfiguredPredictor:
     def predict(self, frame: InspectionFrame) -> None:
         del frame
         raise PredictorNotConfigured("no approved quality model is configured")
 
 
 def create_measurement_model():
-    """Create the small multi-head network shared by training and inference."""
+    """Create the segmentation network shared by training and inference."""
 
     try:
-        import torch
         from torch import nn
     except ImportError as exc:
-        raise PredictorNotConfigured("PyTorch is required for the training checkpoint backend") from exc
+        raise PredictorNotConfigured("PyTorch is required for model construction") from exc
 
-    class MeasurementNet(nn.Module):
+    class QualitySegmentationNet(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            layers = []
-            channels = (3, 16, 32, 64, 96, 128)
-            for input_channels, output_channels in zip(channels, channels[1:]):
-                layers.extend(
-                    [
-                        nn.Conv2d(input_channels, output_channels, 3, stride=2, padding=1),
-                        nn.BatchNorm2d(output_channels),
-                        nn.SiLU(inplace=True),
-                    ]
+
+            def down(input_channels, output_channels):
+                return nn.Sequential(
+                    nn.Conv2d(input_channels, output_channels, 3, stride=2, padding=1),
+                    nn.BatchNorm2d(output_channels),
+                    nn.SiLU(inplace=True),
                 )
-            self.features = nn.Sequential(*layers, nn.AdaptiveAvgPool2d(1))
-            self.head = nn.Linear(channels[-1], len(TARGET_NAMES) * 2)
+
+            def up(input_channels, output_channels):
+                return nn.Sequential(
+                    nn.ConvTranspose2d(input_channels, output_channels, 4, stride=2, padding=1),
+                    nn.BatchNorm2d(output_channels),
+                    nn.SiLU(inplace=True),
+                )
+
+            self.encoder = nn.Sequential(
+                down(3, 16),
+                down(16, 32),
+                down(32, 64),
+                down(64, 96),
+            )
+            self.decoder = nn.Sequential(
+                up(96, 64),
+                up(64, 32),
+                up(32, 16),
+                nn.ConvTranspose2d(16, len(MASK_TARGETS), 4, stride=2, padding=1),
+            )
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.severe_head = nn.Linear(96, 1)
+            self.confidence_head = nn.Linear(96, len(CONFIDENCE_TARGETS))
 
         def forward(self, images):
-            raw = self.head(self.features(images).flatten(1))
-            raw_values = raw[:, : len(TARGET_NAMES)]
-            values = torch.stack(
-                (
-                    torch.sigmoid(raw_values[:, 0]),
-                    torch.sigmoid(raw_values[:, 1]) * 10.0,
-                    torch.sigmoid(raw_values[:, 2]),
-                ),
-                dim=1,
-            )
-            confidences = torch.sigmoid(raw[:, len(TARGET_NAMES) :])
-            return values, confidences
+            features = self.encoder(images)
+            masks = self.decoder(features).sigmoid()
+            pooled = self.pool(features).flatten(1)
+            severe = self.severe_head(pooled).sigmoid()
+            confidences = self.confidence_head(pooled).sigmoid()
+            return masks, severe, confidences
 
-    return MeasurementNet()
+    return QualitySegmentationNet()
 
 
-def _image_bytes_to_tensor(image_data: bytes, image_size: int):
+def _image_bytes_to_array(image_data: bytes, image_size: int):
     try:
         import numpy as np
-        import torch
         from PIL import Image
     except ImportError as exc:
-        raise PredictorNotConfigured("NumPy, Pillow and PyTorch are required for image inference") from exc
+        raise PredictorNotConfigured(
+            "NumPy and Pillow are required for image inference"
+        ) from exc
 
     try:
-        image = letterbox_rgb(Image.open(io.BytesIO(image_data)), image_size)
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
     except Exception as exc:
-        raise ValueError("InspectionImage does not contain a decodable compressed RGB image") from exc
-    pixels = np.asarray(image, dtype=np.float32) / 255.0
-    return torch.from_numpy(pixels).permute(2, 0, 1).unsqueeze(0).contiguous()
+        raise ValueError(
+            "InspectionImage does not contain a decodable compressed RGB image"
+        ) from exc
+    scale = min(image_size / image.width, image_size / image.height)
+    resized_width = max(1, round(image.width * scale))
+    resized_height = max(1, round(image.height * scale))
+    resized = image.resize((resized_width, resized_height), Image.Resampling.BILINEAR)
+    offset_x = (image_size - resized_width) // 2
+    offset_y = (image_size - resized_height) // 2
+    canvas = Image.new("RGB", (image_size, image_size), (114, 114, 114))
+    canvas.paste(resized, (offset_x, offset_y))
+    pixels = np.asarray(canvas, dtype=np.float32) / 255.0
+    array = np.transpose(pixels, (2, 0, 1))[None].copy()
+    transform = LetterboxTransform(
+        original_width=image.width,
+        original_height=image.height,
+        resized_width=resized_width,
+        resized_height=resized_height,
+        offset_x=offset_x,
+        offset_y=offset_y,
+        image_size=image_size,
+    )
+    return array, transform
+
+
+def _restore_mask(mask, transform: LetterboxTransform):
+    import numpy as np
+    from PIL import Image
+
+    array = (
+        mask.detach().cpu().numpy()
+        if hasattr(mask, "detach")
+        else np.asarray(mask)
+    )
+    cropped = array[
+        transform.offset_y : transform.offset_y + transform.resized_height,
+        transform.offset_x : transform.offset_x + transform.resized_width,
+    ]
+    if cropped.size == 0:
+        raise ValueError("model mask is empty after removing letterbox padding")
+    restored = Image.fromarray(np.asarray(cropped, dtype=np.float32)).resize(
+        (transform.original_width, transform.original_height),
+        Image.Resampling.BILINEAR,
+    )
+    return np.asarray(restored, dtype=np.float32)
+
+
+def _prediction_from_outputs(
+    masks,
+    severe,
+    confidences,
+    transform: LetterboxTransform,
+    trained_targets: frozenset[str],
+) -> FrameModelPrediction:
+    color_mask = (
+        _restore_mask(masks[0, 0], transform)
+        if "target_color_mask" in trained_targets
+        else None
+    )
+    damage_mask = (
+        _restore_mask(masks[0, 1], transform)
+        if "damage_mask" in trained_targets
+        else None
+    )
+    severe_value = (
+        float(severe[0, 0])
+        if "severe_defect" in trained_targets
+        else None
+    )
+    raw_confidences = [float(value) for value in confidences[0]]
+    return FrameModelPrediction(
+        color_mask=color_mask,
+        damage_mask=damage_mask,
+        severe_defect=severe_value >= 0.5 if severe_value is not None else None,
+        color_confidence=(
+            raw_confidences[0] if "target_color_mask" in trained_targets else None
+        ),
+        damage_confidence=(
+            raw_confidences[1] if "damage_mask" in trained_targets else None
+        ),
+        severe_confidence=(
+            raw_confidences[2] if "severe_defect" in trained_targets else None
+        ),
+    )
 
 
 class TorchMeasurementPredictor:
-    """Development backend for checkpoints produced by ``train_quality_model``."""
-
     def __init__(self, checkpoint_path: str | Path, *, device: str = "auto") -> None:
         try:
             import torch
@@ -123,10 +227,17 @@ class TorchMeasurementPredictor:
         if not checkpoint_path.is_file():
             raise PredictorNotConfigured(f"model checkpoint not found: {checkpoint_path}")
         selected_device = (
-            "cuda" if device == "auto" and torch.cuda.is_available() else
-            "cpu" if device == "auto" else device
+            "cuda"
+            if device == "auto" and torch.cuda.is_available()
+            else "cpu"
+            if device == "auto"
+            else device
         )
         checkpoint = torch.load(checkpoint_path, map_location=selected_device, weights_only=False)
+        if checkpoint.get("architecture") != MODEL_ARCHITECTURE:
+            raise PredictorNotConfigured(
+                f"checkpoint must use architecture {MODEL_ARCHITECTURE}"
+            )
         self._model = create_measurement_model()
         self._model.load_state_dict(checkpoint["model_state"])
         self._model.to(selected_device).eval()
@@ -134,38 +245,23 @@ class TorchMeasurementPredictor:
         self._image_size = int(checkpoint.get("image_size", 640))
         self._trained_targets = frozenset(checkpoint.get("trained_targets", []))
 
-    def predict(self, frame: InspectionFrame) -> FrameMeasurements:
+    def predict(self, frame: InspectionFrame) -> FrameModelPrediction:
         import torch
 
-        tensor = _image_bytes_to_tensor(frame.image_data, self._image_size).to(self._device)
+        array, transform = _image_bytes_to_array(frame.image_data, self._image_size)
+        tensor = torch.from_numpy(array)
         with torch.inference_mode():
-            values, confidences = self._model(tensor)
-        raw_values = values[0].detach().cpu().tolist()
-        raw_confidences = confidences[0].detach().cpu().tolist()
-        available = {
-            name: (raw_values[index], raw_confidences[index])
-            for index, name in enumerate(TARGET_NAMES)
-            if name in self._trained_targets
-        }
-        return FrameMeasurements(
-            color_ratio=_value(available, "color_ratio"),
-            diameter_mm=None,
-            damage_area_cm2=_value(available, "damage_area_cm2"),
-            severe_defect=(
-                _value(available, "severe_defect") >= 0.5
-                if _value(available, "severe_defect") is not None
-                else None
-            ),
-            color_confidence=_confidence(available, "color_ratio"),
-            diameter_confidence=None,
-            damage_confidence=_confidence(available, "damage_area_cm2"),
-            severe_confidence=_confidence(available, "severe_defect"),
+            masks, severe, confidences = self._model(tensor.to(self._device))
+        return _prediction_from_outputs(
+            masks.detach().cpu(),
+            severe.detach().cpu(),
+            confidences.detach().cpu(),
+            transform,
+            self._trained_targets,
         )
 
 
 class OnnxMeasurementPredictor:
-    """MVP deployment backend using ONNX Runtime CUDA when available."""
-
     def __init__(self, model_path: str | Path) -> None:
         try:
             import onnxruntime as ort
@@ -173,55 +269,46 @@ class OnnxMeasurementPredictor:
             raise PredictorNotConfigured(
                 "onnxruntime-gpu is required on GPU PC 2 for ONNX inference"
             ) from exc
+        import json
+
         model_path = Path(model_path).expanduser().resolve()
         metadata_path = model_path.with_suffix(model_path.suffix + ".json")
         if not model_path.is_file() or not metadata_path.is_file():
             raise PredictorNotConfigured("ONNX model and its .json metadata sidecar are required")
-        import json
-
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        available = ort.get_available_providers()
+        if metadata.get("architecture") != MODEL_ARCHITECTURE:
+            raise PredictorNotConfigured(
+                f"ONNX metadata must use architecture {MODEL_ARCHITECTURE}"
+            )
         providers = (
             ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            if "CUDAExecutionProvider" in available
+            if "CUDAExecutionProvider" in ort.get_available_providers()
             else ["CPUExecutionProvider"]
         )
         self._session = ort.InferenceSession(str(model_path), providers=providers)
         self._image_size = int(metadata.get("image_size", 640))
         self._trained_targets = frozenset(metadata.get("trained_targets", []))
 
-    def predict(self, frame: InspectionFrame) -> FrameMeasurements:
-        tensor = _image_bytes_to_tensor(frame.image_data, self._image_size)
-        values, confidences = self._session.run(None, {"images": tensor.numpy()})
-        available = {
-            name: (float(values[0, index]), float(confidences[0, index]))
-            for index, name in enumerate(TARGET_NAMES)
-            if name in self._trained_targets
-        }
-        severe = _value(available, "severe_defect")
-        return FrameMeasurements(
-            color_ratio=_value(available, "color_ratio"),
-            diameter_mm=None,
-            damage_area_cm2=_value(available, "damage_area_cm2"),
-            severe_defect=severe >= 0.5 if severe is not None else None,
-            color_confidence=_confidence(available, "color_ratio"),
-            diameter_confidence=None,
-            damage_confidence=_confidence(available, "damage_area_cm2"),
-            severe_confidence=_confidence(available, "severe_defect"),
+    def predict(self, frame: InspectionFrame) -> FrameModelPrediction:
+        array, transform = _image_bytes_to_array(frame.image_data, self._image_size)
+        raw_masks, raw_severe, raw_confidences = self._session.run(
+            None,
+            {"images": array},
         )
-
-
-def _value(outputs: dict[str, tuple[float, float]], name: str) -> float | None:
-    return outputs[name][0] if name in outputs else None
-
-
-def _confidence(outputs: dict[str, tuple[float, float]], name: str) -> float | None:
-    return outputs[name][1] if name in outputs else None
+        return _prediction_from_outputs(
+            raw_masks,
+            raw_severe,
+            raw_confidences,
+            transform,
+            self._trained_targets,
+        )
 
 
 def load_measurement_predictor(model_path: str | Path, *, backend: str = "auto"):
     path = Path(model_path)
-    selected = ("onnx" if path.suffix.lower() == ".onnx" else "torch") if backend == "auto" else backend
+    selected = (
+        "onnx" if path.suffix.lower() == ".onnx" else "torch"
+    ) if backend == "auto" else backend
     if selected == "onnx":
         return OnnxMeasurementPredictor(path)
     if selected == "torch":
@@ -233,12 +320,6 @@ def predict_declared_frames(
     session: InspectionSession,
     predictor: FramePredictor[PredictionT],
 ) -> tuple[IndexedPrediction[PredictionT], ...]:
-    """Run inference in frame-index order after all declared frames arrive.
-
-    The function returns opaque per-frame outputs.  It intentionally does not
-    choose a multi-frame aggregation rule or create a ``QualityResult``.
-    """
-
     if not session.has_all_declared_frames:
         raise IncompleteInspectionError(
             f"inspection {session.inspection_id!r} has {session.received_count}/"

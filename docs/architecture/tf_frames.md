@@ -9,6 +9,7 @@
 - `gripper_frame`
 - `base_camera`
 - `arm_camera`
+- `quality_camera_optical_frame`
 - `tree_<id>`
 - `apple_<id>`
 - `conveyor_<id>`
@@ -18,6 +19,8 @@
 - `odom → base_link`: Isaac Sim ROS 2 Bridge의 Odometry Publisher
 - `base_link → robot links`: `robot_state_publisher`, `/joint_states` 기반
 - 카메라 고정 TF: Isaac Sim Action Graph
+- `quality_camera_optical_frame`: 컨베이어 2 품질 카메라의 optical frame.
+  `+X` right, `+Y` down, `+Z` forward 규약을 사용한다.
 - 동일한 TF를 두 노드가 중복 발행하지 않는다.
 
 M0617이 고정 설치된 MVP에서는 `odom → base_link`가 변하지 않는다. 3차 레일 도입 시 동적 변환으로 확장한다.

@@ -1,9 +1,4 @@
-"""Inspection-frame contract validation and per-apple session storage.
-
-This module deliberately contains no ROS 2, image-decoding, timeout, or model
-policy.  Those concerns depend on the open decisions documented in
-``docs/open_questions_gpu_pc2.md``.
-"""
+"""Inspection-frame contract validation and per-apple session storage."""
 
 from __future__ import annotations
 
@@ -13,6 +8,7 @@ from dataclasses import dataclass, field
 UINT16_MAX = 65_535
 MAX_REPRESENTATIVE_FRAMES = 6
 RESULT_DEADLINE_NS = 500_000_000
+QUALITY_CAMERA_OPTICAL_FRAME = "quality_camera_optical_frame"
 
 
 class InspectionContractError(ValueError):
@@ -24,7 +20,7 @@ class InspectionIdentityMismatch(InspectionContractError):
 
 
 class TotalFramesMismatch(InspectionContractError):
-    """Raised when frames in one inspection disagree about ``total_frames``."""
+    """Raised when frames in one inspection disagree about total_frames."""
 
 
 class DuplicateFrameConflict(InspectionContractError):
@@ -33,12 +29,13 @@ class DuplicateFrameConflict(InspectionContractError):
 
 @dataclass(frozen=True)
 class InspectionCompletion:
-    """Transport-neutral ROI-exit event using Isaac Sim time in nanoseconds."""
+    """Transport-neutral ROI-exit event using Isaac simulation time."""
 
     inspection_id: str
     apple_id: str
     total_frames: int
     roi_exit_time_ns: int
+    frame_id: str
 
     def __post_init__(self) -> None:
         if not self.inspection_id.strip() or not self.apple_id.strip():
@@ -49,6 +46,9 @@ class InspectionCompletion:
             )
         if self.roi_exit_time_ns < 0:
             raise InspectionContractError("roi_exit_time_ns must be non-negative")
+        if self.frame_id != QUALITY_CAMERA_OPTICAL_FRAME:
+            raise InspectionContractError(
+                f"completion frame_id must be {QUALITY_CAMERA_OPTICAL_FRAME!r}")
 
     @property
     def deadline_time_ns(self) -> int:
@@ -57,39 +57,68 @@ class InspectionCompletion:
 
 @dataclass(frozen=True)
 class InspectionFrame:
-    """Transport-neutral representation of one ``InspectionImage`` message.
-
-    ``frame_index`` is validated only as an unsigned 16-bit value.  The project
-    specification does not yet state whether frame numbering is zero- or
-    one-based, so this layer must not impose either convention.
-    """
+    """One synchronized, zero-based RGB-D representative frame."""
 
     inspection_id: str
     apple_id: str
     frame_index: int
     total_frames: int
     image_data: bytes
-    image_format: str = ""
+    image_format: str
+    apple_mask_data: bytes
+    apple_mask_format: str
+    depth_data: bytes
+    depth_format: str
+    camera_width: int
+    camera_height: int
+    camera_k: tuple[float, ...]
+    camera_p: tuple[float, ...]
+    stamp_ns: int
+    frame_id: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.inspection_id, str) or not self.inspection_id.strip():
             raise InspectionContractError("inspection_id must be a non-empty string")
         if not isinstance(self.apple_id, str) or not self.apple_id.strip():
             raise InspectionContractError("apple_id must be a non-empty string")
-        if isinstance(self.frame_index, bool) or not isinstance(self.frame_index, int):
-            raise InspectionContractError("frame_index must be an integer")
-        if not 0 <= self.frame_index <= UINT16_MAX:
-            raise InspectionContractError("frame_index must fit in uint16")
         if isinstance(self.total_frames, bool) or not isinstance(self.total_frames, int):
             raise InspectionContractError("total_frames must be an integer")
         if not 1 <= self.total_frames <= MAX_REPRESENTATIVE_FRAMES:
             raise InspectionContractError(
                 f"total_frames must be between 1 and {MAX_REPRESENTATIVE_FRAMES}"
             )
-        if not isinstance(self.image_data, bytes) or not self.image_data:
-            raise InspectionContractError("image_data must be non-empty bytes")
-        if not isinstance(self.image_format, str):
-            raise InspectionContractError("image_format must be a string")
+        if isinstance(self.frame_index, bool) or not isinstance(self.frame_index, int):
+            raise InspectionContractError("frame_index must be an integer")
+        if not 0 <= self.frame_index <= UINT16_MAX:
+            raise InspectionContractError("frame_index must fit in uint16")
+        if self.frame_index >= self.total_frames:
+            raise InspectionContractError("frame_index must be less than total_frames")
+        for name, value in (
+            ("image_data", self.image_data),
+            ("apple_mask_data", self.apple_mask_data),
+            ("depth_data", self.depth_data),
+        ):
+            if not isinstance(value, bytes) or not value:
+                raise InspectionContractError(f"{name} must be non-empty bytes")
+        for name, value in (
+            ("image_format", self.image_format),
+            ("apple_mask_format", self.apple_mask_format),
+            ("depth_format", self.depth_format),
+            ("frame_id", self.frame_id),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise InspectionContractError(f"{name} must be a non-empty string")
+        if self.frame_id != QUALITY_CAMERA_OPTICAL_FRAME:
+            raise InspectionContractError(
+                f"frame_id must be {QUALITY_CAMERA_OPTICAL_FRAME!r}")
+        if self.camera_width <= 0 or self.camera_height <= 0:
+            raise InspectionContractError("CameraInfo width and height must be positive")
+        if len(self.camera_k) != 9 or len(self.camera_p) != 12:
+            raise InspectionContractError("CameraInfo K and P matrices have invalid lengths")
+        if float(self.camera_k[0]) <= 0.0 or float(self.camera_k[4]) <= 0.0:
+            raise InspectionContractError("CameraInfo is uncalibrated")
+        if self.stamp_ns < 0:
+            raise InspectionContractError("frame stamp must be non-negative")
 
 
 @dataclass
@@ -109,13 +138,6 @@ class InspectionSession:
         return session
 
     def add(self, frame: InspectionFrame) -> bool:
-        """Add a frame and return ``True`` when it is new.
-
-        An identical duplicate is idempotent and returns ``False``.  Reusing an
-        index with different contents is a contract error so callers can choose
-        the eventual ROS status after the relevant policy is approved.
-        """
-
         if frame.inspection_id != self.inspection_id or frame.apple_id != self.apple_id:
             raise InspectionIdentityMismatch(
                 "inspection_id and apple_id must remain constant within a session"
@@ -124,7 +146,6 @@ class InspectionSession:
             raise TotalFramesMismatch(
                 f"total_frames changed from {self.total_frames} to {frame.total_frames}"
             )
-
         existing = self._frames.get(frame.frame_index)
         if existing is not None:
             if existing == frame:
@@ -132,7 +153,6 @@ class InspectionSession:
             raise DuplicateFrameConflict(
                 f"frame_index {frame.frame_index} was received with different contents"
             )
-
         if len(self._frames) >= self.total_frames:
             raise InspectionContractError(
                 "received more unique frames than the declared total_frames"
@@ -141,8 +161,6 @@ class InspectionSession:
         return True
 
     def mark_completed(self, completion: InspectionCompletion) -> bool:
-        """Attach the explicit ROI-exit event; identical duplicates are idempotent."""
-
         if (
             completion.inspection_id != self.inspection_id
             or completion.apple_id != self.apple_id
@@ -166,7 +184,10 @@ class InspectionSession:
         return self._completion
 
     def deadline_reached(self, simulation_time_ns: int) -> bool:
-        return self._completion is not None and simulation_time_ns >= self._completion.deadline_time_ns
+        return (
+            self._completion is not None
+            and simulation_time_ns >= self._completion.deadline_time_ns
+        )
 
     @property
     def received_count(self) -> int:
@@ -174,11 +195,6 @@ class InspectionSession:
 
     @property
     def has_all_declared_frames(self) -> bool:
-        """Whether the number of unique frames equals ``total_frames``.
-
-        This is a transport fact, not an ROI-exit or deadline decision.
-        """
-
         return self.received_count == self.total_frames
 
     @property
@@ -192,14 +208,12 @@ class InspectionSession:
 
 @dataclass(frozen=True)
 class FrameAcceptance:
-    """Result of accepting one frame into the inspection store."""
-
     session: InspectionSession
     is_new_frame: bool
 
 
 class InspectionStore:
-    """Own active inspection sessions, keyed by ``inspection_id``."""
+    """Own active inspection sessions, keyed by inspection_id."""
 
     def __init__(self) -> None:
         self._sessions: dict[str, InspectionSession] = {}
@@ -210,12 +224,9 @@ class InspectionStore:
             session = InspectionSession.from_frame(frame)
             self._sessions[frame.inspection_id] = session
             return FrameAcceptance(session, True)
-
         return FrameAcceptance(session, session.add(frame))
 
     def complete(self, completion: InspectionCompletion) -> InspectionSession:
-        """Record ROI exit even if it arrives before the first image frame."""
-
         session = self._sessions.get(completion.inspection_id)
         if session is None:
             session = InspectionSession(
@@ -230,9 +241,11 @@ class InspectionStore:
     def get(self, inspection_id: str) -> InspectionSession | None:
         return self._sessions.get(inspection_id)
 
-    def pop(self, inspection_id: str) -> InspectionSession | None:
-        """Remove a session after a higher layer has finalized its lifecycle."""
+    @property
+    def sessions(self) -> tuple[InspectionSession, ...]:
+        return tuple(self._sessions.values())
 
+    def pop(self, inspection_id: str) -> InspectionSession | None:
         return self._sessions.pop(inspection_id, None)
 
     def __len__(self) -> int:

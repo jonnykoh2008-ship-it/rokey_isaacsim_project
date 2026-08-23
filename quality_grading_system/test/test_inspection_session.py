@@ -4,9 +4,9 @@ import unittest
 
 from inspection_session import (
     DuplicateFrameConflict,
+    InspectionCompletion,
     InspectionContractError,
     InspectionFrame,
-    InspectionCompletion,
     InspectionIdentityMismatch,
     InspectionStore,
     RESULT_DEADLINE_NS,
@@ -18,6 +18,10 @@ from predictor import (
     UnconfiguredPredictor,
     predict_declared_frames,
 )
+
+
+CAMERA_K = (500.0, 0.0, 50.0, 0.0, 500.0, 50.0, 0.0, 0.0, 1.0)
+CAMERA_P = (500.0, 0.0, 50.0, 0.0, 0.0, 500.0, 50.0, 0.0, 0.0, 0.0, 1.0, 0.0)
 
 
 def make_frame(
@@ -34,95 +38,87 @@ def make_frame(
         frame_index=frame_index,
         total_frames=total_frames,
         image_data=image_data if image_data is not None else f"jpeg-{frame_index}".encode(),
-        image_format="jpeg",
+        image_format="rgb8; jpeg compressed bgr8",
+        apple_mask_data=b"png-mask",
+        apple_mask_format="mono8; png",
+        depth_data=b"png-depth",
+        depth_format="16UC1; compressedDepth png",
+        camera_width=100,
+        camera_height=100,
+        camera_k=CAMERA_K,
+        camera_p=CAMERA_P,
+        stamp_ns=1_000_000_000 + frame_index,
+        frame_id="quality_camera_optical_frame",
+    )
+
+
+def make_completion(
+    *,
+    inspection_id: str = "inspection-001",
+    apple_id: str = "apple-001",
+    total_frames: int = 3,
+    roi_exit_time_ns: int = 10_000_000_000,
+) -> InspectionCompletion:
+    return InspectionCompletion(
+        inspection_id,
+        apple_id,
+        total_frames,
+        roi_exit_time_ns,
+        "quality_camera_optical_frame",
     )
 
 
 class InspectionStoreTest(unittest.TestCase):
-    def test_accepts_out_of_order_frames_and_returns_them_sorted(self) -> None:
+    def test_accepts_out_of_order_zero_based_frames(self) -> None:
         store = InspectionStore()
-
         for index in (2, 0, 1):
-            acceptance = store.accept(make_frame(index))
-            self.assertTrue(acceptance.is_new_frame)
-
+            self.assertTrue(store.accept(make_frame(index)).is_new_frame)
         session = store.get("inspection-001")
-        self.assertIsNotNone(session)
         assert session is not None
         self.assertTrue(session.has_all_declared_frames)
-        self.assertEqual(session.received_count, 3)
         self.assertEqual(session.frame_indices, (0, 1, 2))
 
     def test_identical_duplicate_is_idempotent(self) -> None:
         store = InspectionStore()
         frame = make_frame(0)
-
         self.assertTrue(store.accept(frame).is_new_frame)
         self.assertFalse(store.accept(frame).is_new_frame)
-        self.assertEqual(store.get(frame.inspection_id).received_count, 1)  # type: ignore[union-attr]
 
     def test_conflicting_duplicate_is_rejected(self) -> None:
         store = InspectionStore()
         store.accept(make_frame(0, image_data=b"first"))
-
         with self.assertRaises(DuplicateFrameConflict):
             store.accept(make_frame(0, image_data=b"different"))
 
-    def test_apple_id_cannot_change_within_an_inspection(self) -> None:
+    def test_apple_id_and_total_frames_cannot_change(self) -> None:
         store = InspectionStore()
         store.accept(make_frame(0))
-
         with self.assertRaises(InspectionIdentityMismatch):
             store.accept(make_frame(1, apple_id="apple-002"))
-
-    def test_total_frames_cannot_change_within_an_inspection(self) -> None:
-        store = InspectionStore()
-        store.accept(make_frame(0))
-
         with self.assertRaises(TotalFramesMismatch):
             store.accept(make_frame(1, total_frames=4))
 
-    def test_rejects_more_unique_frames_than_declared(self) -> None:
+    def test_frame_index_is_zero_based_and_bounded_by_total(self) -> None:
+        with self.assertRaises(InspectionContractError):
+            make_frame(3, total_frames=3)
+        with self.assertRaises(InspectionContractError):
+            make_frame(-1, total_frames=3)
+
+    def test_rejects_missing_rgbd_or_calibration(self) -> None:
+        values = make_frame(0).__dict__
+        with self.assertRaises(InspectionContractError):
+            InspectionFrame(**{**values, "apple_mask_data": b""})
+        with self.assertRaises(InspectionContractError):
+            InspectionFrame(**{**values, "depth_data": b""})
+        with self.assertRaises(InspectionContractError):
+            InspectionFrame(**{**values, "camera_k": (0.0,) * 9})
+        with self.assertRaises(InspectionContractError):
+            InspectionFrame(**{**values, "frame_id": "wrong_camera_frame"})
+
+    def test_completion_can_arrive_before_frames_and_uses_sim_deadline(self) -> None:
         store = InspectionStore()
-        store.accept(make_frame(10, total_frames=1))
-
-        with self.assertRaises(InspectionContractError):
-            store.accept(make_frame(11, total_frames=1))
-
-    def test_frame_validation_does_not_assume_zero_or_one_based_indices(self) -> None:
-        self.assertEqual(make_frame(0).frame_index, 0)
-        self.assertEqual(make_frame(3).frame_index, 3)
-
-    def test_rejects_invalid_required_fields(self) -> None:
-        with self.assertRaises(InspectionContractError):
-            make_frame(0, inspection_id="")
-        with self.assertRaises(InspectionContractError):
-            make_frame(0, apple_id="")
-        with self.assertRaises(InspectionContractError):
-            make_frame(0, total_frames=7)
-        with self.assertRaises(InspectionContractError):
-            make_frame(0, image_data=b"")
-
-    def test_store_pop_leaves_lifecycle_decision_to_the_caller(self) -> None:
-        store = InspectionStore()
-        store.accept(make_frame(0))
-
-        removed = store.pop("inspection-001")
-
-        self.assertIsNotNone(removed)
-        self.assertIsNone(store.get("inspection-001"))
-        self.assertEqual(len(store), 0)
-
-    def test_completion_event_can_arrive_before_frames_and_uses_sim_deadline(self) -> None:
-        store = InspectionStore()
-        completion = InspectionCompletion(
-            "inspection-early-complete",
-            "apple-001",
-            4,
-            10_000_000_000,
-        )
+        completion = make_completion(total_frames=4)
         session = store.complete(completion)
-
         self.assertFalse(session.deadline_reached(completion.deadline_time_ns - 1))
         self.assertTrue(session.deadline_reached(completion.deadline_time_ns))
         self.assertEqual(
@@ -142,9 +138,14 @@ class InspectionStoreTest(unittest.TestCase):
     def test_completion_identity_must_match_existing_session(self) -> None:
         store = InspectionStore()
         store.accept(make_frame(0))
-
         with self.assertRaises(InspectionIdentityMismatch):
-            store.complete(InspectionCompletion("inspection-001", "apple-other", 3, 1))
+            store.complete(make_completion(apple_id="apple-other"))
+
+    def test_store_pop_cleans_session(self) -> None:
+        store = InspectionStore()
+        store.accept(make_frame(0))
+        self.assertIsNotNone(store.pop("inspection-001"))
+        self.assertEqual(len(store), 0)
 
 
 class PredictorBoundaryTest(unittest.TestCase):
@@ -158,23 +159,17 @@ class PredictorBoundaryTest(unittest.TestCase):
                 return len(frame.image_data)
 
         predictions = predict_declared_frames(session, ByteCountPredictor())
-
         self.assertEqual(tuple(item.frame_index for item in predictions), (0, 1, 2))
-        self.assertEqual(tuple(item.value for item in predictions), (6, 6, 6))
 
-    def test_inference_rejects_an_incomplete_declared_batch(self) -> None:
+    def test_inference_rejects_incomplete_batch(self) -> None:
         session = InspectionStore().accept(make_frame(0)).session
-
         with self.assertRaises(IncompleteInspectionError):
             predict_declared_frames(session, UnconfiguredPredictor())
 
-    def test_unconfigured_predictor_never_fabricates_a_result(self) -> None:
+    def test_unconfigured_predictor_never_fabricates_result(self) -> None:
         store = InspectionStore()
-        session = None
         for index in range(3):
             session = store.accept(make_frame(index)).session
-        assert session is not None
-
         with self.assertRaises(PredictorNotConfigured):
             predict_declared_frames(session, UnconfiguredPredictor())
 

@@ -1,9 +1,4 @@
-"""Reader and capability audit for the Isaac Sim apple dataset.
-
-The capture contains exact diameter metadata and whole-apple instance masks.
-It does not contain color-region, damage-region, or severe-defect annotations;
-those values are never inferred from asset folder names in this module.
-"""
+"""Dataset reader for segmentation-based apple quality annotations."""
 
 from __future__ import annotations
 
@@ -15,12 +10,12 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-TARGET_NAMES = ("color_ratio", "damage_area_cm2", "severe_defect")
+MASK_TARGETS = ("target_color_mask", "damage_mask")
 ANNOTATION_FILE = "quality_annotations.json"
 
 
 class DatasetContractError(ValueError):
-    """Raised when captured files disagree with their manifest or metadata."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -44,8 +39,9 @@ class AppleDatasetRecord:
     instance_mapping_path: Path
     camera_params_path: Path
     measured_diameter_mm: float
-    color_ratio: float | None = None
-    damage_area_cm2: float | None = None
+    target_color_mask_path: Path | None = None
+    damage_mask_path: Path | None = None
+    ignore_mask_path: Path | None = None
     severe_defect: bool | None = None
 
     @property
@@ -57,8 +53,8 @@ class AppleDatasetRecord:
 class DatasetCapabilities:
     samples: int
     diameter_labels: int
-    color_ratio_labels: int
-    damage_area_labels: int
+    color_mask_labels: int
+    damage_mask_labels: int
     severe_defect_labels: int
     asset_types: tuple[str, ...]
 
@@ -67,22 +63,21 @@ class DatasetCapabilities:
         return bool(self.samples) and all(
             count == self.samples
             for count in (
-                self.diameter_labels,
-                self.color_ratio_labels,
-                self.damage_area_labels,
+                self.color_mask_labels,
+                self.damage_mask_labels,
                 self.severe_defect_labels,
             )
         )
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)
+        value["color_ratio_labels"] = self.color_mask_labels
+        value["damage_area_labels"] = self.damage_mask_labels
         value["supports_complete_quality_training"] = self.supports_complete_quality_training
         return value
 
 
 def resolve_dataset_root(path: str | Path) -> Path:
-    """Resolve either one capture root or the parent ``apple_data`` folder."""
-
     candidate = Path(path).expanduser().resolve()
     if (candidate / "dataset_manifest.json").is_file():
         return candidate
@@ -119,6 +114,27 @@ def _load_optional_annotations(root: Path) -> dict[str, dict[str, Any]]:
     return value
 
 
+def _optional_path(root: Path, values: dict[str, Any], key: str) -> Path | None:
+    raw = values.get(key)
+    if raw in (None, ""):
+        return None
+    path = (root / str(raw)).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise DatasetContractError(f"{key} must stay inside dataset root") from exc
+    return _require_file(path)
+
+
+def _optional_bool(values: dict[str, Any], key: str) -> bool | None:
+    value = values.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise DatasetContractError(f"{key} must be boolean or null")
+    return value
+
+
 def load_dataset_records(path: str | Path) -> tuple[AppleDatasetRecord, ...]:
     root = resolve_dataset_root(path)
     manifest = _load_json(root / "dataset_manifest.json")
@@ -140,49 +156,41 @@ def load_dataset_records(path: str | Path) -> tuple[AppleDatasetRecord, ...]:
                 rgb_path = _require_file(size_root / rgb_name)
                 relative = rgb_path.relative_to(root).as_posix()
                 extra = annotations.get(relative, {})
-                record = AppleDatasetRecord(
-                    dataset_root=root,
-                    asset_type=str(item["asset_type"]),
-                    view_index=int(item["view_index"]),
-                    rgb_path=rgb_path,
-                    depth_path=_require_file(size_root / f"distance_to_camera_{stem}.npy"),
-                    instance_segmentation_path=_require_file(
-                        size_root / f"instance_id_segmentation_{stem}.png"
-                    ),
-                    instance_mapping_path=_require_file(
-                        size_root / f"instance_id_segmentation_mapping_{stem}.json"
-                    ),
-                    camera_params_path=_require_file(size_root / f"camera_params_{stem}.json"),
-                    measured_diameter_mm=float(item["measured_diameter_mm"]),
-                    color_ratio=_optional_float(extra, "color_ratio"),
-                    damage_area_cm2=_optional_float(extra, "damage_area_cm2"),
-                    severe_defect=_optional_bool(extra, "severe_defect"),
+                if not isinstance(extra, dict):
+                    raise DatasetContractError(f"annotation for {relative} must be an object")
+                records.append(
+                    AppleDatasetRecord(
+                        dataset_root=root,
+                        asset_type=str(item["asset_type"]),
+                        view_index=int(item["view_index"]),
+                        rgb_path=rgb_path,
+                        depth_path=_require_file(
+                            size_root / f"distance_to_camera_{stem}.npy"
+                        ),
+                        instance_segmentation_path=_require_file(
+                            size_root / f"instance_id_segmentation_{stem}.png"
+                        ),
+                        instance_mapping_path=_require_file(
+                            size_root / f"instance_id_segmentation_mapping_{stem}.json"
+                        ),
+                        camera_params_path=_require_file(
+                            size_root / f"camera_params_{stem}.json"
+                        ),
+                        measured_diameter_mm=float(item["measured_diameter_mm"]),
+                        target_color_mask_path=_optional_path(
+                            root, extra, "target_color_mask"
+                        ),
+                        damage_mask_path=_optional_path(root, extra, "damage_mask"),
+                        ignore_mask_path=_optional_path(root, extra, "ignore_mask"),
+                        severe_defect=_optional_bool(extra, "severe_defect"),
+                    )
                 )
-                records.append(record)
-
     expected = int(manifest.get("total_rgb_images", len(records)))
     if len(records) != expected:
-        raise DatasetContractError(f"manifest declares {expected} images but found {len(records)}")
+        raise DatasetContractError(
+            f"manifest declares {expected} images but found {len(records)}"
+        )
     return tuple(records)
-
-
-def _optional_float(values: dict[str, Any], key: str) -> float | None:
-    if key not in values or values[key] is None:
-        return None
-    result = float(values[key])
-    if key == "color_ratio" and not 0.0 <= result <= 1.0:
-        raise DatasetContractError(f"{key} must be between 0 and 1")
-    if key == "damage_area_cm2" and result < 0.0:
-        raise DatasetContractError(f"{key} must be non-negative")
-    return result
-
-
-def _optional_bool(values: dict[str, Any], key: str) -> bool | None:
-    if key not in values or values[key] is None:
-        return None
-    if not isinstance(values[key], bool):
-        raise DatasetContractError(f"{key} must be boolean")
-    return values[key]
 
 
 def inspect_capabilities(records: Iterable[AppleDatasetRecord]) -> DatasetCapabilities:
@@ -190,8 +198,8 @@ def inspect_capabilities(records: Iterable[AppleDatasetRecord]) -> DatasetCapabi
     return DatasetCapabilities(
         samples=len(values),
         diameter_labels=sum(item.measured_diameter_mm > 0.0 for item in values),
-        color_ratio_labels=sum(item.color_ratio is not None for item in values),
-        damage_area_labels=sum(item.damage_area_cm2 is not None for item in values),
+        color_mask_labels=sum(item.target_color_mask_path is not None for item in values),
+        damage_mask_labels=sum(item.damage_mask_path is not None for item in values),
         severe_defect_labels=sum(item.severe_defect is not None for item in values),
         asset_types=tuple(sorted({item.asset_type for item in values})),
     )
@@ -212,12 +220,12 @@ def load_camera_intrinsics(record: AppleDatasetRecord) -> CameraIntrinsics:
 
 
 def load_apple_mask(record: AppleDatasetRecord):
-    """Return the boolean apple mask encoded by Replicator's RGBA mapping."""
-
     import numpy as np
     from PIL import Image
 
-    segmentation = np.asarray(Image.open(record.instance_segmentation_path).convert("RGBA"))
+    segmentation = np.asarray(
+        Image.open(record.instance_segmentation_path).convert("RGBA")
+    )
     mapping = _load_json(record.instance_mapping_path)
     colors = [
         np.asarray(ast.literal_eval(encoded), dtype=np.uint8)
@@ -225,21 +233,21 @@ def load_apple_mask(record: AppleDatasetRecord):
         if record.asset_type in str(prim_path)
     ]
     if not colors:
-        raise DatasetContractError(f"apple prim is absent from {record.instance_mapping_path}")
+        raise DatasetContractError(
+            f"apple prim is absent from {record.instance_mapping_path}"
+        )
     mask = np.zeros(segmentation.shape[:2], dtype=bool)
     for color in colors:
         mask |= np.all(segmentation == color, axis=2)
-    if not mask.any():
-        raise DatasetContractError(f"apple mask is empty in {record.instance_segmentation_path}")
+    if not bool(mask.any()):
+        raise DatasetContractError(
+            f"apple mask is empty in {record.instance_segmentation_path}"
+        )
     return mask
 
 
 def estimate_visible_diameter_mm(record: AppleDatasetRecord) -> float:
-    """Estimate visible camera-plane extent from ideal radial depth.
-
-    This is a diagnostic, not the documented equatorial ground truth.  Random
-    orientation and invisible back surfaces cause a systematic underestimate.
-    """
+    """Diagnostic visible extent for the existing radial-depth capture."""
 
     import numpy as np
 
@@ -248,7 +256,9 @@ def estimate_visible_diameter_mm(record: AppleDatasetRecord) -> float:
     intrinsics = load_camera_intrinsics(record)
     valid = mask & np.isfinite(depth) & (depth > 0.0)
     if int(valid.sum()) < 10:
-        raise DatasetContractError(f"too few valid apple depth pixels in {record.depth_path}")
+        raise DatasetContractError(
+            f"too few valid apple depth pixels in {record.depth_path}"
+        )
     ys, xs = np.nonzero(valid)
     radial_depth = depth[ys, xs]
     ray_x = (xs - intrinsics.cx) / intrinsics.fx
@@ -275,8 +285,33 @@ def letterbox_rgb(image, size: int = 640):
     return canvas
 
 
+def _letterbox_mask(mask, size: int):
+    import numpy as np
+    from PIL import Image
+
+    image = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255, mode="L")
+    scale = min(size / image.width, size / image.height)
+    resized = image.resize(
+        (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+        Image.Resampling.NEAREST,
+    )
+    canvas = Image.new("L", (size, size), 0)
+    canvas.paste(resized, ((size - resized.width) // 2, (size - resized.height) // 2))
+    return np.asarray(canvas) > 0
+
+
+def _load_binary_mask(path: Path, expected_shape: tuple[int, int]):
+    import numpy as np
+    from PIL import Image
+
+    value = np.asarray(Image.open(path).convert("L")) > 0
+    if value.shape != expected_shape:
+        raise DatasetContractError(f"mask dimensions do not match RGB: {path}")
+    return value
+
+
 class AppleQualityTorchDataset:
-    """Torch-compatible dataset with explicit masks for missing annotations."""
+    """Torch dataset for color/damage segmentation and severe classification."""
 
     def __init__(self, records: Iterable[AppleDatasetRecord], image_size: int = 640) -> None:
         self.records = tuple(records)
@@ -291,28 +326,72 @@ class AppleQualityTorchDataset:
         from PIL import Image
 
         record = self.records[index]
-        image = letterbox_rgb(Image.open(record.rgb_path), self.image_size)
-        pixels = np.asarray(image, dtype=np.float32) / 255.0
-        tensor = torch.from_numpy(pixels).permute(2, 0, 1).contiguous()
-        raw_targets = (
-            record.color_ratio,
-            record.damage_area_cm2,
-            float(record.severe_defect) if record.severe_defect is not None else None,
+        raw_image = Image.open(record.rgb_path).convert("RGB")
+        expected_shape = (raw_image.height, raw_image.width)
+        surface = load_apple_mask(record)
+        if surface.shape != expected_shape:
+            raise DatasetContractError(
+                f"instance mask dimensions do not match RGB: {record.rgb_path}"
+            )
+        ignore = (
+            _load_binary_mask(record.ignore_mask_path, expected_shape)
+            if record.ignore_mask_path
+            else np.zeros(expected_shape, dtype=bool)
         )
-        target_mask = torch.tensor([value is not None for value in raw_targets], dtype=torch.bool)
-        targets = torch.tensor(
-            [float(value) if value is not None else 0.0 for value in raw_targets],
+        color = (
+            _load_binary_mask(record.target_color_mask_path, expected_shape)
+            if record.target_color_mask_path
+            else np.zeros(expected_shape, dtype=bool)
+        )
+        damage = (
+            _load_binary_mask(record.damage_mask_path, expected_shape)
+            if record.damage_mask_path
+            else np.zeros(expected_shape, dtype=bool)
+        )
+
+        image = letterbox_rgb(raw_image, self.image_size)
+        pixels = np.asarray(image, dtype=np.float32) / 255.0
+        image_tensor = torch.from_numpy(pixels).permute(2, 0, 1).contiguous()
+        mask_targets = torch.from_numpy(
+            np.stack(
+                (
+                    _letterbox_mask(color & surface, self.image_size),
+                    _letterbox_mask(damage & surface, self.image_size),
+                )
+            ).astype(np.float32)
+        )
+        valid_surface = torch.from_numpy(
+            _letterbox_mask(surface & ~ignore, self.image_size)
+        )
+        target_valid = torch.tensor(
+            (
+                record.target_color_mask_path is not None,
+                record.damage_mask_path is not None,
+                record.severe_defect is not None,
+            ),
+            dtype=torch.bool,
+        )
+        severe_target = torch.tensor(
+            float(record.severe_defect) if record.severe_defect is not None else 0.0,
             dtype=torch.float32,
         )
-        return tensor, targets, target_mask
+        return image_tensor, mask_targets, severe_target, target_valid, valid_surface
 
 
 def main(args: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Audit Isaac Sim apple quality labels")
+    parser = argparse.ArgumentParser(
+        description="Audit Isaac Sim apple quality segmentation labels"
+    )
     parser.add_argument("dataset", nargs="?", default="apple_data")
     parsed = parser.parse_args(args)
     records = load_dataset_records(parsed.dataset)
-    print(json.dumps(inspect_capabilities(records).to_dict(), ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            inspect_capabilities(records).to_dict(),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

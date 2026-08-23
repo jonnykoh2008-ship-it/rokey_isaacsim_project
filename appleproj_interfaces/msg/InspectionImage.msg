@@ -4,3 +4,6 @@ string apple_id
 uint16 frame_index
 uint16 total_frames
 sensor_msgs/CompressedImage image
+sensor_msgs/CompressedImage apple_mask
+sensor_msgs/CompressedImage aligned_depth
+sensor_msgs/CameraInfo camera_info

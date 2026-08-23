@@ -9,6 +9,7 @@ setup(
     version="0.1.0",
     py_modules=[
         "apple_quality_dataset",
+        "depth_geometry",
         "inspection_session",
         "predictor",
         "quality_inspection_node",

@@ -9,7 +9,7 @@
 - 모든 ROS 2 노드는 `use_sim_time:=true`를 사용한다.
 - `apple_id`와 `inspection_id`는 한 처리 주기 동안 변경하지 않는다.
 - 센서 스트림에는 Sensor Data QoS를 기본 후보로 사용한다.
-- 상태·결과 메시지는 신뢰성 우선 QoS를 사용한다. 정확한 QoS는 TBD다.
+- 상태·결과 메시지는 신뢰성 우선 QoS를 사용한다. 품질검사 토픽의 정확한 QoS는 각 인터페이스 절을 따른다.
 
 ## 인터페이스 목록
 
@@ -22,6 +22,7 @@
 | Action | `/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | 개인 PC 1 |
 | Topic | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | 개인 PC 1 | GPU PC 1 |
 | Topic | `/quality/inspection_images` | `appleproj_interfaces/msg/InspectionImage` | GPU PC 1 | GPU PC 2 |
+| Topic | `/quality/inspection_completed` | `appleproj_interfaces/msg/InspectionCompleted` | GPU PC 1 | GPU PC 2 |
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
 | Service | `/quality/retry_inspection` | `appleproj_interfaces/srv/RetryInspection` | GPU PC 1 | 개인 PC 2 |
 | Topic | `/conveyor/checkpoint_events` | `appleproj_interfaces/msg/CheckpointEvent` | GPU PC 1 | 개인 PC 2 |
@@ -107,23 +108,48 @@ snapshot에는 안전거리가 적용되기 전 형상 크기를 넣고 개인 P
 
 ## InspectionImage
 
-GPU PC 1이 컨베이어 2의 대표 검사 이미지를 GPU PC 2로 전달한다.
+GPU PC 1이 컨베이어 2의 대표 검사 RGB-D 프레임을 GPU PC 2로 전달한다.
 
 ```text
 토픽: /quality/inspection_images
 타입: appleproj_interfaces/msg/InspectionImage
+QoS: Reliable, Volatile, Keep Last 6
 ```
 
 필드:
 
-- `header`: `/clock` 기준 촬영 시각과 카메라 frame
+- `header`: `/clock` 기준 촬영 시각, `frame_id=quality_camera_optical_frame`
 - `inspection_id`: 한 번의 품질검사 식별자
 - `apple_id`: 검사 대상 사과 식별자
-- `frame_index`: 해당 검사에서의 프레임 번호
+- `frame_index`: 0부터 시작하며 `frame_index < total_frames`
 - `total_frames`: 해당 검사에서 전송할 전체 대표 프레임 수
 - `image`: 압축 RGB 이미지
+- `apple_mask`: RGB 픽셀 좌표계의 사과 표면 binary PNG mask
+- `aligned_depth`: RGB 픽셀 좌표계에 정렬한 optical Z-depth
+- `camera_info`: RGB·mask·depth 좌표계에 맞춘 calibration
 
-depth 및 `CameraInfo` 전달 여부는 TBD다.
+`aligned_depth.format`은 `16UC1; compressedDepth png`이고 단위는 mm, invalid 값은 0이다. 방사 거리(distance-to-camera)가 아니라 optical frame의 `+Z` 깊이를 사용한다. RGB, mask, depth의 디코딩 해상도와 `camera_info.width/height`는 같아야 하며 crop·resize 시 `K`와 `P`를 같이 보정한다.
+
+`InspectionImage.header`, `image.header`, `apple_mask.header`, `aligned_depth.header`, `camera_info.header`의 timestamp와 frame ID는 모두 정확히 같아야 한다. GPU PC 2는 하나라도 다르거나 `K[0]`/`K[4]`가 0이면 해당 프레임을 거부한다.
+
+## InspectionCompleted
+
+GPU PC 1이 검사 ROI 이탈과 해당 검사의 프레임 전송 종료를 GPU PC 2에 알린다.
+
+```text
+토픽: /quality/inspection_completed
+타입: appleproj_interfaces/msg/InspectionCompleted
+QoS: Reliable, Volatile, Keep Last 10
+```
+
+필드:
+
+- `header`: ROI 이탈 simulation timestamp, `frame_id=quality_camera_optical_frame`
+- `inspection_id`
+- `apple_id`
+- `total_frames`
+
+`inspection_id`, `apple_id`, `total_frames`는 같은 검사의 모든 `InspectionImage`와 일치해야 한다. GPU PC 2는 완료 이벤트 전에는 모든 프레임이 이미 도착했더라도 결과를 확정하지 않는다. 완료 시각부터 simulation time 0.5초까지 누락 프레임을 기다린다.
 
 ## QualityResult
 
@@ -132,6 +158,7 @@ GPU PC 2가 이미지별 품질 추론과 사과 단위 통합을 완료한 뒤 
 ```text
 토픽: /quality/results
 타입: appleproj_interfaces/msg/QualityResult
+QoS: Reliable, Volatile, Keep Last 10
 ```
 
 필드:
@@ -149,7 +176,7 @@ GPU PC 2가 이미지별 품질 추론과 사과 단위 통합을 완료한 뒤 
 - `result_timestamp`
 - `status`: `VALID`, `RECHECK`, `UNCLASSIFIED`, `TIMEOUT`, `LATE_RESULT`, `ID_MISMATCH`, `INSUFFICIENT_VIEWS`
 
-카메라 ROI 이탈 후 simulation time 0.5초를 결과 deadline으로 사용한다. deadline까지 결과가 없으면 `TIMEOUT`, 이후 도착한 결과는 `LATE_RESULT`로 기록한다. 컨베이어 2의 tracker ID와 컨베이어 3 checkpoint의 rigid body prim이 일치하지 않으면 `ID_MISMATCH`로 처리한다.
+카메라 ROI 이탈 후 simulation time 0.5초를 결과 deadline으로 사용한다. deadline까지 확정하지 못하면 해당 검사의 유일한 최종 결과로 `TIMEOUT`을 발행한다. 이후 끝난 추론은 `LATE_RESULT`로 내부 로그에만 기록하고 정상 등급이나 두 번째 결과 메시지를 발행하지 않는다. 컨베이어 2의 tracker ID와 컨베이어 3 checkpoint의 rigid body prim이 일치하지 않으면 `ID_MISMATCH`로 처리한다.
 
 ## CheckpointEvent
 

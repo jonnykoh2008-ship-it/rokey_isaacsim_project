@@ -22,9 +22,9 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 
 상태: `DECIDED`
 
-- `InspectionImage`는 압축 RGB 이미지를 전달하도록 정의되어 있다.
-- depth와 `CameraInfo`는 대표 RGB 프레임과 함께 GPU PC 2로 전달한다.
-- MVP의 직경 및 손상 면적 계산은 정렬된 depth와 camera intrinsics를 요구한다.
+- `InspectionImage`는 압축 RGB, 사과 mask, aligned depth와 `CameraInfo`를 한 메시지로 전달한다.
+- 모든 영상 성분은 같은 픽셀 좌표계와 header를 사용한다.
+- MVP의 직경 및 손상 면적 계산은 사과 mask, 정렬된 depth와 camera intrinsics를 요구한다.
 
 결정할 내용:
 
@@ -41,10 +41,11 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 
 결정:
 
-- GPU PC 1은 대표 프레임의 RGB, 정렬된 depth, CameraInfo를 GPU PC 2로 전달한다.
+- GPU PC 1은 대표 프레임의 RGB, 사과 mask, 정렬된 depth, CameraInfo를 GPU PC 2로 전달한다.
 - GPU PC 2가 RGB/depth 기반 품질 추론과 직경·손상 면적 등 기하 측정을 담당한다.
 - 품질검사 연산을 GPU PC 2에 집중해 PC 간 기능 경계를 명확히 한다.
-- MVP에서는 RGB, 정렬된 depth, CameraInfo를 하나의 custom `InspectionImage` 계열 메시지에 함께 포함해 동일 대표 프레임 단위로 전달한다. 네트워크 최적화가 필요할 때만 추후 분리 토픽 구조를 재검토한다.
+- MVP에서는 RGB, 사과 mask, 정렬된 depth, CameraInfo를 하나의 custom `InspectionImage`에 함께 포함해 동일 대표 프레임 단위로 전달한다.
+- depth는 optical Z-depth, `16UC1` millimeter, invalid 0, `compressedDepth png`를 사용한다.
 
 ### G2-02. 프레임별 품질 모델 입출력
 
@@ -63,7 +64,7 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 결정:
 
 - 모델은 `HIGH`, `MEDIUM`, `LOW` 등급을 직접 출력하지 않는다.
-- 프레임별로 착색률, 손상률 또는 손상 면적, 심각 결함 여부 등 품질 측정값을 출력한다.
+- 프레임별로 목표 착색 mask, 손상 mask, 심각 결함 여부와 각 confidence를 출력한다.
 - 직경은 정렬된 depth와 camera intrinsics를 이용해 GPU PC 2에서 계산한다.
 - 최종 `HIGH`/`MEDIUM`/`LOW` 등급은 사전에 정의한 품질 기준과 측정값을 이용한 규칙 기반 판정으로 결정한다.
 - 이 방식은 등급 판정 근거를 추적할 수 있고, 품질 기준 변경 시 모델 전체를 다시 학습하지 않고 판정 규칙을 조정할 수 있도록 하기 위한 것이다.
@@ -71,7 +72,7 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 - 프레임 confidence는 품질 측정에 사용된 모델 출력들의 유효 confidence 평균으로 정의한다. 초기 유효 threshold는 0.5로 두며, 핵심 측정 항목의 confidence가 0.5 미만이면 해당 프레임의 해당 측정값을 무효 처리한다.
 - 낮은 confidence 때문에 사과 단위 유효 프레임이 4장 미만이 되면 `INSUFFICIENT_VIEWS`, 손상 면적 유효 프레임이 2장 미만이면 기존 정책대로 `RECHECK`를 사용한다.
 - 모델 배포 형식은 ONNX를 기본으로 하고 GPU PC 2에서는 ONNX Runtime CUDA를 MVP 실행 백엔드로 사용한다. 이후 성능이 부족하면 TensorRT 변환을 최적화 단계에서 검토한다.
-- annotation은 착색 영역, 표면 손상 영역, 심각 결함 여부를 최소 단위로 정의하고, 부패·형상 이상은 MVP 데이터셋에서 신뢰성 있게 구분 가능한 경우에만 별도 클래스로 확장한다.
+- annotation은 사과 표면, 목표 착색, 손상, 무시 영역 mask와 심각 결함 여부를 사용한다. MVP는 동일 적색 품종군을 대상으로 하고 정상적인 과피 거침은 손상에서 제외하며 scab은 손상에 포함한다.
 
 ### G2-03. 다중 프레임 통합 규칙
 
@@ -100,11 +101,12 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 
 결정:
 
-- GPU PC 1은 검사 대상 사과가 카메라 ROI를 이탈하면 별도의 검사 완료 이벤트를 GPU PC 2에 전달한다.
-- 검사 완료 이벤트에는 최소한 `apple_id`, `total_frames`, ROI 이탈 시점의 simulation timestamp를 포함한다.
+- GPU PC 1은 검사 대상 사과가 카메라 ROI를 이탈하면 `/quality/inspection_completed`에 `InspectionCompleted`를 발행한다.
+- 완료 이벤트에는 `header`, `inspection_id`, `apple_id`, `total_frames`를 포함한다.
 - GPU PC 2는 검사 완료 이벤트의 ROI 이탈 simulation timestamp를 결과 deadline의 시작점으로 사용하며, 결과 deadline은 해당 시점부터 simulation time 0.5초다.
 - 검사 완료 이벤트를 수신했을 때 누락된 `frame_index`가 있으면 GPU PC 2는 deadline까지 해당 프레임의 도착을 기다린다.
 - deadline까지 도착하지 않은 프레임은 실패 프레임으로 처리한다. 이후 정상 처리 가능한 대표 프레임이 4장 이상이면 수신된 유효 프레임으로 결과를 계산하고, 4장 미만이면 `INSUFFICIENT_VIEWS`로 처리한다.
+- 완료 이벤트 전에는 모든 프레임이 도착했더라도 결과를 확정하지 않는다.
 
 선택 근거:
 
@@ -118,9 +120,9 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 
 결정:
 
-- `TIMEOUT`과 `LATE_RESULT`는 GPU PC 2가 판정한다. G2-04에서 확정한 검사 완료 이벤트의 ROI 이탈 simulation timestamp를 기준으로 0.5초 deadline을 계산한다.
-- `TIMEOUT`은 deadline까지 최종 결과를 생성하지 못한 경우 사용한다.
-- deadline 이후 정상 추론이 완료되더라도 해당 검사에 대한 정상 결과를 다시 발행하지 않고 `LATE_RESULT` 상태만 기록·발행한다. 동일 사과에 대해 서로 충돌하는 최종 결과가 두 번 사용되는 것을 방지한다.
+- GPU PC 2는 G2-04의 ROI 이탈 simulation timestamp를 기준으로 0.5초 deadline을 계산한다.
+- deadline까지 최종 결과를 생성하지 못하면 해당 검사의 유일한 결과로 `TIMEOUT`을 발행한다.
+- deadline 이후 정상 추론이 끝나면 `LATE_RESULT`를 내부 로그에만 기록하고 별도 결과 메시지를 발행하지 않는다.
 - `ID_MISMATCH`는 컨베이어 tracker ID와 rigid body prim 정보를 모두 확인할 수 있는 공정/추적 관리 노드에서 판정한다. GPU PC 2가 직접 비교하지 않는다.
 - GPU PC 2는 검사 완료 이벤트와 프레임의 `apple_id` 일치 여부만 검증하며, 동일 검사 내부에서 ID가 다르면 입력 오류로 거부하고 상태 로그를 남긴다.
 
@@ -137,7 +139,7 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 결정:
 
 - `/quality/inspection_images`는 `RELIABLE`, `VOLATILE`, `KEEP_LAST`, `depth=6`을 사용한다.
-- 검사 완료 이벤트도 `RELIABLE`, `VOLATILE`, `KEEP_LAST`, `depth=10`을 사용한다.
+- `/quality/inspection_completed`도 `RELIABLE`, `VOLATILE`, `KEEP_LAST`, `depth=10`을 사용한다.
 - `/quality/results`는 `RELIABLE`, `VOLATILE`, `KEEP_LAST`, `depth=10`을 사용한다.
 - MVP에서는 재전송으로 인한 약간의 지연보다 대표 프레임 또는 최종 결과 유실을 더 큰 위험으로 본다.
 - 실제 다중 PC 시험에서 재전송 지연이 0.5초 deadline을 반복적으로 침범하면 이미지 토픽만 `BEST_EFFORT`로 변경하는 비교 시험을 수행한다.
@@ -180,16 +182,17 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 
 - `system_overview.md`와 `ros2_interfaces.md`에서 이미 개인 PC 1·2 체계를 사용하고 있어 이를 기준으로 맞추는 편이 변경 범위가 작고 이해하기 쉽다.
 
-### G2-09. 압축 이미지의 두 header
+### G2-09. RGB-D 구성요소의 header
 
 상태: `DECIDED`
 
 결정:
 
 - 기준 timestamp와 frame ID는 `InspectionImage.header`를 단일 기준으로 사용한다.
-- 내부 `sensor_msgs/CompressedImage.image.header`도 송신 시 동일한 timestamp와 frame ID를 복사해 설정한다.
-- GPU PC 2는 두 header가 다르면 해당 프레임을 유효 입력으로 사용하지 않고 입력 오류로 기록한다.
-- 추후 custom interface를 정리할 때 중복 header를 제거할 수 있으나 MVP에서는 기존 메시지 호환성을 위해 둘 다 유지한다.
+- `image.header`, `apple_mask.header`, `aligned_depth.header`, `camera_info.header`에도 동일한 timestamp와 frame ID를 복사한다.
+- frame ID는 `quality_camera_optical_frame`을 사용하고 frame index는 0부터 시작한다.
+- GPU PC 2는 다섯 header 중 하나라도 다르면 해당 프레임을 거부한다.
+- 중복 header는 MVP custom message에서 유지한다.
 
 선택 근거:
 
@@ -207,6 +210,7 @@ GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 
 - 1280×720, 30fps를 MVP 기본 실행 프로파일로 사용한다.
 - RGB와 depth는 동일 해상도 기준으로 정렬해 GPU PC 2에 전달한다.
 - camera intrinsics와 장착 transform은 실행 시 사용되는 실제 카메라 설정값을 메시지/TF에서 읽고 코드에 상수로 고정하지 않는다.
+- aligned depth는 optical Z-depth이며 `16UC1; compressedDepth png` 계약을 사용한다.
 - 대표 프레임 품질, 직경 오차, 손상률 측정 안정성, 네트워크 사용량을 측정한 뒤 해상도와 FPS를 최종 확정한다.
 
 검증 기준:
