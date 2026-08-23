@@ -212,38 +212,47 @@ class MotionEngine:
         self.world, self.robot, self.stage = world, robot, stage
         self.ik, self.lula = harvest.create_ik_solver(robot, stage)
         self.gripper_indices = [robot.get_dof_index(n) for n in harvest.GRIPPER_JOINTS]
-        self.link_t, self.link_r = harvest.compute_link6_to_palm(stage)
+        self.arm_indices = harvest.np.asarray(
+            [robot.get_dof_index(n) for n in harvest.ARM_JOINTS],
+            dtype=harvest.np.int32,
+        )
         robot_position, _ = harvest.get_prim_world_pose(stage, harvest.ROBOT_BASE_PATH)
         _, apple_size = harvest.compute_apple_center(stage)
         self.conveyor = harvest.compute_conveyor_start(stage, robot_position, apple_size)
         self.expected_index = 0
         self.fsm = None
+        self.collision_motion = None
         self.joint_break = harvest.JointBreakMonitor()
-        self.stem_joint_disarmed = False
+        self.gripper_drive_max_force = harvest.GRIPPER_GRASP_MAX_FORCE
 
     def close(self):
-        if self.stem_joint_disarmed:
-            self._set_stem_joint_armed(True, "ENGINE CLOSE")
         self.joint_break.close()
 
-    def _set_stem_joint_armed(self, armed, reason):
-        """파지 완료 전 접촉 충격으로 줄기가 끊어지지 않게 한다."""
-        joint_prim = harvest.require_prim(self.stage, harvest.FIXED_JOINT_PATH)
-        joint = harvest.UsdPhysics.Joint(joint_prim)
-        if armed:
-            break_force, break_torque = harvest.configured_break_limits()
-            state = "ARMED"
-        else:
-            maximum = float(harvest.np.finfo(harvest.np.float32).max)
-            break_force, break_torque = maximum, maximum
-            state = "DISARMED"
-        joint.GetBreakForceAttr().Set(break_force)
-        joint.GetBreakTorqueAttr().Set(break_torque)
-        self.stem_joint_disarmed = not armed
-        print(
-            f"   Apple joint  {state} FOR {reason}: "
-            f"force {break_force:.3g} N, torque {break_torque:.3g} N·m"
+    def _reset_action_sequence(self, reason):
+        """실패한 Goal의 부분 FSM을 폐기하고 다음 요청을 APPROACH로 맞춘다."""
+        self._set_gripper_drive_max_force(
+            harvest.GRIPPER_GRASP_MAX_FORCE,
+            f"RESET {reason}",
+            report=True,
         )
+        print(f"   Action reset {reason}: next expected APPROACH")
+        self.expected_index = 0
+        self.fsm = None
+        self.collision_motion = None
+
+    def _set_gripper_drive_max_force(self, max_force, state, report=False):
+        """동작 단계에 맞춰 그리퍼 Drive 토크 한계를 갱신한다."""
+        max_force = float(max_force)
+        changed = not harvest.np.isclose(
+            max_force, self.gripper_drive_max_force, atol=1e-9
+        )
+        if changed:
+            harvest.set_gripper_drive_max_force(self.stage, max_force)
+            self.gripper_drive_max_force = max_force
+        if report:
+            print(
+                f"   Gripper force {state}: max {max_force:.3f} N·m/joint"
+            )
 
     @staticmethod
     def result(success, code="", message=""):
@@ -281,8 +290,15 @@ class MotionEngine:
     def execute(self, handle):
         request = handle.request
         if request.motion_type != MOTION_SEQUENCE[self.expected_index]:
+            expected = MOTION_SEQUENCE[self.expected_index]
+            self._reset_action_sequence("INVALID_SEQUENCE")
             handle.abort()
-            return self.result(False, "INVALID_SEQUENCE", "Action 단계 순서가 잘못되었습니다.")
+            return self.result(
+                False,
+                "INVALID_SEQUENCE",
+                f"Action 단계 순서가 잘못되었습니다: "
+                f"expected={expected}, received={request.motion_type}",
+            )
         if request.target_pose.header.frame_id != "world":
             handle.abort()
             return self.result(False, "INVALID_FRAME", "target_pose frame_id는 world여야 합니다.")
@@ -290,13 +306,6 @@ class MotionEngine:
             if request.motion_type == RobotMotion.Goal.APPROACH:
                 self._approach(handle, request.target_pose)
             else:
-                if request.motion_type == RobotMotion.Goal.GRASP:
-                    self._set_stem_joint_armed(False, "GRASP")
-                elif request.motion_type == RobotMotion.Goal.PULL:
-                    # 임계값 복원 직후 파손되더라도 PULL 중 정상 분리로
-                    # 기록되도록 물리 스텝 전에 모니터 상태를 전환한다.
-                    self.joint_break.set_state("PULL")
-                    self._set_stem_joint_armed(True, "PULL")
                 self._run_fsm(handle, STOP_STATE[request.motion_type])
                 if request.motion_type == RobotMotion.Goal.GRASP:
                     self._report_grasp_state()
@@ -309,28 +318,34 @@ class MotionEngine:
                         "PULL 완료 시점까지 사과 FixedJoint가 분리되지 않았습니다.",
                     )
         except MotionExecutionError as error:
-            if self.stem_joint_disarmed:
-                self.joint_break.set_state("FAILED")
-                self._set_stem_joint_armed(True, "FAILED GOAL")
+            self._reset_action_sequence(error.error_code)
             handle.abort()
             return self.result(False, error.error_code, str(error))
+        except harvest.ApproachUnreachableError as error:
+            self._reset_action_sequence("APPROACH_UNREACHABLE")
+            handle.abort()
+            return self.result(False, "APPROACH_UNREACHABLE", str(error))
         except Exception as error:
-            if self.stem_joint_disarmed:
-                self.joint_break.set_state("FAILED")
-                self._set_stem_joint_armed(True, "FAILED GOAL")
+            self._reset_action_sequence("MOTION_FAILED")
             handle.abort()
             return self.result(False, "MOTION_FAILED", str(error))
         if handle.is_cancel_requested:
-            if self.stem_joint_disarmed:
-                self.joint_break.set_state("CANCELED")
-                self._set_stem_joint_armed(True, "CANCELED GOAL")
+            self._reset_action_sequence("CANCELED")
             handle.canceled()
             return self.result(False, "CANCELED", "사용자가 동작을 취소했습니다.")
         self.expected_index += 1
+        if self.expected_index == len(MOTION_SEQUENCE):
+            self._reset_action_sequence("CYCLE_COMPLETE")
         handle.succeed()
         return self.result(True, "", "동작 완료")
 
     def _approach(self, handle, pose):
+        if self.joint_break.broken:
+            raise MotionExecutionError(
+                "APPLE_ALREADY_DETACHED",
+                "사과 FixedJoint가 이미 분리됐습니다. 시뮬레이션을 Reset한 뒤 "
+                "다시 실행하세요.",
+            )
         apple = pose.pose.position
         center = harvest.np.array([apple.x, apple.y, apple.z], dtype=float)
         if not harvest.np.all(harvest.np.isfinite(center)):
@@ -344,16 +359,36 @@ class MotionEngine:
         )
         initial = self._require_arm_joint_positions()
         if not harvest.validate_planned_ik(
-            planned, self.lula, initial, pregrasp, rotation, self.link_t, self.link_r
+            planned, self.lula, initial, pregrasp, rotation
         ):
-            raise RuntimeError("비전 목표의 전체 수확 경로 IK 검사에 실패했습니다.")
+            raise harvest.ApproachUnreachableError(
+                "비전 목표의 전체 수확 경로 IK 검사에 실패했습니다."
+            )
+        current_tcp, _current_rotation = harvest.current_tcp_pose(self.robot)
+        self.collision_motion = harvest.CollisionAwareMotion(
+            robot=self.robot,
+            stage=self.stage,
+            apple_center=center,
+            path_start=current_tcp,
+            pregrasp_tcp=pregrasp,
+        )
+        self.joint_break.set_state("PRE_GRASP")
         self.feedback(handle, "APPROACH", 0.1)
         _steps, complete = harvest.move_arm_to_pregrasp(
-            self.world, self.robot, self.ik, self.gripper_indices,
-            pregrasp, rotation, self.link_t, self.link_r, 0,
+            world=self.world,
+            robot=self.robot,
+            lula_solver=self.lula,
+            collision_motion=self.collision_motion,
+            gripper_indices=self.gripper_indices,
+            pregrasp_tcp=pregrasp,
+            approach_rotation=rotation,
+            max_physics_steps=0,
+            contact_guard=lambda: self.joint_break.broken,
         )
         if not complete:
-            raise RuntimeError("pregrasp 이동을 완료하지 못했습니다.")
+            raise harvest.ApproachUnreachableError(
+                "pregrasp 이동을 완료하지 못했습니다."
+            )
         tcp, palm_rotation = harvest.current_tcp_pose(self.robot)
         self.fsm = harvest.AppleHarvestFSM(
             tcp, palm_rotation, center, rotation, direction, *self.conveyor,
@@ -388,25 +423,119 @@ class MotionEngine:
             )
 
     def _run_fsm(self, handle, stop_state):
-        if self.fsm is None:
+        if self.fsm is None or self.collision_motion is None:
             raise RuntimeError("APPROACH가 먼저 완료되지 않았습니다.")
         failures = 0
+        grasp_hold_positions = None
+        grasp_settle_remaining = harvest.GRASP_SETTLE_STEPS
+        reported_force_state = None
         while not self.fsm.done and self.fsm.NAMES[self.fsm.state] != stop_state:
             if handle.is_cancel_requested:
                 return
-            self._require_arm_joint_positions()
+            current_arm_positions = self._require_arm_joint_positions()
             motion_state = self.fsm.NAMES[self.fsm.state]
+
+            if motion_state == "GRASP" and grasp_hold_positions is None:
+                grasp_hold_positions = current_arm_positions.copy()
+                self._set_gripper_drive_max_force(
+                    harvest.GRIPPER_GRASP_MAX_FORCE,
+                    "GRASP",
+                    report=True,
+                )
+                print(
+                    f"   [GRASP SETTLE] arm hold for "
+                    f"{harvest.GRASP_SETTLE_STEPS} steps before closing"
+                )
+
+            if motion_state == "GRASP" and grasp_settle_remaining > 0:
+                self.joint_break.set_state("GRASP_SETTLE")
+                self.robot.apply_action(
+                    harvest.ArticulationAction(
+                        joint_positions=grasp_hold_positions,
+                        joint_indices=self.arm_indices,
+                    )
+                )
+                harvest.apply_gripper_target(
+                    self.robot, self.gripper_indices, 0.0
+                )
+                completed = (
+                    harvest.GRASP_SETTLE_STEPS - grasp_settle_remaining + 1
+                )
+                if completed == 1 or completed % 60 == 0:
+                    print(
+                        f"   GRASP SETTLE {completed:3d}/"
+                        f"{harvest.GRASP_SETTLE_STEPS}"
+                    )
+                self.feedback(
+                    handle,
+                    "GRASP_SETTLE",
+                    completed / float(harvest.GRASP_SETTLE_STEPS),
+                )
+                self.world.step(render=not harvest.args.headless)
+                grasp_settle_remaining -= 1
+                if self.joint_break.broken:
+                    raise MotionExecutionError(
+                        "GRASP_FAILED",
+                        "사과 FixedJoint가 GRASP_SETTLE 중 조기 파손됐습니다.",
+                    )
+                continue
+
             self.joint_break.set_state(motion_state)
             target, rotation, grip = self.fsm.sample()
-            link_position, link_orientation = harvest.tcp_target_to_link6(
-                target, rotation, self.link_t, self.link_r
-            )
-            action, solved = self.ik.compute_inverse_kinematics(
-                target_position=link_position,
-                target_orientation=link_orientation,
-                position_tolerance=0.003,
-                orientation_tolerance=harvest.np.deg2rad(3.0),
-            )
+            if motion_state == "TWIST":
+                alpha = min(
+                    1.0,
+                    (self.fsm.frame + 1) / float(harvest.TWIST_STEPS),
+                )
+                max_force = (
+                    harvest.GRIPPER_GRASP_MAX_FORCE
+                    + harvest.smoothstep(alpha)
+                    * (
+                        harvest.GRIPPER_HOLD_MAX_FORCE
+                        - harvest.GRIPPER_GRASP_MAX_FORCE
+                    )
+                )
+                self._set_gripper_drive_max_force(
+                    max_force,
+                    "TWIST RAMP",
+                    report=self.fsm.frame in (0, harvest.TWIST_STEPS - 1),
+                )
+            elif motion_state in {
+                "PULL",
+                "RETREAT",
+                "CLEAR_UP",
+                "OUTSIDE",
+                "ALIGN",
+                "TO_BELT",
+            }:
+                self._set_gripper_drive_max_force(
+                    harvest.GRIPPER_HOLD_MAX_FORCE,
+                    motion_state,
+                    report=reported_force_state != "HOLD",
+                )
+                reported_force_state = "HOLD"
+            elif motion_state in {"RELEASE", "LIFT", "EXIT"}:
+                self._set_gripper_drive_max_force(
+                    harvest.GRIPPER_GRASP_MAX_FORCE,
+                    motion_state,
+                    report=reported_force_state != "RELEASE",
+                )
+                reported_force_state = "RELEASE"
+            if motion_state == "GRASP":
+                # 손가락 접촉 중에는 RMPflow의 미세 Cartesian 보정이 줄기
+                # 토크로 전달되지 않도록 ENTER 완료 관절 자세를 유지한다.
+                action = harvest.ArticulationAction(
+                    joint_positions=grasp_hold_positions,
+                    joint_indices=self.arm_indices,
+                )
+                solved = True
+            else:
+                self.collision_motion.set_target(target, rotation)
+                action = self.collision_motion.next_action()
+                solved = (
+                    action.joint_positions is not None
+                    and harvest.np.all(harvest.np.isfinite(action.joint_positions))
+                )
             if solved:
                 self.robot.apply_action(action)
                 failures = 0
@@ -416,12 +545,15 @@ class MotionEngine:
             else:
                 failures += 1
                 if failures >= harvest.MAX_CONSECUTIVE_IK_FAILURES:
-                    raise RuntimeError("IK가 연속 실패했습니다.")
+                    raise RuntimeError("RMPflow 관절 목표가 연속으로 유효하지 않습니다.")
             harvest.apply_gripper_target(self.robot, self.gripper_indices, grip)
             state = self.fsm.NAMES[min(self.fsm.state, len(self.fsm.NAMES) - 1)]
             self.feedback(handle, state, 0.5)
             self.world.step(render=not harvest.args.headless)
-            if self.joint_break.broken and self.joint_break.break_state != "PULL":
+            if (
+                self.joint_break.broken
+                and self.joint_break.break_state not in {"TWIST", "PULL"}
+            ):
                 raise MotionExecutionError(
                     "GRASP_FAILED",
                     f"사과 FixedJoint가 {self.joint_break.break_state} 중 조기 파손됐습니다.",

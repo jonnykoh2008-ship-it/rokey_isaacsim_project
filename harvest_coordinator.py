@@ -25,6 +25,7 @@ class HarvestCoordinator(Node):
         self.samples = deque(maxlen=sample_count)
         self.maximum_spread = maximum_spread
         self.target = None
+        self.failed_target = None
         self.index = 0
         self.running = False
         self.client = ActionClient(self, RobotMotion, "/harvest/robot_motion")
@@ -46,16 +47,31 @@ class HarvestCoordinator(Node):
         self.get_logger().info(f"target median={center}, spread={spread:.4f} m")
         if spread > self.maximum_spread or not self.execute_enabled:
             return
+        if (
+            self.failed_target is not None
+            and np.linalg.norm(center - self.failed_target) <= self.maximum_spread
+        ):
+            self.get_logger().warning(
+                "직전 실패 사과와 같은 위치이므로 자동 재시도하지 않습니다. "
+                "재시도하려면 coordinator를 다시 시작하세요."
+            )
+            self.samples.clear()
+            return
         self.target = PoseStamped()
         self.target.header = message.header
         self.target.pose.position.x, self.target.pose.position.y, self.target.pose.position.z = center
         self.target.pose.orientation.w = 1.0
+        self.failed_target = None
+        self.samples.clear()
         self.running, self.index = True, 0
         self.send_next()
 
     def send_next(self):
         if self.index >= len(SEQUENCE):
             self.get_logger().info("수확 Action 시퀀스 완료")
+            self.running = False
+            self.target = None
+            self.samples.clear()
             return
         if not self.client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error("/harvest/robot_motion 서버를 찾을 수 없습니다.")
@@ -82,7 +98,14 @@ class HarvestCoordinator(Node):
         result = future.result().result
         if not result.success:
             self.get_logger().error(f"{result.error_code}: {result.message}")
+            if self.target is not None:
+                position = self.target.pose.position
+                self.failed_target = np.array(
+                    [position.x, position.y, position.z], dtype=float
+                )
             self.running = False
+            self.target = None
+            self.samples.clear()
             return
         self.index += 1
         self.send_next()
