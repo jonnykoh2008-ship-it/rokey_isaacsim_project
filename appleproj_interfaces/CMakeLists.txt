@@ -11,6 +11,7 @@ find_package(std_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CheckpointEvent.msg"
   "msg/InspectionImage.msg"
+  "msg/MotionStatus.msg"
   "msg/ObstacleProxy.msg"
   "msg/PlanningScene.msg"
   "msg/QualityResult.msg"

@@ -20,6 +20,7 @@
 | Topic | `/planning_scene` | `appleproj_interfaces/msg/PlanningScene` | GPU PC 1 | 개인 PC 1 |
 | Service | `/planning_scene/get_snapshot` | `appleproj_interfaces/srv/GetPlanningScene` | GPU PC 1 | 개인 PC 1 |
 | Action | `/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | 개인 PC 1 |
+| Topic | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | 개인 PC 1 | GPU PC 1 |
 | Topic | `/quality/inspection_images` | `appleproj_interfaces/msg/InspectionImage` | GPU PC 1 | GPU PC 2 |
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
 | Service | `/quality/retry_inspection` | `appleproj_interfaces/srv/RetryInspection` | GPU PC 1 | 개인 PC 2 |
@@ -179,7 +180,7 @@ GPU PC 1의 Isaac Sim 컨베이어 I/O 상태를 개인 PC 2로 전달한다.
 
 Goal:
 
-- `motion_type`: `APPROACH`, `GRASP`, `TWIST`, `PULL`, `TRANSPORT`, `PLACE`, `RETRACT`
+- `motion_type`: `APPROACH`, `GRASP`, `TWIST`, `PULL`, `TRANSPORT`, `PLACE`, `RETRACT`, `RELEASE`
 - `target_pose`: 동작 목표 pose
 - `reset_id`, `scene_version`: 계획에 사용한 planning scene 세대
 - `waypoints`: 개인 PC 1이 계획한 world 기준 TCP waypoint 배열. MVP에서는
@@ -194,12 +195,76 @@ Result:
 Feedback:
 
 - `current_state`
-- `progress`
+- `progress`: `0.0`에서 `1.0` 범위의 단계 진행률
 
 각 모션 단계는 별도 Goal로 요청한다. 단계 순서와 실패 복구는 개인 PC 1의 수확 상태 머신이 관리한다.
 GPU PC 1은 scene 세대가 현재 값과 다르거나 `APPROACH.waypoints`가 비어 있으면
 Goal을 거부한다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`, 실제
 로봇-나무 접촉이 발생하면 `UNEXPECTED_CONTACT`로 중단한다.
+
+### 모션 의미
+
+- `GRASP`: Goal을 보내는 시점의 현재 pose를 `target_pose`에 채우고, 해당 pose를 유지하며 그리퍼만 폐합한다.
+- `PULL`: 당김 동작과 stem joint 분리 확인을 포함한다. stem이 분리되지 않으면 성공으로 판정하지 않는다.
+- `PLACE`: 목표 pose까지 이동만 수행하고 그리퍼를 개방하지 않는다.
+- `RELEASE`: Goal을 보내는 시점의 현재 pose를 `target_pose`에 채우고, 해당 pose를 유지하며 그리퍼만 개방한다.
+
+### 실행 규칙
+
+- 각 단계의 기본 timeout은 `/clock` 기준 simulation time 3초다.
+- Action을 실행하는 동안에는 새 Goal을 거부하고 cancel만 허용한다.
+- cancel, timeout, 충돌 또는 모션 실패가 발생하면 GPU PC 1의 Action Server는 로봇 동작을 즉시 멈추고 실패 Result를 반환한다.
+- 실패 후 자동 후퇴는 수행하지 않는다.
+- 성공 Result의 `error_code`는 빈 문자열이다.
+
+### MotionStatus
+
+개인 PC 1이 RobotMotion Goal을 보내기 전 발생한 계획·검증 결과를 GPU PC 1에 전달한다.
+
+```text
+토픽: /harvest/motion_status
+타입: appleproj_interfaces/msg/MotionStatus
+송신: 개인 PC 1
+수신: GPU PC 1
+```
+
+필드:
+
+- `header`: `/clock` 기준 상태 발생 시각
+- `current_state`: 수확 상태 머신의 현재 상태
+- `success`: 상태 또는 계획 성공 여부
+- `progress`: `0.0`에서 `1.0` 범위
+- `error_code`: 기존 300번대 오류 코드 문자열. 성공 시 빈 문자열
+- `message`: 사람이 읽을 수 있는 상세 설명
+
+개인 PC 1은 Goal 전 `IK_FAILED`, `APPROACH_UNREACHABLE`, `COLLISION_RISK`,
+`SINGULARITY_RISK`, `INVALID_TARGET_POSE`, `TF_UNAVAILABLE`,
+`JOINT_STATE_UNAVAILABLE` 등의 실패가 발생하면 `success=false`와 기존 오류 코드를
+발행한다. GPU PC 1은 이 메시지를 수신하면 해당 수확 실행을 실패 상태로 기록하고,
+새 RobotMotion Goal을 받기 전에 원인을 확인한다.
+
+이 토픽은 상태·결과 전달용으로 Reliable QoS를 사용하며, 기본 history depth는 10으로
+한다. 상태 메시지의 timestamp는 simulation time을 사용한다.
+
+### 오류 코드
+
+| 코드 | `error_code` |
+|---:|---|
+| 300 | `IK_FAILED` |
+| 301 | `APPROACH_UNREACHABLE` |
+| 302 | `COLLISION_RISK` |
+| 303 | `SINGULARITY_RISK` |
+| 304 | `MOTION_TIMEOUT` |
+| 305 | `STEM_NOT_BROKEN` |
+| 306 | `GOAL_REJECTED` |
+| 307 | `CANCELLED` |
+| 308 | `SIMULATION_RESET` |
+| 309 | `INVALID_TARGET_POSE` |
+| 310 | `TF_UNAVAILABLE` |
+| 311 | `JOINT_STATE_UNAVAILABLE` |
+| 312 | `INTERNAL_ERROR` |
+
+`error_code`는 `"300:IK_FAILED"`처럼 숫자 코드와 심볼을 함께 포함하는 문자열로 전송한다.
 
 ## RetryInspection
 
