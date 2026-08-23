@@ -1,4 +1,4 @@
-"""base_rsd455 RGB-D 영상에서 빨간 사과 한 개의 3D 중심을 검출한다.
+"""base_rsd455 RGB-D 전체 영상에서 가장 가까운 빨간 사과를 검출한다.
 
 이 파일은 Isaac Sim Python이 아니라 ROS 2 Jazzy가 설치된 시스템 환경에서
 실행한다. 현재 단계의 HSV 검출은 RGB-D와 TF 파이프라인 검증용이며, 여러
@@ -77,6 +77,7 @@ class BaseAppleDetector(Node):
         self.declare_parameter("minimum_depth_m", 0.2)
         self.declare_parameter("maximum_depth_m", 10.0)
         self.declare_parameter("maximum_sync_error_sec", 0.08)
+        self.declare_parameter("apple_radius_m", 0.04)
         self.declare_parameter("target_frame", "world")
         self.declare_parameter("show_debug_window", True)
 
@@ -92,6 +93,12 @@ class BaseAppleDetector(Node):
         self.maximum_sync_error_ns = int(
             float(self.get_parameter("maximum_sync_error_sec").value) * 1e9
         )
+        self.apple_radius_m = float(self.get_parameter("apple_radius_m").value)
+        if not math.isfinite(self.apple_radius_m) or self.apple_radius_m < 0.0:
+            raise ValueError(
+                f"apple_radius_m은 0 이상의 유한값이어야 합니다: "
+                f"{self.apple_radius_m}"
+            )
         self.target_frame = str(self.get_parameter("target_frame").value)
         self.show_debug_window = bool(
             self.get_parameter("show_debug_window").value
@@ -181,8 +188,8 @@ class BaseAppleDetector(Node):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    def find_apple_contour(self, bgr_image):
-        """최소 면적을 만족하는 가장 큰 빨간 영역을 사과 후보로 선택한다."""
+    def find_apple_contours(self, bgr_image):
+        """전체 화각에서 최소 면적을 만족하는 모든 빨간 사과 후보를 찾는다."""
         mask = self.red_mask(bgr_image)
         contours, _hierarchy = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -192,9 +199,7 @@ class BaseAppleDetector(Node):
             for contour in contours
             if cv2.contourArea(contour) >= self.minimum_contour_area
         ]
-        if not candidates:
-            return None, mask
-        return max(candidates, key=cv2.contourArea), mask
+        return candidates, mask
 
     def depth_in_meters(self, depth_message: Image):
         """Isaac/ROS depth encoding을 meter 단위 float 배열로 통일한다."""
@@ -251,6 +256,15 @@ class BaseAppleDetector(Node):
             ],
             dtype=float,
         )
+
+    @staticmethod
+    def surface_point_to_center(surface_point, apple_radius_m):
+        """카메라에 보이는 사과 표면점을 구의 중심점으로 보정한다."""
+        surface_point = np.asarray(surface_point, dtype=float)
+        ray_length = float(np.linalg.norm(surface_point))
+        if ray_length <= 1e-9 or not np.isfinite(ray_length):
+            raise ValueError(f"사과 표면점이 유효하지 않습니다: {surface_point}")
+        return surface_point + surface_point / ray_length * apple_radius_m
 
     def make_camera_pose(self, rgb_message, point_camera):
         pose = PoseStamped()
@@ -333,9 +347,9 @@ class BaseAppleDetector(Node):
                 f"{depth_m.shape[:2]}"
             )
 
-        contour, _red_mask = self.find_apple_contour(bgr)
+        contours, _red_mask = self.find_apple_contours(bgr)
         annotated = bgr.copy()
-        if contour is None:
+        if not contours:
             cv2.putText(
                 annotated,
                 "APPLE NOT FOUND",
@@ -349,13 +363,31 @@ class BaseAppleDetector(Node):
             self.show_debug(annotated)
             return
 
-        center = self.contour_center(contour)
-        depth_value = self.robust_depth(contour, depth_m)
-        if center is None or depth_value is None:
-            cv2.drawContours(annotated, [contour], -1, (0, 165, 255), 2)
+        valid_candidates = []
+        for contour in contours:
+            center = self.contour_center(contour)
+            depth_value = self.robust_depth(contour, depth_m)
+            if center is None or depth_value is None:
+                cv2.drawContours(annotated, [contour], -1, (0, 165, 255), 2)
+                continue
+
+            u, v = center
+            surface_point = self.deproject(u, v, depth_value, camera_info)
+            center_point = self.surface_point_to_center(
+                surface_point,
+                self.apple_radius_m,
+            )
+            distance = float(np.linalg.norm(center_point))
+            if not math.isfinite(distance):
+                continue
+            valid_candidates.append(
+                (contour, center, surface_point, center_point, distance)
+            )
+
+        if not valid_candidates:
             cv2.putText(
                 annotated,
-                "INVALID DEPTH",
+                "NO APPLE WITH VALID DEPTH",
                 (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.0,
@@ -366,8 +398,13 @@ class BaseAppleDetector(Node):
             self.show_debug(annotated)
             return
 
+        # 전체 유효 후보 중 카메라 광학 중심과의 3D 직선거리가 가장 짧은
+        # 사과를 이번 수확 목표로 선택한다.
+        selected = min(valid_candidates, key=lambda candidate: candidate[4])
+        contour, center, surface_point_camera, point_camera, selected_distance = (
+            selected
+        )
         u, v = center
-        point_camera = self.deproject(u, v, depth_value, camera_info)
         camera_pose = self.make_camera_pose(rgb_message, point_camera)
         self.camera_pose_publisher.publish(camera_pose)
 
@@ -375,11 +412,33 @@ class BaseAppleDetector(Node):
         if world_pose is not None:
             self.target_pose_publisher.publish(world_pose)
 
+        for candidate_contour, candidate_center, _surface, _point, distance in (
+            valid_candidates
+        ):
+            cv2.drawContours(
+                annotated, [candidate_contour], -1, (0, 255, 255), 2
+            )
+            label_position = (
+                max(0, round(candidate_center[0]) - 35),
+                max(15, round(candidate_center[1]) - 10),
+            )
+            cv2.putText(
+                annotated,
+                f"{distance:.2f}m",
+                label_position,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 255, 255),
+                1,
+            )
+
+        # 선택 후보는 마지막에 다시 그려 다른 후보와 명확히 구분한다.
         cv2.drawContours(annotated, [contour], -1, (0, 255, 0), 2)
         cv2.circle(annotated, (round(u), round(v)), 5, (255, 0, 0), -1)
         text = (
-            f"camera x={point_camera[0]:.3f} y={point_camera[1]:.3f} "
-            f"z={point_camera[2]:.3f} m"
+            f"SELECTED 1/{len(valid_candidates)} distance={selected_distance:.3f}m "
+            f"xyz=({point_camera[0]:.3f}, {point_camera[1]:.3f}, "
+            f"{point_camera[2]:.3f})"
         )
         cv2.putText(
             annotated,
@@ -398,7 +457,12 @@ class BaseAppleDetector(Node):
             self.last_detection_log_ns < 0
             or now_ns - self.last_detection_log_ns >= 1_000_000_000
         ):
-            message = f"사과 camera xyz = {point_camera.round(4).tolist()} m"
+            message = (
+                f"사과 후보 {len(valid_candidates)}개, 최근접 거리 "
+                f"{selected_distance:.4f} m, surface camera xyz = "
+                f"{surface_point_camera.round(4).tolist()} m, "
+                f"center camera xyz = {point_camera.round(4).tolist()} m"
+            )
             if world_pose is not None:
                 position = world_pose.pose.position
                 message += (
