@@ -87,6 +87,9 @@ STOP_STATE = {
     RobotMotion.Goal.RETRACT: "DONE",
 }
 ACTION_TIMEOUT_S = 3.0
+# ENTER 전에 손가락 collider가 사과 쪽으로 남아 있지 않도록 실제 관절값을
+# 확인한다. 이 값은 Isaac Sim 그리퍼 Drive 정착 시험 후 조정할 초기값이다.
+GRIPPER_OPEN_TOLERANCE_RAD = 0.02
 ERROR_CODES = {
     "IK_FAILED": "300:IK_FAILED",
     "APPROACH_UNREACHABLE": "301:APPROACH_UNREACHABLE",
@@ -606,6 +609,109 @@ class MotionEngine:
             )
         return positions
 
+    def _require_gripper_joint_positions(self):
+        """ENTER 안전 검사에 사용할 실제 그리퍼 관절값을 반환한다."""
+        positions = self.robot.get_joint_positions(
+            joint_indices=harvest.np.asarray(
+                self.gripper_indices, dtype=harvest.np.int32
+            )
+        )
+        if positions is None:
+            raise MotionExecutionError(
+                "311:JOINT_STATE_UNAVAILABLE",
+                "그리퍼 관절 위치를 읽지 못했습니다.",
+            )
+        positions = harvest.np.asarray(positions, dtype=float)
+        expected_shape = (len(harvest.GRIPPER_JOINTS),)
+        if positions.shape != expected_shape:
+            raise MotionExecutionError(
+                "311:JOINT_STATE_UNAVAILABLE",
+                f"그리퍼 관절 배열 크기가 잘못되었습니다: "
+                f"{positions.shape}, expected={expected_shape}",
+            )
+        if not harvest.np.all(harvest.np.isfinite(positions)):
+            raise MotionExecutionError(
+                "311:JOINT_STATE_UNAVAILABLE",
+                "그리퍼 관절 위치에 NaN 또는 Inf가 있습니다.",
+            )
+        return positions
+
+    def _wait_for_gripper_open_before_enter(self, handle):
+        """pre-grasp에서 팔을 고정하고 실제 그리퍼 개방을 확인한다."""
+        hold_arm_positions = self._require_arm_joint_positions().copy()
+        self.action_last_progress_time = float(self.world.current_time)
+        self.progress_tcp_position, self.progress_tcp_rotation = (
+            value.copy() for value in self._current_tcp_pose()
+        )
+        initial_error = None
+        frame = 0
+        while True:
+            self._check_execution_guard()
+            pause_reported = False
+            while not self.world.is_playing():
+                self._check_execution_guard()
+                if not pause_reported:
+                    self._publish_pause()
+                    pause_reported = True
+                harvest.simulation_app.update()
+            if pause_reported:
+                self._publish_resume()
+
+            actual = self._require_gripper_joint_positions()
+            max_error = float(
+                harvest.np.max(harvest.np.abs(actual - harvest.GRIPPER_OPEN))
+            )
+            if initial_error is None:
+                initial_error = max(max_error, GRIPPER_OPEN_TOLERANCE_RAD)
+                print(
+                    f"   [OPEN CHECK] ENTER 전 그리퍼 개방 대기: "
+                    f"max error {max_error:.4f} rad"
+                )
+            if self.tree_contact.detected:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    "ENTER 전 그리퍼 개방 중 실제 로봇 collider가 나무 collider에 "
+                    f"접촉했습니다: robot={self.tree_contact.robot_path}, "
+                    f"tree={self.tree_contact.tree_path}",
+                )
+            if self.joint_break.broken:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    "ENTER 전 그리퍼 개방 중 사과 FixedJoint가 조기 파손됐습니다.",
+                )
+            if max_error <= GRIPPER_OPEN_TOLERANCE_RAD:
+                print(
+                    f"   [OPEN READY] ENTER 허용: max error "
+                    f"{max_error:.4f} rad"
+                )
+                self.feedback(handle, "GRIPPER_OPEN_READY", 0.4)
+                break
+
+            self.robot.apply_action(
+                harvest.ArticulationAction(
+                    joint_positions=hold_arm_positions,
+                    joint_indices=self.arm_indices,
+                )
+            )
+            harvest.apply_gripper_target(self.robot, self.gripper_indices, 0.0)
+            progress = 0.1 + 0.3 * (
+                1.0 - min(1.0, max_error / initial_error)
+            )
+            self.feedback(handle, "GRIPPER_OPENING", progress)
+            self.world.step(render=not harvest.args.headless)
+            frame += 1
+            if frame == 1 or frame % 60 == 0:
+                print(
+                    f"   [OPENING] frame {frame}, max error "
+                    f"{max_error:.4f} rad"
+                )
+
+        # 개방 대기 시간이 다음 ENTER 단계의 무진전 시간에 합산되지 않게 한다.
+        self.action_last_progress_time = float(self.world.current_time)
+        self.progress_tcp_position, self.progress_tcp_rotation = (
+            value.copy() for value in self._current_tcp_pose()
+        )
+
     def _current_tcp_pose(self):
         """USD palm + local +Y 0.093 m로 물리 TCP pose를 한 번만 계산한다."""
         try:
@@ -871,6 +977,7 @@ class MotionEngine:
             raise harvest.ApproachUnreachableError(
                 "pregrasp 이동을 완료하지 못했습니다."
             )
+        self._wait_for_gripper_open_before_enter(handle)
         tcp, palm_rotation = self._current_tcp_pose()
         self.fsm = harvest.AppleHarvestFSM(
             tcp, palm_rotation, center, rotation, direction, *self.conveyor,
