@@ -1,7 +1,0 @@
-string inspection_id
-string apple_id
-string reason
----
-bool accepted
-string new_inspection_id
-string message

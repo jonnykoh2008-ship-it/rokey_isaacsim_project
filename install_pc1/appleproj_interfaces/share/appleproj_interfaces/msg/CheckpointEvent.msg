@@ -1,1 +1,0 @@
-/home/jonny/rokey_proj/rokey_isaacsim_project/appleproj_interfaces/msg/CheckpointEvent.msg

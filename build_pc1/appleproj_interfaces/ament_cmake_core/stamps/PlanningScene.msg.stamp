@@ -1,6 +1,0 @@
-std_msgs/Header header
-uint64 reset_id
-uint64 scene_version
-geometry_msgs/PoseStamped robot_base_pose
-geometry_msgs/PoseStamped robot_tcp_pose
-appleproj_interfaces/ObstacleProxy[] obstacles

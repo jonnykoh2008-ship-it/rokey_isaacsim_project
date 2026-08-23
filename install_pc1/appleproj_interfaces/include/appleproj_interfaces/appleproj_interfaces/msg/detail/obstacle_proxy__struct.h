@@ -1,1 +1,0 @@
-/home/jonny/rokey_proj/rokey_isaacsim_project/build_pc1/appleproj_interfaces/rosidl_generator_c/appleproj_interfaces/msg/detail/obstacle_proxy__struct.h
