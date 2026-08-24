@@ -9,6 +9,8 @@ __pycache__/
 # Distribution / packaging
 .Python
 build/
+/appleproj_interfaces/install/
+/appleproj_interfaces/log/
 develop-eggs/
 dist/
 downloads/
@@ -224,3 +226,8 @@ trial_and_error/
 /build/
 /install/
 /log/
+
+# 개인 PC 1
+/build_pc1/
+/install_pc1/
+/log_pc1/

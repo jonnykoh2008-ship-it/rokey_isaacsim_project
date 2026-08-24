@@ -239,7 +239,9 @@ Goal을 거부한다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`
 
 ### 실행 규칙
 
-- 각 단계의 기본 timeout은 `/clock` 기준 simulation time 3초다.
+- 각 단계에서 유의미한 TCP 위치 또는 자세 진전이 `/clock`
+  기준 simulation time 3초 동안 없으면 timeout으로 판정한다.
+  Timeline Pause 중에는 이 watchdog도 정지한다.
 - Action을 실행하는 동안에는 새 Goal을 거부하고 cancel만 허용한다.
 - cancel, timeout, 충돌 또는 모션 실패가 발생하면 GPU PC 1의 Action Server는 로봇 동작을 즉시 멈추고 실패 Result를 반환한다.
 - 실패 후 자동 후퇴는 수행하지 않는다.
@@ -268,8 +270,10 @@ Goal을 거부한다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`
 개인 PC 1은 Goal 전 `IK_FAILED`, `APPROACH_UNREACHABLE`, `COLLISION_RISK`,
 `SINGULARITY_RISK`, `INVALID_TARGET_POSE`, `TF_UNAVAILABLE`,
 `JOINT_STATE_UNAVAILABLE` 등의 실패가 발생하면 `success=false`와 기존 오류 코드를
-발행한다. GPU PC 1은 이 메시지를 수신하면 해당 수확 실행을 실패 상태로 기록하고,
-새 RobotMotion Goal을 받기 전에 원인을 확인한다.
+발행한다. GPU PC 1은 이 메시지를 수신하면 해당 수확 실행을 실패 상태로
+기록·로그한다. `MotionStatus` 실패 기록은 RobotMotion Goal admission을
+차단하지 않으며, Goal 허용은 현재 `SimulationState`, `reset_id`,
+`scene_version`, busy 상태로 판정한다.
 
 이 토픽은 상태·결과 전달용으로 Reliable QoS를 사용하며, 기본 history depth는 10으로
 한다. 상태 메시지의 timestamp는 simulation time을 사용한다.

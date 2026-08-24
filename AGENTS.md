@@ -16,6 +16,40 @@
 - Preserve the distinction between feature specifications (`docs/features`) and delivery phases (`docs/phases`). Phase documents reference feature documents rather than duplicating them.
 - Unresolved requirements must be written as `TBD`; do not invent final values without user approval.
 
+## PC ownership and edit boundaries
+
+This repository is developed by four PCs. Source ownership follows the PC that
+executes and maintains the function, not the PC that happens to discover a bug.
+
+| Owner | Responsibilities | Current owned source examples |
+|---|---|---|
+| GPU PC 1 | Isaac Sim, physics, sensors, apple detection, planning-scene publication, robot Action execution, and runtime safety monitoring | `apple_pick.py`, `vision_apple_pick.py`, `base_apple_detector.py`, `base_camera_publish.py`, Isaac Sim robot/gripper assets and runtime configuration |
+| GPU PC 2 | Quality-image inference and apple-level quality-result integration | Quality inference and result-integration source; current path is `TBD` |
+| Personal PC 1 | Harvest coordination, planning-proxy-based global waypoint planning, and Goal sequencing | `harvest_coordinator.py`, `harvest_route_planner.py`, and their tests |
+| Personal PC 2 | Monitoring, result display, retry requests, and phase-2 pusher selection | Monitoring and pusher-selection source; current path is `TBD` |
+
+Shared contracts and documentation include `appleproj_interfaces/`, `docs/`,
+`README.md`, `AGENTS.md`, and cross-PC build or network configuration. They are
+not owned exclusively by one PC. Modify a shared file only after the user
+explicitly approves that exact file and scope, and report every affected PC.
+
+The active implementation scope for this working environment is Personal PC 1.
+
+- Modify only Personal PC 1-owned source and tests after the normal approval gate.
+- For GPU PC 1, GPU PC 2, or Personal PC 2-owned source, perform read-only
+  inspection and provide a concrete change proposal or handoff instructions;
+  do not edit the file.
+- A request to fix system behavior does not by itself transfer ownership of the
+  executing PC's source. If the fix belongs to another PC, identify that owner
+  and propose the required file, function, behavior, and verification steps.
+- Before every source edit, state which PC executes the code and confirm that
+  the file is Personal PC 1-owned. If ownership is missing or ambiguous, stop
+  and ask the user instead of editing.
+- Do not make opportunistic edits to another PC's source while changing shared
+  interfaces or Personal PC 1 code.
+- Changing this ownership boundary requires an explicit user request to revise
+  the ownership rule itself.
+
 ## Required documentation routing
 
 Before planning or implementing a task, read the documents mapped to its scope.
