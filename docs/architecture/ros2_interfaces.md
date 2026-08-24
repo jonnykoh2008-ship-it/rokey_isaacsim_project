@@ -10,17 +10,26 @@
 - `apple_id`와 `inspection_id`는 한 처리 주기 동안 변경하지 않는다.
 - 센서 스트림에는 Sensor Data QoS를 기본 후보로 사용한다.
 - 상태·결과 메시지는 신뢰성 우선 QoS를 사용한다. 정확한 QoS는 TBD다.
+- v2.0에서 영상의 송신·센서 권위자는 GPU PC 1이고, 영상 수신·사과 3D 좌표
+  계산·target 발행 주체는 개인 PC 1이다.
+- v2.0에서 경로 계획·궤적 생성·로봇 실행의 권위자는 GPU PC 1이다. 개인 PC 1은
+  최종 waypoint를 발행하지 않는다.
 
 ## 인터페이스 목록
 
 | 종류 | 이름 | 타입 | 송신/서버 | 수신/클라이언트 |
 |---|---|---|---|---|
-| Topic | `/harvest/target_pose` | `geometry_msgs/msg/PoseStamped` | GPU PC 1 | 개인 PC 1 |
+| Topic | `/base_camera/color/image_raw` | `sensor_msgs/msg/Image` (raw) | GPU PC 1 | 개인 PC 1 |
+| Topic | `/base_camera/depth/image_raw` | `sensor_msgs/msg/Image` (raw) | GPU PC 1 | 개인 PC 1 |
+| Topic | `/base_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | GPU PC 1 | 개인 PC 1 |
+| Topic | `/harvest/target` | custom target 메시지 (`TBD`) | 개인 PC 1 | GPU PC 1 |
 | Topic | `/simulation/state` | `appleproj_interfaces/msg/SimulationState` | GPU PC 1 | 개인 PC 1 |
 | Topic | `/planning_scene` | `appleproj_interfaces/msg/PlanningScene` | GPU PC 1 | 개인 PC 1 |
-| Service | `/planning_scene/get_snapshot` | `appleproj_interfaces/srv/GetPlanningScene` | GPU PC 1 | 개인 PC 1 |
-| Action | `/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | 개인 PC 1 |
-| Topic | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | 개인 PC 1 | GPU PC 1 |
+| Service | `/planning_scene/get_snapshot` | `appleproj_interfaces/srv/GetPlanningScene` | GPU PC 1 | 개인 PC 1 (debug/RViz) |
+| Action | `/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | GPU PC 1 내부 supervisor |
+| Topic | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | GPU PC 1 | 개인 PC 1·개인 PC 2 |
+| Topic | `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` (`TBD`) | GPU PC 1 | 개인 PC 1 RViz |
+| Topic | `/harvest/planned_path` | `nav_msgs/msg/Path` (`TBD`) | GPU PC 1 | 개인 PC 1 RViz |
 | Topic | `/quality/inspection_images` | `appleproj_interfaces/msg/InspectionImage` | GPU PC 1 | GPU PC 2 |
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
 | Service | `/quality/retry_inspection` | `appleproj_interfaces/srv/RetryInspection` | GPU PC 1 | 개인 PC 2 |
@@ -40,13 +49,26 @@ Action과 Service 표에서 서버는 요청을 실행하는 쪽이고 클라이
 ## 사과 목표
 
 ```text
-토픽: /harvest/target_pose
-타입: geometry_msgs/msg/PoseStamped
+토픽: /harvest/target
+타입: custom target 메시지 (`TBD`)
 frame_id: world
-의미: 사과 중심과 접근 orientation
+의미: 개인 PC 1이 RGB-D로 계산한 사과 중심과 검증 메타데이터
 ```
 
-MVP에서는 Isaac Sim ground-truth pose를 사용한다. 다중 사과 단계의 ID 포함 메시지 구조는 TBD다.
+필요 필드 후보:
+
+- `header`: 영상 촬영 시각, `frame_id=world`
+- `position`: 사과 중심
+- `target_id` 또는 `apple_id`
+- `reset_id`
+- `confidence`
+- depth 유효성·TF 시간 오차·검출 상태
+
+최종 메시지 이름, 필드, QoS 및 기존 `/harvest/target_pose` 호환 여부는 `TBD`다.
+개인 PC 1은 orientation을 결정하지 않는다. GPU PC 1은 target을 수신할 때 현재
+`reset_id`, timestamp, frame, position 및 confidence를 다시 검증한 뒤, 현재
+로봇 상태와 planning scene에 맞는 접근 orientation과 pre-grasp pose를 결정한다.
+세대가 맞지 않는 target은 계획에 사용하지 않는다.
 
 ## SimulationState
 
@@ -67,9 +89,11 @@ QoS: Reliable, Transient Local, Keep Last 1
 - `scene_version`: 새 obstacle snapshot마다 증가
 - `message`: 상태 전환 원인
 
-개인 PC 1은 `READY` 또는 `PLAYING`에서만 새 계획을 시작한다. `STOPPED` 또는
-`INITIALIZING`을 받으면 실행 Goal을 취소하고 이전 계획을 폐기한다. `PAUSED`는
-새 계획과 Goal 전송을 금지하되 현재 실행 문맥은 재개 가능하도록 유지한다.
+GPU PC 1은 `READY` 또는 `PLAYING`에서만 target을 계획·실행한다. `STOPPED` 또는
+`INITIALIZING`을 받으면 실행 Goal, RRT tree 및 trajectory를 폐기하고 개인 PC 1에
+새 target 발행을 중지하도록 알린다. `PAUSED`는 새 계획과 Goal 전송을 금지하되
+현재 실행 문맥은 재개 가능하도록 유지한다. 개인 PC 1은 `READY/PLAYING`이 아니면
+영상 검출을 계속할 수 있지만 target을 발행하지 않는다.
 
 ## PlanningScene 및 ObstacleProxy
 
@@ -98,12 +122,15 @@ QoS: Reliable, Transient Local, Keep Last 1
 - `safety_margin`: 형상 크기와 별도로 적용할 최소 안전거리
 
 MVP snapshot은 몸통 box와 가지 sphere만 사용한다. 잎은 포함하지 않는다.
-snapshot에는 안전거리가 적용되기 전 형상 크기를 넣고 개인 PC 1이
-`safety_margin`을 더한다. GPU PC 1도 같은 안전거리를 독립적으로 적용한다.
+snapshot에는 안전거리가 적용되기 전 형상 크기와 `safety_margin`을 넣는다. GPU
+PC 1의 RRT와 RMPflow가 동일한 safety margin을 적용한다. 개인 PC 1은 이를
+시각화할 뿐 실행용 obstacle을 재구성하지 않는다.
 
-개인 PC 1이 snapshot을 받지 못했거나 version 누락을 감지하면
-`/planning_scene/get_snapshot`을 호출한다. 성공 응답에는 최신 전체
-`PlanningScene` 한 개가 포함된다.
+개인 PC 1은 snapshot을 RViz 표시 또는 디버그 검증에 사용할 수 있다. snapshot을
+받지 못했거나 version 누락을 감지하면 `/planning_scene/get_snapshot`을 호출할 수
+있다. 성공 응답에는 최신 전체 `PlanningScene` 한 개가 포함된다. 경로 계획과
+안전거리 적용의 최종 권위자는 GPU PC 1이며, 개인 PC 1의 snapshot 처리는 실행
+admission에 영향을 주지 않는다.
 
 ## InspectionImage
 
@@ -171,7 +198,9 @@ GPU PC 1의 Isaac Sim 컨베이어 I/O 상태를 개인 PC 2로 전달한다.
 
 ## RobotMotion
 
-개인 PC 1이 단계별 로봇 동작 Goal을 GPU PC 1에 요청한다.
+GPU PC 1의 수확 supervisor가 planner와 executor를 연결하는 내부 Action으로
+사용한다. v2.0에서 개인 PC 1은 RobotMotion Goal을 보내지 않고 `/harvest/target`
+만 발행한다.
 
 ```text
 액션: /harvest/robot_motion
@@ -182,9 +211,11 @@ Goal:
 
 - `motion_type`: `APPROACH`, `GRASP`, `TWIST`, `PULL`, `TRANSPORT`, `PLACE`, `RETRACT`, `RELEASE`
 - `target_pose`: 동작 목표 pose
-- `reset_id`, `scene_version`: 계획에 사용한 planning scene 세대
-- `waypoints`: 개인 PC 1이 계획한 world 기준 TCP waypoint 배열. MVP에서는
-  `APPROACH`에 필수이며 다른 단계에서는 빈 배열이다.
+- `reset_id`, `scene_version`: GPU PC 1이 계획에 사용한 planning scene 세대
+- `waypoints`: GPU PC 1의 Lula RRT/trajectory 단계가 생성한 내부 world 기준
+  TCP waypoint 배열. 외부 PC가 주입하지 않는다.
+- planner seed 및 재계획 정책은 구현 파라미터로 두고 정식 인터페이스에는
+  노출하지 않는 것을 기본으로 한다 (`TBD`).
 
 Result:
 
@@ -197,10 +228,11 @@ Feedback:
 - `current_state`
 - `progress`: `0.0`에서 `1.0` 범위의 단계 진행률
 
-각 모션 단계는 별도 Goal로 요청한다. 단계 순서와 실패 복구는 개인 PC 1의 수확 상태 머신이 관리한다.
-GPU PC 1은 scene 세대가 현재 값과 다르거나 `APPROACH.waypoints`가 비어 있으면
-Goal을 거부한다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`, 실제
-로봇-나무 접촉이 발생하면 `UNEXPECTED_CONTACT`로 중단한다.
+각 모션 단계는 별도 Goal로 실행할 수 있다. 단계 순서, RRT 재계획 및 실패
+복구는 GPU PC 1의 수확 supervisor가 관리한다. GPU PC 1은 target과 scene 세대가
+현재 값과 다르거나 내부 RRT/trajectory 검증이 끝나지 않으면 Goal을 실행하지
+않는다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`, 실제 로봇-나무
+접촉이 발생하면 `UNEXPECTED_CONTACT`로 중단한다.
 
 ### 모션 의미
 
@@ -221,13 +253,15 @@ Goal을 거부한다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`
 
 ### MotionStatus
 
-개인 PC 1이 RobotMotion Goal을 보내기 전 발생한 계획·검증 결과를 GPU PC 1에 전달한다.
+GPU PC 1이 target 수신, RRT 계획, trajectory 변환, RMPflow 실행 및 PhysX 안전
+감시 결과를 개인 PC 1과 개인 PC 2에 전달한다. 개인 PC 1의 인식 실패는 별도의
+target 상태 계약(`TBD`)으로 전달한다.
 
 ```text
 토픽: /harvest/motion_status
 타입: appleproj_interfaces/msg/MotionStatus
-송신: 개인 PC 1
-수신: GPU PC 1
+송신: GPU PC 1
+수신: 개인 PC 1·개인 PC 2
 ```
 
 필드:
@@ -239,13 +273,12 @@ Goal을 거부한다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`
 - `error_code`: 기존 300번대 오류 코드 문자열. 성공 시 빈 문자열
 - `message`: 사람이 읽을 수 있는 상세 설명
 
-개인 PC 1은 Goal 전 `IK_FAILED`, `APPROACH_UNREACHABLE`, `COLLISION_RISK`,
+GPU PC 1은 `IK_FAILED`, `APPROACH_UNREACHABLE`, `COLLISION_RISK`,
 `SINGULARITY_RISK`, `INVALID_TARGET_POSE`, `TF_UNAVAILABLE`,
-`JOINT_STATE_UNAVAILABLE` 등의 실패가 발생하면 `success=false`와 기존 오류 코드를
-발행한다. GPU PC 1은 이 메시지를 수신하면 해당 수확 실행을 실패 상태로
-기록·로그한다. `MotionStatus` 실패 기록은 RobotMotion Goal admission을
-차단하지 않으며, Goal 허용은 현재 `SimulationState`, `reset_id`,
-`scene_version`, busy 상태로 판정한다.
+`JOINT_STATE_UNAVAILABLE`, `SCENE_MISMATCH`, `UNEXPECTED_CONTACT` 등의 실패가
+발생하면 `success=false`와 기존 오류 코드를 발행한다. 개인 PC 1은 이 메시지를
+RViz 또는 모니터링에 사용한다. Goal admission은 현재 `SimulationState`, target의
+`reset_id`, `scene_version`, timestamp, busy 상태 및 내부 계획 검증으로 판정한다.
 
 이 토픽은 상태·결과 전달용으로 Reliable QoS를 사용하며, 기본 history depth는 10으로
 한다. 상태 메시지의 timestamp는 simulation time을 사용한다.
@@ -269,6 +302,24 @@ Goal을 거부한다. Goal 승인 후 scene 세대가 바뀌면 `SCENE_MISMATCH`
 | 312 | `INTERNAL_ERROR` |
 
 `error_code`는 `"300:IK_FAILED"`처럼 숫자 코드와 심볼을 함께 포함하는 문자열로 전송한다.
+v2.0의 RRT 실패, trajectory 변환 실패, stale target, scene mismatch 및
+unexpected contact의 숫자 코드 배정은 기존 300번대 체계와 조정 후 `TBD`로 확정한다.
+
+## Motion planning 시각화
+
+GPU PC 1은 실행과 독립된 시각화 publisher를 제공한다. 후보 인터페이스는 다음과
+같으며 최종 토픽 이름과 QoS는 `TBD`다.
+
+| 토픽 | 타입 | 의미 |
+|---|---|---|
+| `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` | target, pre-grasp, obstacle, clearance, RRT node/path, 실패 지점 |
+| `/harvest/planned_path` | `nav_msgs/msg/Path` | world 기준 TCP 경로 |
+| `/harvest/planned_joint_trajectory` | `trajectory_msgs/msg/JointTrajectory` | 시간 매개화된 RRT 결과 미리보기 |
+| `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | planning/execution 상태와 오류 |
+
+개인 PC 1은 위 토픽을 원격으로 구독해 RViz에서 표시한다. RViz가 종료되거나
+네트워크에서 시각화 토픽이 유실되어도 GPU PC 1의 planner와 safety monitor는
+계속 실행할 수 있어야 한다.
 
 ## RetryInspection
 
