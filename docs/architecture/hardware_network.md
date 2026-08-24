@@ -11,9 +11,9 @@
 
 | 장비 | IP | 기본 역할 |
 |---|---|---|
-| GPU PC 1 | `10.10.0.1` | Isaac Sim 및 센서 발행 |
+| GPU PC 1 | `10.10.0.1` | Isaac Sim, 센서·TF 발행, Lula RRT/trajectory/RMPflow, 로봇 실행·안전 감시, motion visualization 발행 |
 | GPU PC 2 | `10.10.0.2` | 품질 추론 |
-| 개인 PC 1 | `10.10.0.3` | 로봇 계획·개발 |
+| 개인 PC 1 | `10.10.0.3` | RGB-D 수신·사과 3D 좌표 계산·target 발행, RViz 원격 표시 |
 | 개인 PC 2 | `10.10.0.4` | 분류 제어·모니터링 |
 
 ## ROS 2
@@ -23,9 +23,15 @@
 - 통합 환경 `ROS_DOMAIN_ID=101`
 - 개별 테스트 `ROS_DOMAIN_ID=102~107`
 - 다중 PC 통신에 UDP transport를 사용하도록 Fast DDS 설정을 통일한다.
-- 센서 데이터는 필요한 경우 compressed transport로 전달한다.
-- RGB는 JPEG 기반 압축, depth는 `compressedDepth` 또는 PNG 기반 무손실 압축을 우선한다.
-- 가능하면 GPU PC 1에서 원본 센서를 처리하고 네트워크에는 pose나 선별 이미지처럼 축소된 결과를 전달한다.
+- 수확 v2.0의 RGB와 depth 입력은 raw `sensor_msgs/msg/Image`로 확정한다.
+- GPU PC 1은 RGB/depth/CameraInfo를 개인 PC 1으로 전달하고, 개인 PC 1은 사과
+  3D target을 GPU PC 1으로 반환한다. 해상도와 FPS는 별도 시험값으로 관리한다.
+- 수확 입력에는 compressed transport를 사용하지 않는다. 품질검사용
+  `/quality/inspection_images`의 압축 RGB는 별도 계약으로 유지한다.
+- motion planning visualization은 GPU PC 1에서 발행하고 개인 PC 1의 RViz가
+  원격 표시한다. RViz 데이터는 안전·실행 경로가 아니므로 유실을 허용한다.
+- planning scene은 GPU PC 1에서 RRT/RMPflow에 직접 사용하고, 개인 PC 1에는
+  시각화·디버그용 snapshot으로 전달한다.
 - 정적인 나무 planning scene은 전체 snapshot 한 개로 전달한다. QoS는
   `Reliable + Transient Local + Keep Last 1`을 사용하고, 개인 PC 1은 누락 또는
   버전 불일치 시 `/planning_scene/get_snapshot`으로 최신 snapshot을 요청한다.
@@ -33,8 +39,13 @@
 ## 운영 규칙
 
 - 모든 PC의 ROS_DOMAIN_ID, RMW 설정 및 메시지 버전을 실행 전에 확인한다.
-- `RobotMotion`, `PlanningScene`, `SimulationState`가 변경되면 GPU PC 1의 Isaac
-  Python 3.11 인터페이스와 개인 PC 1의 ROS Python 3.12 인터페이스를 함께
-  재빌드한다. 한쪽만 이전 인터페이스를 사용한 상태에서는 실행하지 않는다.
+- target, `PlanningScene`, `SimulationState`, `MotionStatus` 또는 visualization
+  인터페이스가 변경되면 GPU PC 1의 Isaac Python 3.11 인터페이스와 개인 PC 1의
+  ROS Python 3.12 인터페이스를 함께 재빌드한다. 한쪽만 이전 인터페이스를
+  사용하는 상태에서는 통합 실행하지 않는다.
 - Wi-Fi와 Ethernet의 라우팅 우선순위가 ROS 2 discovery를 방해하지 않도록 인터페이스를 고정한다.
-- 네트워크 대역폭과 추론 지연은 통합 시험에서 측정한다.
+- 네트워크 대역폭과 RGB-D 전송 지연, TF-target timestamp 오차, target-to-plan
+  지연, RViz 표시 지연은 통합 시험에서 별도로 측정한다.
+- 영상 또는 target 연결이 끊기면 GPU PC 1은 stale target을 실행하지 않고
+  정지·실패 상태를 발행한다. 네트워크 노드 장애 감지용 wall-time timeout은
+  simulation-time motion timeout과 분리하며 값은 `TBD`다.

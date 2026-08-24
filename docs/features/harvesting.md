@@ -4,11 +4,13 @@
 
 - 로봇: Doosan M0617
 - 그리퍼: AGS-001-MTCP
-- solver: LulaKinematicsSolver
+- solver: LulaKinematicsSolver for IK, Lula RRT for global path planning,
+  Lula trajectory generation for time parameterization, and RMPflow for execution
 - 물리 수확 TCP: USD `palm` 원점에서 palm 로컬 `+Y 0.0908 m`
 - GPU PC 1은 Isaac Sim 동적 TF에 `palm` frame을 발행한다.
-- 개인 PC 1은 `world → palm`을 조회하고 palm 로컬 `+Y` offset을 적용해
-  현재 TCP pose를 계산한다.
+- 개인 PC 1은 영상 target을 계산하지만 로봇 current TCP pose나 계획 경로의
+  권위자가 아니다. GPU PC 1이 `world → palm`과 관절 상태를 읽어 현재 pose를
+  계산한다.
 - Lula/RMPflow 제어 frame: `link_6`
 
 ## 상태 흐름
@@ -32,6 +34,8 @@ TARGET_RECEIVED
 ## 접근
 
 - MVP 기본 접근은 사과 아래에서 world `+Z` 방향으로 이동한다.
+- 개인 PC 1은 사과 중심과 confidence만 전달하고, GPU PC 1이 현재 로봇 상태와
+  planning scene을 기준으로 접근 orientation과 pre-grasp pose를 결정한다.
 - 직전 joint configuration과 가까운 IK 해를 우선한다.
 - 급격한 joint angle 변화와 singularity에 가까운 해를 제외한다.
 - 굵은 가지와 로봇 전체 링크의 충돌을 방지한다.
@@ -43,16 +47,29 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
 
 ## 수확 경로 및 충돌 회피
 
+쉽게 말하면 Lula RRT는 나무 사이에서 사과 앞까지 가는 **큰 이동길**을 찾고,
+그리퍼 닫기·비틀기·당기기는 접촉을 제어하는 **정밀 동작**으로 별도 실행한다.
+
 - GPU PC 1은 reset마다 전체 몸통 box와 가지 sphere planning proxy snapshot을
   `world` 좌표로 발행한다. 잎과 목표 사과는 정적 snapshot에서 제외한다.
-- 개인 PC 1은 현재 `reset_id/scene_version`의 snapshot만 사용해 홈 자세에서
-  pre-grasp까지 direct, 좌우, 추가 외측 전역 waypoint 후보를 계획한다.
-- 개인 PC 1의 APPROACH 경로 마지막 waypoint는 사과 중심에서 world `-Z`
-  방향 `0.15 m`의 pre-grasp pose여야 한다.
-- GPU PC 1은 외부 waypoint의 frame, scene version, 순차 IK와 자체 planning
-  proxy 여유를 다시 검사한다. 검사를 통과하지 못하면 로봇을 움직이지 않는다.
-- GPU PC 1의 transit 실행은 단순 관절 보간을 사용하지 않고 Lula/RMPflow의
-  로봇 collision sphere와 planning obstacle을 사용한다.
+- GPU PC 1은 현재 관절 configuration과 target/pre-grasp pose로 Lula RRT의
+  전역 c-space 경로를 계획한다. RRT는 정적 snapshot에서 실행하며 seed,
+  step size, iteration limit 및 sampling limit은 로봇 시험 후 `TBD`로
+  확정한다.
+- RRT 결과는 단순 선형 관절 보간으로 실행하지 않는다. GPU PC 1은 Lula
+  trajectory generator로 속도·가속도 제약을 반영한 시간 매개화 궤적으로
+  변환하고, 각 segment를 순차 IK와 proxy clearance로 재검증한다.
+- GPU PC 1의 RMPflow는 시간 매개화 궤적/목표를 추종하는 실행 계층으로 사용하며,
+  planning world를 매 simulation step 갱신한다. RRT는 실행 중 반응형 회피
+  계층이 아니므로 동적 변화가 감지되면 Action을 중단하고 재계획한다.
+- APPROACH 경로 마지막 waypoint는 사과 중심에서 world `-Z` 방향 `0.15 m`의
+  pre-grasp pose여야 한다. 이 waypoint 생성과 검증은 GPU PC 1이 담당한다.
+- Lula RRT의 적용 범위는 장애물이 있는 transit·staging·pre-grasp·retract
+  구간의 전역 경로 탐색이다. palm 접촉 이후의 `GRASP`, 45° `TWIST`, 직선
+  `LINEAR_PULL`은 접촉 의도가 있는 결정론적 task-space 동작으로 유지하고,
+  매 step RMPflow·PhysX 접촉 규칙으로 검증한다. 접촉 구간을 RRT sampling의
+  일반 목표로 만들면 의도된 palm 접촉과 stem 파괴 조건을 비용 함수가 보장하지
+  못하므로 기본 방식으로 사용하지 않는다.
 - M0617 전체 링크는 굵은 가지 planning proxy와 충돌하지 않아야 한다.
 - 그리퍼와 손목은 작은 가지 planning proxy와 충돌하지 않아야 한다.
 - 몸통 mesh가 여러 개인 경우 각 mesh를 별도 planning obstacle로 유지한다.
@@ -105,16 +122,16 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
 파손되면 즉시 명령을 중지하고 실패를 보고한다. 안전한 후퇴 경로가 검증된
 경우에만 후퇴하며, 그렇지 않으면 현재 자세에서 정지한다.
 
-개인 PC 1이 계획을 만들지 못하면 `APPROACH_UNREACHABLE`로 해당 사과를
-수확하지 않는다. GPU PC 1은 Action 실행 직전에 실제 PhysX collider가 이미
-겹쳐 있는지 검사하고, 실행 중 Contact Report에서 로봇-나무 접촉을 감지하면
-`UNEXPECTED_CONTACT`로 Action을 중단한다. 사과와 그리퍼의 의도된 접촉 및
-로봇 자체 접촉은 이 나무 접촉 감시 조건에 포함하지 않는다.
+GPU PC 1이 RRT, trajectory 변환 또는 재검증을 완료하지 못하면
+`APPROACH_UNREACHABLE`로 해당 사과를 수확하지 않는다. GPU PC 1은 Action 실행
+직전에 실제 PhysX collider가 이미 겹쳐 있는지 검사하고, 실행 중 Contact Report에서
+로봇-나무 접촉을 감지하면 `UNEXPECTED_CONTACT`로 Action을 중단한다. 사과와
+그리퍼의 의도된 접촉 및 로봇 자체 접촉은 이 나무 접촉 감시 조건에 포함하지 않는다.
 
 Timeline Stop/Reset 시 GPU PC 1은 실행 중 Action을 종료하고 `reset_id`를
-증가시킨 뒤 새 snapshot을 발행한다. 개인 PC 1은 이전 waypoint, IK seed 및
-실패 대상 캐시를 폐기하고 `READY/PLAYING`과 snapshot 동기화를 확인한 후에만
-다음 계획을 시작한다.
+증가시킨 뒤 새 snapshot을 발행한다. 개인 PC 1은 이전 target과 검출 캐시를
+폐기하고 `READY/PLAYING` 및 target 세대 동기화를 확인한 후에만 새 target을
+발행한다. GPU PC 1은 이전 RRT tree, trajectory 및 실행 goal을 폐기한다.
 
 RMPflow gain, proxy voxel 크기, proxy 수 제한 및 영향 반경은 시뮬레이션 충돌
 시험 후 조정한다. 조정값은 물리 collider 크기와 planning proxy 크기를 구분해
@@ -162,11 +179,14 @@ Stem joint:
 - Feedback의 `progress`는 `0.0`에서 `1.0` 범위를 사용한다.
 - 성공 Result의 `error_code`는 빈 문자열이다.
 - 실행 중 실패하면 로봇 동작을 즉시 멈추고 실패 Result를 반환한다. 실패 후 자동 후퇴는 수행하지 않는다.
-- Goal 전 계획·검증 실패는 `/harvest/motion_status`로 GPU PC 1에 전달한다.
-- 계획·검증 실패 상태 메시지는 `success=false`, 기존 300번대 `error_code`, 실패 상태와 설명을 포함한다.
-- GPU PC 1은 `MotionStatus` 실패를 기록·로그하지만 이 기록만으로
-  후속 RobotMotion Goal을 차단하지 않는다. Goal 허용은 현재
-  `SimulationState`, `reset_id`, `scene_version`, busy 상태로 판정한다.
+- 계획·검증과 RobotMotion Action은 GPU PC 1이 소유한다. 개인 PC 1은 target
+  발행 전 인식 실패 상태와 target 수명·세대 오류를 별도 상태 토픽으로 전달하며,
+  정식 토픽과 메시지 필드는 `TBD`다.
+- GPU PC 1은 현재 `SimulationState`, target의 `reset_id`, planning scene
+  `scene_version`, busy 상태 및 target timestamp를 함께 검사해 Goal을 승인한다.
+- 외부 PC가 직접 waypoint를 보내는 기존 계약은 v2.0에서 폐기한다. 필요한 경우
+  디버그용 계획 요청 API를 별도로 정의하되, 최종 planner authority는 GPU PC 1에
+  둔다.
 
 ## 실패 처리
 

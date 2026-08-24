@@ -462,13 +462,34 @@ class HarvestCoordinator(Node):
             self.planning_scene = None
             self.request_snapshot()
             raise RoutePlanningError("planning scene 버전이 현재 simulation과 다릅니다.")
-        start_tcp = self._xyz(scene.robot_tcp_pose.pose.position)
+        planning_start = (
+            self._current_tcp_pose()
+            if self.execute_enabled
+            else scene.robot_tcp_pose
+        )
+        start_tcp = self._xyz(planning_start.pose.position)
+        start_orientation = np.array(
+            [
+                planning_start.pose.orientation.x,
+                planning_start.pose.orientation.y,
+                planning_start.pose.orientation.z,
+                planning_start.pose.orientation.w,
+            ],
+            dtype=float,
+        )
         robot_base = self._xyz(scene.robot_base_pose.pose.position)
         proxies = [self._proxy_from_message(value) for value in scene.obstacles]
-        route = plan_approach_route(start_tcp, robot_base, center, proxies)
+        route = plan_approach_route(
+            start_tcp,
+            robot_base,
+            center,
+            proxies,
+            start_orientation_xyzw=start_orientation,
+        )
         waypoints = []
-        q = route.orientation_xyzw
-        for position in route.positions:
+        for planned_waypoint in route.waypoints:
+            position = planned_waypoint.position
+            q = planned_waypoint.orientation_xyzw
             waypoint = PoseStamped()
             waypoint.header = target_header
             waypoint.header.frame_id = "world"
@@ -482,10 +503,16 @@ class HarvestCoordinator(Node):
             waypoints.append(waypoint)
         self.get_logger().info(
             f"APPROACH plan={route.name}, waypoints={len(waypoints)}, "
+            f"phases={','.join(value.phase for value in route.waypoints)}, "
             f"clearance={route.minimum_clearance:.3f} m, "
             f"closest={route.closest_obstacle}"
         )
-        return scene.reset_id, scene.scene_version, waypoints, route.orientation_xyzw
+        return (
+            scene.reset_id,
+            scene.scene_version,
+            waypoints,
+            route.final_orientation_xyzw,
+        )
 
     def on_pose(self, message):
         if message.header.frame_id != "world" or self.running:

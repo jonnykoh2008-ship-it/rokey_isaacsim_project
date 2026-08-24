@@ -1,6 +1,6 @@
 # Isaac Sim 기반 사과 수확·품질 분류 시스템
 
-디지털 트윈 환경에서 Doosan M0617 협동로봇과 Robotiq AGS-001-MTCP 3-finger soft gripper를 이용해 사과를 수확하고, MVP의 3모듈 컨베이어에서 품질을 판정하는 프로젝트다.
+디지털 트윈 환경에서 Doosan M0617 협동로봇과 Robotiq AGS-001-MTCP 3-finger soft gripper를 이용해 사과를 수확하고, MVP의 3모듈 컨베이어에서 품질을 판정하는 프로젝트다. v2.0에서는 개인 PC 1이 영상에서 사과의 3D 좌표를 계산하고, GPU PC 1이 해당 좌표를 받아 Lula 기반 경로 계획과 로봇 실행을 전담한다.
 
 ## 개발 목표
 
@@ -18,6 +18,42 @@
 - Isaac Sim Python 3.11 / ROS 2 Python 3.12
 - GPU 노트북 2대, 개인 노트북 2대
 - 2.5Gbps 5포트 스위치 중 4포트 사용
+
+## v2.0 실행 구조
+
+```text
+GPU PC 1: Isaac Sim RGB-D/TF/장애물 발행
+  → 개인 PC 1: 영상 수신·사과 3D 좌표 계산
+  → GPU PC 1: Lula RRT 전역 계획·궤적 생성·RMPflow 실행·PhysX 안전 감시
+  → 개인 PC 1: RViz 원격 표시
+```
+
+- 영상 기반 수확 인식의 실행 주체는 개인 PC 1이다.
+- 경로 계획, 계획 검증, Action 실행 및 최종 충돌 감시는 GPU PC 1이다.
+- motion planning 시각화 데이터는 GPU PC 1이 발행하고 RViz GUI는 개인 PC 1에서 실행한다.
+- GPU PC 2의 품질 추론과 개인 PC 2의 결과 표시·푸셔 선택은 기존 분리를 유지한다.
+
+쉽게 말하면 개인 PC 1은 카메라로 보는 **눈**, GPU PC 1은 경로를 결정하고 로봇을
+움직이는 **두뇌와 팔**, 개인 PC 1의 RViz는 결과를 보는 **화면**이다.
+
+## PC별 개발 범위
+
+| PC | 담당 기능 | 유지·개발 대상 |
+|---|---|---|
+| GPU PC 1 | Isaac Sim, 물리, 센서·TF·planning scene, Lula RRT/trajectory/RMPflow, 로봇 실행, 충돌 감시, 계획 시각화 | `apple_pick.py`, `vision_apple_pick.py`, `base_camera_publish.py`, planner/executor |
+| GPU PC 2 | 품질 영상 추론 및 사과 단위 품질 결과 통합 | 품질 추론·결과 통합 소스 (`TBD`) |
+| 개인 PC 1 | RGB-D 기반 사과 검출·3D 좌표 계산·target 발행, RViz 원격 표시 | PC1 perception 노드 및 RViz 설정 (`TBD`) |
+| 개인 PC 2 | 모니터링, 품질 결과 표시, 재검 요청, 2차 푸셔 선택 | 모니터링·푸셔 선택 소스 (`TBD`) |
+
+v2.0 기준으로 수확 계획·상태 머신·RobotMotion 실행을 담당하는
+`harvest_coordinator.py`와 `harvest_route_planner.py`의 소유권은 GPU PC 1로
+이전한다. 개인 PC 1은 새 perception 노드와 RViz 설정을 소유한다. 실제 코드
+이관과 인터페이스 반영은 별도 구현 단계에서 수행하며, 공유 인터페이스와 문서는
+네 PC 공동 소유다.
+
+## 모션 계획 원칙
+
+GPU PC 1은 정적 planning scene에서 Lula RRT로 시작 관절 상태부터 transit/staging/pre-grasp까지 전역 경로 후보를 만든다. RRT 출력 waypoint를 그대로 로봇에 보내지 않고 Lula trajectory generation으로 시간 매개화한 뒤, GPU PC 1의 RMPflow와 PhysX contact monitor로 실행 중 재검증한다. palm 접촉 이후의 twist·pull은 접촉 의도가 있는 결정론적 task-space 동작으로 유지한다. 동적 장애물이나 목표 변화가 생기면 현재 Action을 중단하고 최신 `reset_id/scene_version`으로 재계획한다.
 
 ## 문서
 
