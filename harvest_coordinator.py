@@ -72,6 +72,7 @@ class HarvestCoordinator(Node):
         # link_6 → TCP는 기계적 고정변환이므로 reset 후에도 유지한다.
         self.control_to_tcp_rotation = None
         self.control_to_tcp_translation = None
+        self._last_calibration_failure = None
 
         latched_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -116,6 +117,12 @@ class HarvestCoordinator(Node):
             or self.planning_scene.scene_version != self.simulation_state.scene_version
         ):
             self.request_snapshot()
+            return
+        if (
+            self.control_to_tcp_rotation is None
+            or self.control_to_tcp_translation is None
+        ):
+            self._calibrate_control_frame_to_tcp(self.planning_scene)
 
     def _publish_status(self, state, success, progress, error_code="", message=""):
         value = MotionStatus()
@@ -271,21 +278,32 @@ class HarvestCoordinator(Node):
         )
         return rotation, position
 
+    def _report_calibration_failure(self, message):
+        """Report a changed calibration failure together with the live TF tree."""
+        try:
+            frames = self.tf_buffer.all_frames_as_string()
+        except Exception as error:
+            frames = f"Unable to read TF tree: {error}"
+        failure = f"{message}\nCurrent TF tree:\n{frames}"
+        if failure == self._last_calibration_failure:
+            return
+        self._last_calibration_failure = failure
+        self.get_logger().warning(failure)
+
     def _calibrate_control_frame_to_tcp(self, scene):
-        """GPU PC 1의 robot_tcp_pose로 link_6 → TCP 고정변환을 보정한다."""
+        """Calibrate the fixed link_6-to-TCP transform from the GPU snapshot."""
+        if (
+            self.control_to_tcp_rotation is not None
+            and self.control_to_tcp_translation is not None
+        ):
+            return True
+
         tcp_pose = scene.robot_tcp_pose
         if tcp_pose.header.frame_id != "world":
-            self.get_logger().warning(
-                "robot_tcp_pose frame_id가 world가 아니라 TCP 보정을 건너뜁니다."
+            self._report_calibration_failure(
+                "TCP calibration failed: robot_tcp_pose frame_id is not world."
             )
-            return
-        try:
-            link_rotation, link_position = self._lookup_control_frame(
-                Time.from_msg(scene.header.stamp)
-            )
-        except RoutePlanningError as error:
-            self.get_logger().warning(f"TCP 보정 실패: {error}")
-            return
+            return False
         try:
             tcp_rotation = self._matrix_from_quaternion_xyzw(
                 tcp_pose.pose.orientation.x,
@@ -294,17 +312,57 @@ class HarvestCoordinator(Node):
                 tcp_pose.pose.orientation.w,
             )
         except RoutePlanningError as error:
-            self.get_logger().warning(f"TCP 보정 실패: {error}")
-            return
+            self._report_calibration_failure(f"TCP calibration failed: {error}")
+            return False
+
+        lookup_source = "scene_stamp"
+        try:
+            link_rotation, link_position = self._lookup_control_frame(
+                Time.from_msg(scene.header.stamp)
+            )
+        except RoutePlanningError as stamped_error:
+            state = self.simulation_state
+            fallback_allowed = (
+                not self.running
+                and state is not None
+                and state.state in (SimulationState.READY, SimulationState.PLAYING)
+            )
+            if not fallback_allowed:
+                self._report_calibration_failure(
+                    "TCP calibration failed at the scene stamp and latest-TF "
+                    f"fallback is not safe now. ({stamped_error})"
+                )
+                return False
+            try:
+                link_rotation, link_position = self._lookup_control_frame(Time())
+            except RoutePlanningError as latest_error:
+                self._report_calibration_failure(
+                    "TCP calibration failed for both scene-stamp and latest TF. "
+                    f"scene_stamp=({stamped_error}), latest=({latest_error})"
+                )
+                return False
+            lookup_source = "latest_fallback"
+            self.get_logger().warning(
+                "The planning-scene stamp predates the TF buffer. Calibrating "
+                "with latest TF under the explicit assumption that the robot "
+                "has not moved since the snapshot."
+            )
+
         tcp_position = self._xyz(tcp_pose.pose.position)
-        self.control_to_tcp_rotation = link_rotation.T @ tcp_rotation
-        self.control_to_tcp_translation = link_rotation.T @ (
+        control_to_tcp_rotation = link_rotation.T @ tcp_rotation
+        control_to_tcp_translation = link_rotation.T @ (
             tcp_position - link_position
         )
+        self.control_to_tcp_rotation = control_to_tcp_rotation
+        self.control_to_tcp_translation = control_to_tcp_translation
+        self._last_calibration_failure = None
         self.get_logger().info(
-            f"{CONTROL_FRAME} → TCP 보정: translation="
-            f"{np.round(self.control_to_tcp_translation, 5)} m"
+            f"{CONTROL_FRAME} -> TCP calibration: translation="
+            f"{np.round(self.control_to_tcp_translation, 5)} m, "
+            f"norm={np.linalg.norm(self.control_to_tcp_translation):.5f} m, "
+            f"source={lookup_source}"
         )
+        return True
 
     def _current_tcp_pose(self):
         """보정된 link_6 → TCP 변환을 현재 link_6 TF에 적용한다."""
@@ -458,6 +516,11 @@ class HarvestCoordinator(Node):
         ):
             self.planning_scene = None
             self.request_snapshot()
+            return False
+        if self.execute_enabled and (
+            self.control_to_tcp_rotation is None
+            or self.control_to_tcp_translation is None
+        ):
             return False
         return True
 
