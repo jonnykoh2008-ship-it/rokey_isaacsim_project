@@ -20,11 +20,15 @@
 
 ## 시스템 통합
 
-- GPU PC 1: Isaac Sim 및 센서
-- GPU PC 2: 수확/품질 AI 추론
-- 개인 PC: 계획, 분류 제어, 모니터링
+- GPU PC 1: Isaac Sim 및 센서, TF, Lula RRT/trajectory/RMPflow, 로봇 실행·안전
+  감시, 수확·푸셔 계획 visualization 발행
+- GPU PC 2: 품질 AI 추론 및 사과 단위 결과 통합
+- 개인 PC 1: RGB-D 수확 인식·world target 발행, GPU PC 1 계획 visualization의
+  RViz 원격 표시
+- 개인 PC 2: 분류 제어·모니터링
 - ROS 2 Jazzy/Fast DDS 기반 다중 PC 통신
-- latency, throughput 및 메시지 유실 측정
+- 영상 전송 latency, target 계산·전달 latency, RRT 계획시간, 실행시간,
+  visualization latency, throughput 및 메시지 유실 측정
 
 ## 복구
 
@@ -35,5 +39,8 @@
 - 사과 작업영역 이탈
 - 노드 또는 네트워크 장애
 
-상세 복구 정책과 연속 운용 완료 기준은 TBD다.
+영상 또는 target 네트워크 장애 시 GPU PC 1은 마지막 target을 무기한 재사용하지
+않고 stale 정책에 따라 정지한다. RViz 장애는 표시만 중단하며 수확 safety
+monitor의 판정과 분리한다.
 
+상세 복구 정책과 연속 운용 완료 기준은 TBD다.

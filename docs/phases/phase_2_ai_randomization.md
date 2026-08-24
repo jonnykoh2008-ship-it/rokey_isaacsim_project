@@ -15,17 +15,25 @@
 ## 수확 인식
 
 - Isaac Sim Replicator 데이터 생성
-- OpenCV/YOLOv8 기반 사과 검출
-- RGB-D 기반 3D 위치 계산
+- 개인 PC 1의 OpenCV/YOLOv8 기반 사과 검출
+- 개인 PC 1의 RGB-D 기반 3D 위치 계산 및 `world` target 발행
+- GPU PC 1의 target 세대·timestamp 검증
 - 다중 사과 ID 도입
-- 작은 가지와 잎 obstacle 추출
+- 작은 가지와 잎의 인식 후보 추출은 개인 PC 1에서 수행할 수 있으나, planning
+  obstacle 채택과 safety margin 적용은 GPU PC 1이 결정
 
 ## 접근 및 파지
 
 - 기본 `+Z` 접근 실패 시 다른 접근 각도 탐색
-- 가지와 잎을 고려한 free-space 평가
+- GPU PC 1의 Lula RRT 기반 전역 경로 후보 탐색 및 RMPflow 실행
+- 가지를 planning obstacle로 사용하고, 잎은 PhysX collision과 planning obstacle에서
+  제외한다. 잎은 occlusion/confidence 판단에만 사용한다.
 - 사과 위치·크기 변화에 대한 파지 안정성 향상
 - 필요 시 강화학습 적용
+
+RRT seed, sampling limit, collision-check 해상도, trajectory 제약 및 재계획
+정책은 GPU PC 1에서 시험한다. 개인 PC 1은 검출·좌표 계산 성능과 target
+timestamp 품질을 시험한다.
 
 ## 품질 분류
 
@@ -37,4 +45,3 @@
 ## 완료 기준
 
 데이터셋 규모, 인식 정확도, 파지 성공률 및 평가 시나리오는 TBD다.
-

@@ -53,6 +53,10 @@ WAITING
 - 개인 PC 2가 `QualityResult`를 받아 푸셔를 선택한다.
 - `SortCommand`를 GPU PC 1의 Isaac Sim으로 보낸다.
 - GPU PC 1이 trigger와 명령을 검증한 후 joint를 구동한다.
+- 수확 target, Lula RRT 계획 및 로봇 Action은 GPU PC 1의 수확 supervisor가
+  담당하며 푸셔 명령과 별도의 상태 머신으로 유지한다.
+- 개인 PC 1의 RViz는 GPU PC 1이 발행하는 수확·푸셔 상태 visualization을
+  원격 표시할 수 있으나 푸셔 동작을 승인하지 않는다.
 
 ## 미확정 사항
 

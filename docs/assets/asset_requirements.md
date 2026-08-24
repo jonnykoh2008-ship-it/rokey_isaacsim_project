@@ -13,6 +13,12 @@
 - 6DOF Doosan M0617
 - fixed-base MVP 구성
 - LulaKinematicsSolver에서 사용할 robot description과 URDF/USD 관절 이름을 일치시킨다.
+- GPU PC 1의 Lula RRT·trajectory·RMPflow가 동일한 URDF, robot description,
+  collision sphere 및 joint limit를 사용해야 한다.
+- Lula RRT용 planner configuration은 RMPflow configuration과 분리해 관리한다.
+  seed, step size, iteration/sampling limit, distance metric, task-space limits 및
+  `link_6` end-effector frame 일치 여부를 GPU PC 1에서 검증한다. 실제 수치와
+  지원 robot-description 경로는 `TBD`다.
 - 장착 어댑터 asset은 만들지 않는다.
 
 ## Robotiq AGS-001-MTCP 그리퍼
@@ -42,6 +48,11 @@
 - RGB/Depth global shutter
 - MVP 초기 실행 프로파일 후보: 1280×720, 30fps
 - 실제 해상도, FPS, intrinsics 및 장착 transform은 TBD다.
+
+v2.0에서 GPU PC 1은 raw RGB, raw depth 및 `CameraInfo`를 발행하고 개인 PC 1은
+이를 구독해 사과 중심을 계산한다. RGB와 depth의 촬영 timestamp와 카메라 TF가
+같은 simulation-time 기준을 사용해야 한다. 해상도, FPS 및 허용 timestamp 오차는
+`TBD`다.
 
 ## 사과
 
@@ -73,6 +84,10 @@
   convex 또는 voxel proxy로 단순화한다.
 - planning proxy에는 자산 분류(`trunk`, `branch`)와 적용한 안전거리
   값을 기록한다.
+
+GPU PC 1은 reset마다 planning proxy snapshot을 생성하고 Lula RRT와 RMPflow에
+동일한 proxy 및 safety margin을 적용한다. 개인 PC 1은 proxy를 재생성하지 않고
+필요할 때 RViz 표시용으로만 사용한다.
 
 작은 가지의 물리 collision 비활성화는 경로 계획 장애물 제외를 의미하지
 않으며 Lula/RMPflow 회피 대상으로 유지한다. 잎은 최신 수확 동작 규약에 따라
