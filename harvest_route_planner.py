@@ -69,12 +69,42 @@ class Proxy:
 
 
 @dataclass(frozen=True)
+class PlannedWaypoint:
+    """위치와 자세를 함께 고정한 APPROACH waypoint."""
+
+    phase: str
+    position: np.ndarray
+    orientation_xyzw: np.ndarray
+
+    def __post_init__(self):
+        position = np.asarray(self.position, dtype=float)
+        orientation = np.asarray(self.orientation_xyzw, dtype=float)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ValueError(f"{self.phase}: waypoint position이 유효하지 않습니다.")
+        if orientation.shape != (4,) or not np.all(np.isfinite(orientation)):
+            raise ValueError(f"{self.phase}: waypoint orientation이 유효하지 않습니다.")
+        norm = float(np.linalg.norm(orientation))
+        if norm <= 1e-12:
+            raise ValueError(f"{self.phase}: waypoint quaternion이 0입니다.")
+        object.__setattr__(self, "position", position)
+        object.__setattr__(self, "orientation_xyzw", orientation / norm)
+
+
+@dataclass(frozen=True)
 class PlannedRoute:
     name: str
-    positions: tuple
-    orientation_xyzw: np.ndarray
+    waypoints: tuple
     minimum_clearance: float
     closest_obstacle: str
+
+    @property
+    def positions(self):
+        """경로 검사와 기존 진단 코드에서 사용할 위치 열."""
+        return tuple(waypoint.position for waypoint in self.waypoints)
+
+    @property
+    def final_orientation_xyzw(self):
+        return self.waypoints[-1].orientation_xyzw
 
 
 def validate_scene_version(scene_reset_id, scene_version, state_reset_id, state_version):
@@ -255,11 +285,34 @@ def _select_corridor_proxies(start_tcp, route_points, proxies):
     return tuple(proxy for _clearance, proxy in selected)
 
 
-def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
-    """direct 또는 나무 바깥 우회 경로를 만들고 마지막 pose를 pregrasp로 둔다."""
+def _route_length(points):
+    return sum(
+        float(np.linalg.norm(np.asarray(end) - np.asarray(start)))
+        for start, end in zip(points[:-1], points[1:])
+    )
+
+
+def _waypoint(phase, position, orientation_xyzw):
+    return PlannedWaypoint(
+        phase=phase,
+        position=np.asarray(position, dtype=float),
+        orientation_xyzw=np.asarray(orientation_xyzw, dtype=float),
+    )
+
+
+def plan_approach_route(
+    start_tcp,
+    robot_position,
+    apple_position,
+    proxies,
+    *,
+    start_orientation_xyzw,
+):
+    """현재 자세로 안전점까지 이동한 뒤 정지 상태에서 접근 자세를 정렬한다."""
     start_tcp = np.asarray(start_tcp, dtype=float)
     robot_position = np.asarray(robot_position, dtype=float)
     apple_position = np.asarray(apple_position, dtype=float)
+    start_orientation = np.asarray(start_orientation_xyzw, dtype=float)
     for name, value in (
         ("start_tcp", start_tcp),
         ("robot_position", robot_position),
@@ -267,6 +320,12 @@ def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
     ):
         if value.shape != (3,) or not np.all(np.isfinite(value)):
             raise RoutePlanningError(f"{name} 좌표가 유효하지 않습니다.")
+    if start_orientation.shape != (4,) or not np.all(np.isfinite(start_orientation)):
+        raise RoutePlanningError("start_orientation_xyzw가 유효하지 않습니다.")
+    start_orientation_norm = float(np.linalg.norm(start_orientation))
+    if start_orientation_norm <= 1e-12:
+        raise RoutePlanningError("start_orientation_xyzw quaternion이 0입니다.")
+    start_orientation = start_orientation / start_orientation_norm
     proxies = tuple(proxies)
     orientation = approach_orientation_xyzw(robot_position, apple_position)
     staging = apple_position - np.array([0.0, 0.0, STAGING_DISTANCE_M])
@@ -277,7 +336,14 @@ def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
     clearance, obstacle = route_clearance(direct, corridor_proxies)
     if clearance >= 0.0:
         return PlannedRoute(
-            "direct", tuple(np.asarray(p, dtype=float) for p in direct[1:]), orientation, clearance, obstacle
+            "direct",
+            (
+                _waypoint("SAFE_TRANSIT", staging, start_orientation),
+                _waypoint("ORIENTATION_ALIGN", staging, orientation),
+                _waypoint("PRE_GRASP", pregrasp, orientation),
+            ),
+            clearance,
+            obstacle,
         )
     if not proxies:
         raise RoutePlanningError("planning scene에 obstacle proxy가 없습니다.")
@@ -312,6 +378,7 @@ def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
         )
     definitions.append(("outside extra", SIDE_OFFSET_M, 0.0))
     attempted = []
+    feasible = []
     for name, outward_offset, lateral_offset in definitions:
         low = outside + outward * outward_offset + lateral * lateral_offset
         high = low.copy()
@@ -324,11 +391,28 @@ def plan_approach_route(start_tcp, robot_position, apple_position, proxies):
         clearance, obstacle = route_clearance(points, corridor_proxies)
         attempted.append(f"{name}={clearance:.3f}m/{obstacle}")
         if clearance >= 0.0:
-            return PlannedRoute(
-                name,
-                tuple(np.asarray(p, dtype=float) for p in points[1:]),
-                orientation,
-                clearance,
-                obstacle,
+            waypoints = [
+                _waypoint("SAFE_TRANSIT", high, start_orientation),
+                _waypoint("ORIENTATION_ALIGN", high, orientation),
+                _waypoint("OUTSIDE_DESCENT", low, orientation),
+            ]
+            if abs(lateral_offset) > 1e-9:
+                waypoints.append(
+                    _waypoint("LATERAL_APPROACH", near_staging, orientation)
+                )
+            waypoints.extend(
+                [
+                    _waypoint("STAGING", staging, orientation),
+                    _waypoint("PRE_GRASP", pregrasp, orientation),
+                ]
             )
+            feasible.append(
+                (
+                    clearance,
+                    _route_length(points),
+                    PlannedRoute(name, tuple(waypoints), clearance, obstacle),
+                )
+            )
+    if feasible:
+        return max(feasible, key=lambda item: (item[0], -item[1]))[2]
     raise RoutePlanningError("모든 APPROACH 후보가 충돌합니다: " + ", ".join(attempted))
