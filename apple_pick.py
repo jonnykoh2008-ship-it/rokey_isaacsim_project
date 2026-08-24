@@ -129,12 +129,16 @@ ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
 BREAK_FORCE_N = 15.0
 BREAK_TORQUE_NM = 1.0
 
-# palm collision mesh 앞면(+Y 50.8 mm), 명목 사과 반지름(40 mm), 접촉
-# 여유(2.2 mm)를 합친 포위 파지 중심이다. 기존 125 mm는 사과와 palm 사이에
+# palm collision mesh 앞면(+Y 50.8 mm)과 명목 사과 반지름(40 mm)을 합친 포위
+# 파지 중심이다. 접촉 여유는 현재 0 mm이므로 실효 offset은 90.8 mm이며,
+# docs/features/harvesting.md의 명목 80 mm 사과 중심 목표(+Y 90.8 mm)와
+# 일치한다. docs/architecture/tf_frames.md는 접촉 여유 2.2 mm를 포함한
+# 93 mm를 명시하므로 두 문서 값이 서로 다르다. 여유를 되살리려면
+# PALM_CONTACT_CLEARANCE_M만 조정한다. 기존 125 mm는 사과와 palm 사이에
 # 약 34 mm 틈을 남겨 손가락 끝만 접촉하므로 사용하지 않는다.
 PALM_COLLISION_FACE_Y_M = 0.0508
 NOMINAL_APPLE_RADIUS_M = 0.0400
-PALM_CONTACT_CLEARANCE_M = 0.0022
+PALM_CONTACT_CLEARANCE_M = 0.0
 PALM_TO_TCP = np.array(
     [
         0.0,
@@ -147,6 +151,17 @@ PALM_TO_TCP = np.array(
 )
 
 PREGRASP_DISTANCE_M = 0.15
+ENTER_SLOW_DISTANCE_M = 0.03
+ENTER_FAST_STEPS = 360
+ENTER_SLOW_STEPS = 360
+ENTRY_PRESHAPE_SAMPLE_STEPS = 30
+ENTRY_PRESHAPE_MAX_SETTLE_STEPS = 120
+# entry pre-shape에서 손가락 collider가 사과를 지나칠 때 요구할 최소 여유이다.
+# 그리퍼를 최대로 벌린 상태의 기계적 최대 여유가 명목 80 mm 사과 기준 약
+# 0.0137 m이므로 이 값은 그보다 작아야 한다. 그렇지 않으면 정상 사과도
+# 전부 거부된다. 0.010 m는 지름 약 87 mm까지 허용하고 그보다 큰 사과는
+# 진입 전에 APPROACH_UNREACHABLE로 중단시키는 임시값이다.
+ENTRY_SWEEP_MIN_CLEARANCE_M = 0.010
 APPLE_OBSTACLE_RELEASE_DISTANCE_M = 0.30
 PULL_DISTANCE_M = 0.10
 RETREAT_DISTANCE_M = 0.25
@@ -242,8 +257,59 @@ GRIPPER_JOINTS = [
     "finger_middle_joint_3",
 ]
 
-# 열린 자세는 URDF의 모든 관절 0 rad이다.
-GRIPPER_OPEN = np.zeros(len(GRIPPER_JOINTS), dtype=float)
+# 사과 진입/해제 자세는 두 측면 손가락의 palm joint를 URDF 허용 범위
+# 바깥쪽 끝까지 벌린다. 세 distal joint는 음의 limit 근처로 접어 전방으로
+# 길게 뻗은 손가락 끝을 사과 통로 바깥쪽으로 빼는 entry pre-shape이다.
+# 단순 all-zero 자세는 영상상 palm보다 약 0.11 m 앞에서 선접촉했다.
+GRIPPER_OPEN = np.array(
+    [
+        0.25,
+        0.0,
+        0.0,
+        -1.20,
+        -0.25,
+        0.0,
+        0.0,
+        -1.20,
+        0.0,
+        0.0,
+        -1.20,
+    ],
+    dtype=float,
+)
+
+# URDF(robotiq_3f_isaac.urdf)의 손가락 관절 한계이다. 진입 여유를 넓히는
+# 방향은 proximal/medial을 펴고(0) distal을 최대로 접는(음의 한계) 쪽뿐이다.
+FINGER_JOINT_1_LOWER_RAD = 0.0
+FINGER_JOINT_2_LOWER_RAD = 0.0
+FINGER_JOINT_3_LOWER_RAD = -1.2217304764
+# Drive가 한계에 정확히 붙으면 solver가 진동할 수 있어 여유를 둔다.
+FINGER_LIMIT_MARGIN_RAD = 0.005
+ENTRY_DISTAL_MAX_RAD = FINGER_JOINT_3_LOWER_RAD + FINGER_LIMIT_MARGIN_RAD
+
+
+def _entry_preshape(distal_rad):
+    """두 측면 palm joint를 최대로 벌리고 세 distal을 지정 각도로 접는다."""
+    return np.array(
+        [
+            0.25, FINGER_JOINT_1_LOWER_RAD, FINGER_JOINT_2_LOWER_RAD, distal_rad,
+            -0.25, FINGER_JOINT_1_LOWER_RAD, FINGER_JOINT_2_LOWER_RAD, distal_rad,
+            FINGER_JOINT_1_LOWER_RAD, FINGER_JOINT_2_LOWER_RAD, distal_rad,
+        ],
+        dtype=float,
+    )
+
+
+# pre-grasp에서 실제 collider swept clearance를 측정할 후보이다.
+# 이전 버전은 finger_middle_joint_1을 0.00~0.60으로 키우며 탐색했지만 URDF
+# 하한이 0이므로 값을 키우는 방향은 손가락을 사과 통로 안쪽으로 감을 뿐이다.
+# 실측에서도 0.00/0.10/0.35/0.60의 여유가 각각 13.8/11.9/5.1/-8.1 mm로
+# 단조 감소해 항상 0.00이 선택됐다. 남은 자유도는 distal 굽힘뿐이므로
+# 기본값과 URDF 한계 두 가지만 비교한다.
+GRIPPER_ENTRY_CANDIDATES = [
+    ("distal_-1.20", GRIPPER_OPEN.copy()),
+    (f"distal_{ENTRY_DISTAL_MAX_RAD:.4f}", _entry_preshape(ENTRY_DISTAL_MAX_RAD)),
+]
 
 # 약 10 cm 사과를 감싸기 위한 목표값이다. 충돌이 정상이라면 손가락은
 # 사과 표면에서 멈추며, Drive가 이 목표를 계속 유지해 파지력을 만든다.
@@ -607,6 +673,83 @@ class RobotTreeContactMonitor:
             return
 
 
+class RobotAppleContactMonitor:
+    """사과와 접촉한 gripper collider가 palm인지 손가락인지 구분한다."""
+
+    def __init__(self, stage):
+        self.state = "IDLE"
+        self.palm_contacted = False
+        self.finger_contacted = False
+        self.palm_path = None
+        self.finger_path = None
+        articulation = require_prim(stage, ARTICULATION_PRIM_PATH)
+        report = PhysxSchema.PhysxContactReportAPI.Apply(articulation)
+        report.CreateThresholdAttr(0.0)
+        self._subscription = (
+            omni.physx.get_physx_simulation_interface()
+            .subscribe_contact_report_events(self._on_contact_report)
+        )
+
+    @staticmethod
+    def _decode_path(encoded):
+        return RobotTreeContactMonitor._decode_path(encoded)
+
+    @staticmethod
+    def _is_apple_path(path):
+        apple_body_path = APPLE_PATH.rsplit("/", 1)[0]
+        return path.startswith(apple_body_path)
+
+    @staticmethod
+    def _gripper_collider_path(paths):
+        candidates = [path for path in paths if path.startswith(GRIPPER_ROOT_PATH)]
+        if not candidates:
+            return None
+        return max(candidates, key=len)
+
+    def set_state(self, state):
+        self.state = state
+
+    def reset(self):
+        self.palm_contacted = False
+        self.finger_contacted = False
+        self.palm_path = None
+        self.finger_path = None
+
+    def close(self):
+        self._subscription = None
+
+    def _on_contact_report(self, headers, _data):
+        for header in headers:
+            if int(header.num_contact_data) <= 0:
+                continue
+            paths = [
+                self._decode_path(header.actor0),
+                self._decode_path(header.actor1),
+                self._decode_path(header.collider0),
+                self._decode_path(header.collider1),
+            ]
+            if not any(self._is_apple_path(path) for path in paths):
+                continue
+            gripper_path = self._gripper_collider_path(paths)
+            if gripper_path is None:
+                continue
+            if gripper_path.startswith(PALM_PATH):
+                if not self.palm_contacted:
+                    self.palm_contacted = True
+                    self.palm_path = gripper_path
+                    print(
+                        f"   [APPLE CONTACT] state={self.state}, "
+                        f"type=palm, robot={gripper_path}"
+                    )
+            elif not self.finger_contacted:
+                self.finger_contacted = True
+                self.finger_path = gripper_path
+                print(
+                    f"   [APPLE CONTACT] state={self.state}, "
+                    f"type=finger, robot={gripper_path}"
+                )
+
+
 def find_robot_tree_physx_overlap(stage):
     """현재 자세의 실제 로봇 collider와 나무 collider 겹침을 반환한다."""
     scene_query = omni.physx.get_physx_scene_query_interface()
@@ -758,18 +901,9 @@ def disable_leaf_colliders(stage):
 
 
 def configure_contact_colliders(stage):
-    """3F 손가락과 사과가 실제로 충돌하도록 런타임 Collider를 구성한다.
-
-    조립된 3F USD에는 충돌용 STL Mesh가 들어 있지만 instance proxy라서
-    Collision API가 적용되어 있지 않다. Instance 내부에는 속성을 직접
-    작성할 수 없으므로, 각 Rigid Body 링크의 로컬 좌표계로 충돌 Mesh를
-    복제하고 convex hull Collider를 적용한다.
-
-    이 변경은 메모리에서 열린 Stage에만 적용되며 원본 USD는 저장하지 않는다.
-    """
+    """authored gripper collider만 사용하고 접촉 리포트를 활성화한다."""
     leaf_colliders_disabled = disable_leaf_colliders(stage)
     gripper_root = require_prim(stage, GRIPPER_ROOT_PATH)
-    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
     collider_count = 0
 
     rigid_links = [
@@ -778,55 +912,32 @@ def configure_contact_colliders(stage):
         if prim.HasAPI(UsdPhysics.RigidBodyAPI)
     ]
 
+    # ContactReportAPI는 articulation root에만 적용하면 자식 손가락 rigid
+    # body의 접촉이 누락될 수 있다. 실제 충돌 주체인 각 gripper link에
+    # 직접 적용해 apple contact에서 collider 경로를 받을 수 있게 한다.
+    contact_report_body_count = 0
+    for link_prim in rigid_links:
+        report = PhysxSchema.PhysxContactReportAPI.Apply(link_prim)
+        report.CreateThresholdAttr(0.0)
+        contact_report_body_count += 1
+
     for link_prim in rigid_links:
         # URDF의 <collision>에서 가져온 STL만 사용한다. Visual Mesh를
         # Collider로 사용하면 형상이 지나치게 복잡해질 수 있다.
-        source_prim = next(
-            (
-                prim
-                for prim in Usd.PrimRange(
-                    link_prim,
-                    Usd.TraverseInstanceProxies(),
-                )
-                if prim.IsA(UsdGeom.Mesh) and "/collisions/" in str(prim.GetPath())
-            ),
-            None,
-        )
-        if source_prim is None:
+        source_prims = [
+            prim
+            for prim in Usd.PrimRange(
+                link_prim,
+                Usd.TraverseInstanceProxies(),
+            )
+            if prim.IsA(UsdGeom.Mesh) and "/collisions/" in str(prim.GetPath())
+        ]
+        if len(source_prims) != 1:
             raise RuntimeError(f"충돌 STL Mesh를 찾을 수 없습니다: {link_prim.GetPath()}")
-
-        source_mesh = UsdGeom.Mesh(source_prim)
-        source_points = source_mesh.GetPointsAttr().Get()
-        face_counts = source_mesh.GetFaceVertexCountsAttr().Get()
-        face_indices = source_mesh.GetFaceVertexIndicesAttr().Get()
-        if not source_points or not face_counts or not face_indices:
-            raise RuntimeError(f"충돌 STL Mesh 데이터가 비어 있습니다: {source_prim.GetPath()}")
-
-        # Source Mesh의 점을 해당 Rigid Body 링크 로컬 좌표로 변환한다.
-        source_to_world = xform_cache.GetLocalToWorldTransform(source_prim)
-        world_to_link = xform_cache.GetLocalToWorldTransform(link_prim).GetInverse()
-        link_points = []
-        for point in source_points:
-            world_point = source_to_world.Transform(Gf.Vec3d(point))
-            link_point = world_to_link.Transform(world_point)
-            link_points.append(Gf.Vec3f(link_point))
 
         collider_path = link_prim.GetPath().AppendChild("runtime_collision")
         if stage.GetPrimAtPath(collider_path).IsValid():
             stage.RemovePrim(collider_path)
-
-        collider_mesh = UsdGeom.Mesh.Define(stage, collider_path)
-        collider_mesh.CreatePointsAttr().Set(link_points)
-        collider_mesh.CreateFaceVertexCountsAttr().Set(face_counts)
-        collider_mesh.CreateFaceVertexIndicesAttr().Set(face_indices)
-        collider_mesh.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
-
-        # 화면에는 원래 Visual Mesh만 보이고, PhysX에는 이 Mesh만 사용된다.
-        collider_mesh.CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
-        collision = UsdPhysics.CollisionAPI.Apply(collider_mesh.GetPrim())
-        collision.CreateCollisionEnabledAttr().Set(True)
-        mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(collider_mesh.GetPrim())
-        mesh_collision.CreateApproximationAttr().Set("convexHull")
         collider_count += 1
 
     # 사과 Mesh에는 Collision API가 이미 있지만 저장된 USD에서 비활성화돼
@@ -849,14 +960,94 @@ def configure_contact_colliders(stage):
     apple_mesh_collision = UsdPhysics.MeshCollisionAPI.Apply(apple_collision_prim)
     apple_mesh_collision.CreateApproximationAttr().Set("convexHull")
 
+    apple_body_path = APPLE_PATH.rsplit("/", 1)[0]
+    apple_body = require_prim(stage, apple_body_path)
+    apple_report = PhysxSchema.PhysxContactReportAPI.Apply(apple_body)
+    apple_report.CreateThresholdAttr(0.0)
+
     print(
         f"   Colliders    gripper {collider_count}, apple 1 "
-        "(runtime convex hull)"
+        "(authored only; runtime duplicates removed)"
+    )
+    print(
+        f"   Contact report gripper bodies {contact_report_body_count}, apple body 1"
     )
     print(
         f"   Leaf collision disabled {leaf_colliders_disabled} "
         "(visual-only)"
     )
+
+
+def _mesh_sample_points_world(mesh_prim, xform_cache):
+    """collision mesh의 vertex/edge midpoint/face center를 world 좌표로 샘플한다."""
+    mesh = UsdGeom.Mesh(mesh_prim)
+    points = mesh.GetPointsAttr().Get()
+    counts = mesh.GetFaceVertexCountsAttr().Get()
+    indices = mesh.GetFaceVertexIndicesAttr().Get()
+    if not points or not counts or not indices:
+        return np.empty((0, 3), dtype=float)
+    local = np.asarray(points, dtype=float)
+    samples = [local]
+    cursor = 0
+    face_centers = []
+    edge_centers = []
+    for count in counts:
+        face = np.asarray(indices[cursor:cursor + count], dtype=np.int64)
+        cursor += count
+        if face.size < 2:
+            continue
+        vertices = local[face]
+        face_centers.append(np.mean(vertices, axis=0))
+        edge_centers.extend(
+            0.5 * (vertices + np.roll(vertices, -1, axis=0))
+        )
+    if face_centers:
+        samples.append(np.asarray(face_centers, dtype=float))
+    if edge_centers:
+        samples.append(np.asarray(edge_centers, dtype=float))
+    transform = xform_cache.GetLocalToWorldTransform(mesh_prim)
+    return np.asarray(
+        # np.vstack 결과의 각 행은 numpy.ndarray이므로 Gf.Vec3d 생성자와
+        # 직접 매칭되지 않는다. 스칼라 3개로 풀어서 넘긴다.
+        [
+            transform.Transform(Gf.Vec3d(*(float(value) for value in point)))
+            for point in np.vstack(samples)
+        ],
+        dtype=float,
+    )
+
+
+def compute_gripper_entry_swept_clearance(
+    stage, current_tcp, apple_center, apple_radius
+):
+    """현재 finger collider가 TCP→apple 선분을 이동할 때 최소 여유를 계산한다."""
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    gripper_root = require_prim(stage, GRIPPER_ROOT_PATH)
+    closest_clearance = float("inf")
+    closest_path = None
+    for prim in Usd.PrimRange(gripper_root, Usd.TraverseInstanceProxies()):
+        path = str(prim.GetPath())
+        if (
+            not prim.IsA(UsdGeom.Mesh)
+            or "/collisions/" not in path
+            or "/finger_" not in path
+        ):
+            continue
+        points = _mesh_sample_points_world(prim, xform_cache)
+        if points.size == 0:
+            continue
+        distances = _point_to_segment_distances(
+            points,
+            np.asarray(current_tcp, dtype=float),
+            np.asarray(apple_center, dtype=float),
+        )
+        clearance = float(np.min(distances) - float(apple_radius))
+        if clearance < closest_clearance:
+            closest_clearance = clearance
+            closest_path = path
+    if closest_path is None:
+        raise RuntimeError("gripper authored collision mesh를 측정하지 못했습니다.")
+    return closest_clearance, closest_path
 
 
 def compute_apple_center(stage):
@@ -1112,6 +1303,7 @@ class AppleHarvestFSM:
     NAMES = [
         "APPROACH",
         "ENTER",
+        "ENTER_SLOW",
         "GRASP",
         "TWIST",
         "PULL",
@@ -1184,9 +1376,11 @@ class AppleHarvestFSM:
             )
         )
 
+        enter_slow_start = apple_center - approach_direction * ENTER_SLOW_DISTANCE_M
         specs = [
             (pregrasp, approach_rotation, approach_steps, 0.0, 0.0),
-            (apple_center, approach_rotation, 100, 0.0, 0.0),
+            (enter_slow_start, approach_rotation, ENTER_FAST_STEPS, 0.0, 0.0),
+            (apple_center, approach_rotation, ENTER_SLOW_STEPS, 0.0, 0.0),
             (apple_center, approach_rotation, GRASP_STEPS, 0.0, 1.0),
             (apple_center, self.twisted_rotation, TWIST_STEPS, 1.0, 1.0),
             (pull, self.twisted_rotation, 120, 1.0, 1.0),
@@ -1297,7 +1491,7 @@ class AppleHarvestFSM:
         grip = grip0 + smoothstep(alpha) * (grip1 - grip0)
         return position, orientation, grip
 
-    def advance(self, actual_position, actual_rotation):
+    def advance(self, actual_position, actual_rotation, completion_allowed=True):
         """명령 시간과 실제 TCP 도달 조건을 모두 만족할 때만 다음 단계로 간다."""
         if self.done:
             return "done"
@@ -1313,6 +1507,7 @@ class AppleHarvestFSM:
         if (
             position_error > TARGET_POSITION_TOLERANCE_M
             or orientation_error > TARGET_ORIENTATION_TOLERANCE_DEG
+            or not completion_allowed
         ):
             self.settle_frame += 1
             if self.settle_frame == 1 or self.settle_frame % 60 == 0:
@@ -1332,6 +1527,17 @@ class AppleHarvestFSM:
         self.settle_frame = 0
         self._print_state()
         return "advanced"
+
+    def complete_current_on_contact(self, actual_position, actual_rotation):
+        """저속 진입 중 palm 접촉 위치를 GRASP 유지 pose로 확정한다."""
+        if self.done or self.NAMES[self.state] != "ENTER_SLOW":
+            raise RuntimeError("ENTER_SLOW가 아닌 상태에서 접촉 완료를 요청했습니다.")
+        self.start_position = np.asarray(actual_position, dtype=float)
+        self.start_quat = rot_matrix_to_quat(actual_rotation)
+        self.state += 1
+        self.frame = 0
+        self.settle_frame = 0
+        self._print_state()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -2020,15 +2226,28 @@ class CollisionAwareMotion:
             )
 
 
-def apply_gripper_target(robot, gripper_indices, close_ratio):
-    """0.0=open, 1.0=closed 비율로 11개 그리퍼 관절을 명령한다."""
-    targets = GRIPPER_OPEN + close_ratio * (GRIPPER_CLOSED - GRIPPER_OPEN)
+def apply_gripper_positions(robot, gripper_indices, targets):
+    """11개 gripper 관절에 검증된 위치 배열을 명령한다."""
+    targets = np.asarray(targets, dtype=float)
+    if targets.shape != (len(GRIPPER_JOINTS),) or not np.all(np.isfinite(targets)):
+        raise ValueError(f"그리퍼 목표 배열이 유효하지 않습니다: {targets}")
     robot.apply_action(
         ArticulationAction(
             joint_positions=targets,
             joint_indices=np.asarray(gripper_indices, dtype=np.int32),
         )
     )
+
+
+def apply_gripper_target(robot, gripper_indices, close_ratio, open_positions=None):
+    """0.0=open, 1.0=closed 비율로 11개 그리퍼 관절을 명령한다."""
+    open_positions = (
+        GRIPPER_OPEN
+        if open_positions is None
+        else np.asarray(open_positions, dtype=float)
+    )
+    targets = open_positions + close_ratio * (GRIPPER_CLOSED - open_positions)
+    apply_gripper_positions(robot, gripper_indices, targets)
 
 
 def move_arm_to_pregrasp(

@@ -18,8 +18,9 @@
 
 실행 예시:
     source /opt/ros/jazzy/setup.bash
-    ROS_DOMAIN_ID=102 python3 base_apple_detector.py \
-        --ros-args -p use_sim_time:=true
+    ROS_DOMAIN_ID=102 python3 base_apple_detector.py
+
+use_sim_time은 노드가 직접 강제하므로 별도 인자가 필요하지 않다.
 """
 
 import math
@@ -37,6 +38,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image
@@ -69,7 +71,14 @@ class BaseAppleDetector(Node):
     """RGB, Depth, CameraInfo를 결합해 사과 중심 Pose를 계산하는 노드."""
 
     def __init__(self):
-        super().__init__("base_apple_detector")
+        # docs/architecture/ros2_interfaces.md는 모든 ROS 2 노드가
+        # use_sim_time:=true를 쓰도록 규정한다. CLI 인자를 빠뜨리면 이 노드만
+        # wall time으로 동작해 /clock 기준 timestamp 비교가 어긋나므로
+        # 노드에서 직접 강제한다.
+        super().__init__(
+            "base_apple_detector",
+            parameter_overrides=[Parameter("use_sim_time", value=True)],
+        )
 
         # 현재 빨간 사과 에셋용 검출 파라미터다. ROS parameter로 노출하여
         # 코드를 수정하지 않고 환경별로 조절할 수 있다.
@@ -78,6 +87,10 @@ class BaseAppleDetector(Node):
         self.declare_parameter("maximum_depth_m", 10.0)
         self.declare_parameter("maximum_sync_error_sec", 0.08)
         self.declare_parameter("apple_radius_m", 0.04)
+        # surface_point_to_center가 "가장 앞면 표면점"을 가정하므로 윤곽 내부
+        # depth에서 앞면에 해당하는 낮은 분위를 사용한다. 0에 가까울수록
+        # 기하학적으로 정확하지만 depth noise에 민감해진다.
+        self.declare_parameter("depth_surface_percentile", 10.0)
         self.declare_parameter("target_frame", "world")
         self.declare_parameter("show_debug_window", True)
 
@@ -98,6 +111,14 @@ class BaseAppleDetector(Node):
             raise ValueError(
                 f"apple_radius_m은 0 이상의 유한값이어야 합니다: "
                 f"{self.apple_radius_m}"
+            )
+        self.depth_surface_percentile = float(
+            self.get_parameter("depth_surface_percentile").value
+        )
+        if not 0.0 <= self.depth_surface_percentile <= 100.0:
+            raise ValueError(
+                "depth_surface_percentile은 0~100 범위여야 합니다: "
+                f"{self.depth_surface_percentile}"
             )
         self.target_frame = str(self.get_parameter("target_frame").value)
         self.show_debug_window = bool(
@@ -210,7 +231,14 @@ class BaseAppleDetector(Node):
         return depth.astype(np.float32)
 
     def robust_depth(self, contour, depth_m):
-        """윤곽 내부 유효 depth 중앙값을 사용해 잎·배경 outlier를 줄인다."""
+        """윤곽 내부에서 사과의 '카메라를 향한 앞면' depth를 추정한다.
+
+        중앙값을 쓰면 구 표면 전체의 평균적 깊이(중심에서 약 0.71r 앞)가
+        나오는데, surface_point_to_center는 여기에 반지름 전체를 더하므로
+        추정 중심이 시선 방향으로 약 0.29r(사과 기준 약 12 mm) 밀린다.
+        앞면에 해당하는 낮은 분위를 사용해 두 단계의 가정을 일치시킨다.
+        순수 최솟값은 depth noise와 배경 픽셀에 취약하므로 분위를 쓴다.
+        """
         contour_mask = np.zeros(depth_m.shape[:2], dtype=np.uint8)
         cv2.drawContours(contour_mask, [contour], -1, 255, thickness=cv2.FILLED)
 
@@ -227,7 +255,7 @@ class BaseAppleDetector(Node):
         values = depth_m[valid]
         if values.size < 5:
             return None
-        return float(np.median(values))
+        return float(np.percentile(values, self.depth_surface_percentile))
 
     @staticmethod
     def contour_center(contour) -> Optional[Tuple[float, float]]:
