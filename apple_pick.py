@@ -202,6 +202,13 @@ PLACE_LIFT_STEPS = 150
 MAX_CONSECUTIVE_IK_FAILURES = 180
 TARGET_POSITION_TOLERANCE_M = 0.025
 TARGET_ORIENTATION_TOLERANCE_DEG = 6.0
+# 마지막 pre-grasp waypoint는 여기서 swept clearance를 측정하고 곧바로
+# 사과 사이로 진입하므로 일반 transit 허용오차를 쓸 수 없다. 25 mm 도착
+# 오차는 ENTER 중 횡방향으로 되밀어야 하는 거리가 되어 진입 여유(명목
+# 사과 기준 약 13.8 mm)를 통째로 잡아먹는다. RMPflow가 실제로 낼 수 있는
+# 정밀도는 미검증이므로 [TRANSIT] 실측값을 보고 조정할 임시값이다.
+PREGRASP_POSITION_TOLERANCE_M = 0.005
+PREGRASP_ORIENTATION_TOLERANCE_DEG = 2.0
 MAX_TARGET_SETTLE_STEPS = 180
 APPLE_GRASP_MAX_DISTANCE_M = 0.14
 
@@ -238,6 +245,14 @@ GRIPPER_DRIVE_DAMPING = 5.0
 GRIPPER_GRASP_MAX_FORCE = 0.08
 GRIPPER_HOLD_MAX_FORCE = 0.50
 GRIPPER_DRIVE_MAX_FORCE = GRIPPER_GRASP_MAX_FORCE
+# entry pre-shape는 사과에 닿기 전 자세라 stem의 1 N·m 제한과 무관하다.
+# GRASP용 저토크로는 팔이 가속하는 동안 손가락이 명령 자세를 유지하지 못해
+# 정적으로 측정한 swept clearance와 실제 진입 자세가 달라질 수 있다.
+GRIPPER_ENTRY_MAX_FORCE = GRIPPER_HOLD_MAX_FORCE
+# 진입 중 실시간으로 다시 잰 swept clearance가 이 값 아래로 내려가면
+# 중단한다. 검사 간격 동안 진행하는 거리보다 커야 접촉 전에 멈출 수 있다.
+ENTRY_LIVE_MIN_CLEARANCE_M = 0.004
+ENTRY_LIVE_CHECK_INTERVAL_STEPS = 10
 
 # ══════════════════════════════════════════════════════════════
 # 3F 그리퍼 관절
@@ -557,12 +572,31 @@ def configured_break_limits():
 class JointBreakMonitor:
     """사과 FixedJoint의 실제 PhysX 파손 시점과 FSM 상태를 기록한다."""
 
-    def __init__(self):
+    def __init__(self, stage):
+        self.stage = stage
+        branch_prim = require_prim(stage, BRANCH_BODY_PATH)
+        self.branch_imageable = UsdGeom.Imageable(branch_prim)
+        if not self.branch_imageable:
+            raise RuntimeError(
+                f"가지 prim에 visibility를 적용할 수 없습니다: {BRANCH_BODY_PATH}"
+            )
         self.broken = False
         self.break_state = None
         self.current_state = "SETUP"
+        self._set_branch_visible(True)
         events = omni.physx.get_physx_interface().get_simulation_event_stream_v2()
         self._subscription = events.create_subscription_to_pop(self._on_event)
+
+    def _set_branch_visible(self, visible):
+        """런타임 세션 레이어에서 branchbody의 렌더링만 전환한다."""
+        visibility = (
+            UsdGeom.Tokens.inherited if visible else UsdGeom.Tokens.invisible
+        )
+        with Usd.EditContext(self.stage, self.stage.GetSessionLayer()):
+            if not self.branch_imageable.CreateVisibilityAttr().Set(visibility):
+                raise RuntimeError(
+                    f"가지 visibility를 설정하지 못했습니다: {BRANCH_BODY_PATH}"
+                )
 
     def set_state(self, state):
         self.current_state = state
@@ -571,6 +605,7 @@ class JointBreakMonitor:
         self.broken = False
         self.break_state = None
         self.current_state = "SETUP"
+        self._set_branch_visible(True)
 
     def close(self):
         self._subscription = None
@@ -588,12 +623,14 @@ class JointBreakMonitor:
             return
         self.broken = True
         self.break_state = self.current_state
+        self._set_branch_visible(False)
         break_force, break_torque = configured_break_limits()
         print(
             f"   [JOINT BREAK] {FIXED_JOINT_PATH} state={self.break_state}, "
             f"test={args.break_test}, "
             f"limit={break_force:.3g} N/{break_torque:.3g} N·m"
         )
+        print(f"   [BRANCH HIDDEN] {BRANCH_BODY_PATH}")
 
 
 class RobotTreeContactMonitor:
@@ -978,8 +1015,13 @@ def configure_contact_colliders(stage):
     )
 
 
-def _mesh_sample_points_world(mesh_prim, xform_cache):
-    """collision mesh의 vertex/edge midpoint/face center를 world 좌표로 샘플한다."""
+def _mesh_sample_points_world(mesh_prim, xform_cache, vertices_only=False):
+    """collision mesh의 vertex/edge midpoint/face center를 world 좌표로 샘플한다.
+
+    vertices_only는 face/edge 보간을 생략해 훨씬 빠르다. 진입 중 반복 호출하는
+    실시간 검사용이며, vertex는 볼록 collider의 최외곽이므로 최소 여유
+    추정에는 충분하다.
+    """
     mesh = UsdGeom.Mesh(mesh_prim)
     points = mesh.GetPointsAttr().Get()
     counts = mesh.GetFaceVertexCountsAttr().Get()
@@ -991,6 +1033,8 @@ def _mesh_sample_points_world(mesh_prim, xform_cache):
     cursor = 0
     face_centers = []
     edge_centers = []
+    if vertices_only:
+        counts = ()
     for count in counts:
         face = np.asarray(indices[cursor:cursor + count], dtype=np.int64)
         cursor += count
@@ -1018,9 +1062,13 @@ def _mesh_sample_points_world(mesh_prim, xform_cache):
 
 
 def compute_gripper_entry_swept_clearance(
-    stage, current_tcp, apple_center, apple_radius
+    stage, current_tcp, apple_center, apple_radius, vertices_only=False
 ):
-    """현재 finger collider가 TCP→apple 선분을 이동할 때 최소 여유를 계산한다."""
+    """현재 finger collider가 TCP→apple 선분을 이동할 때 최소 여유를 계산한다.
+
+    현재 자세에서 다시 호출하면 팔이 어떤 경로로 왔는지와 무관하게 남은
+    여유를 그대로 알려준다. 진입 중 재측정하면 직선 이동 가정이 필요 없다.
+    """
     xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
     gripper_root = require_prim(stage, GRIPPER_ROOT_PATH)
     closest_clearance = float("inf")
@@ -1033,7 +1081,9 @@ def compute_gripper_entry_swept_clearance(
             or "/finger_" not in path
         ):
             continue
-        points = _mesh_sample_points_world(prim, xform_cache)
+        points = _mesh_sample_points_world(
+            prim, xform_cache, vertices_only=vertices_only
+        )
         if points.size == 0:
             continue
         distances = _point_to_segment_distances(
@@ -1048,6 +1098,49 @@ def compute_gripper_entry_swept_clearance(
     if closest_path is None:
         raise RuntimeError("gripper authored collision mesh를 측정하지 못했습니다.")
     return closest_clearance, closest_path
+
+
+def compute_gripper_entry_lever_arm(stage, current_tcp):
+    """TCP에서 가장 먼 finger collider 점까지의 거리를 반환한다.
+
+    진입 중 손목이 theta만큼 회전하면 finger collider는 최대 theta * (이 거리)
+    만큼 옆으로 쓸린다. 이탈 원인을 위치와 회전으로 나눠 기록할 때 쓴다.
+    """
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    gripper_root = require_prim(stage, GRIPPER_ROOT_PATH)
+    current_tcp = np.asarray(current_tcp, dtype=float)
+    lever = 0.0
+    for prim in Usd.PrimRange(gripper_root, Usd.TraverseInstanceProxies()):
+        path = str(prim.GetPath())
+        if (
+            not prim.IsA(UsdGeom.Mesh)
+            or "/collisions/" not in path
+            or "/finger_" not in path
+        ):
+            continue
+        points = _mesh_sample_points_world(prim, xform_cache, vertices_only=True)
+        if points.size == 0:
+            continue
+        lever = max(
+            lever,
+            float(np.max(np.linalg.norm(points - current_tcp, axis=1))),
+        )
+    if lever <= 0.0:
+        raise RuntimeError("gripper finger collider 지렛대를 측정하지 못했습니다.")
+    return lever
+
+
+def point_to_line_distance(point, line_point, line_direction):
+    """점과 무한 직선 사이의 수직거리를 반환한다."""
+    point = np.asarray(point, dtype=float)
+    line_point = np.asarray(line_point, dtype=float)
+    direction = np.asarray(line_direction, dtype=float)
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-12:
+        raise ValueError("직선 방향 벡터가 0입니다.")
+    direction = direction / norm
+    delta = point - line_point
+    return float(np.linalg.norm(delta - np.dot(delta, direction) * direction))
 
 
 def compute_apple_center(stage):
@@ -1345,6 +1438,9 @@ class AppleHarvestFSM:
             - approach_direction * RETREAT_DISTANCE_M
             + np.array([0.0, 0.0, RETREAT_HEIGHT_M])
         )
+        retreat_steps = (
+            1 if np.linalg.norm(retreat - pull) <= 1e-9 else 180
+        )
         place = np.asarray(conveyor_start, dtype=float)
         outside = np.asarray(conveyor_outside, dtype=float)
         place_above = place + np.array([0.0, 0.0, PLACE_APPROACH_HEIGHT_M])
@@ -1384,7 +1480,7 @@ class AppleHarvestFSM:
             (apple_center, approach_rotation, GRASP_STEPS, 0.0, 1.0),
             (apple_center, self.twisted_rotation, TWIST_STEPS, 1.0, 1.0),
             (pull, self.twisted_rotation, 120, 1.0, 1.0),
-            (retreat, self.twisted_rotation, 180, 1.0, 1.0),
+            (retreat, self.twisted_rotation, retreat_steps, 1.0, 1.0),
             (
                 clear_up,
                 self.twisted_rotation,
@@ -2300,9 +2396,17 @@ def move_arm_to_pregrasp(
         waypoint_count,
         waypoint,
         target_rotation,
+        position_tolerance=TARGET_POSITION_TOLERANCE_M,
+        orientation_tolerance=TARGET_ORIENTATION_TOLERANCE_DEG,
     ):
         nonlocal physics_steps
         collision_motion.set_target(waypoint, target_rotation)
+        # 수렴 판정이 촘촘해지면 진전 판정도 같은 비율로 촘촘해야 한다.
+        # 그렇지 않으면 목표에 근접하는 동안의 작은 개선이 진전으로 잡히지
+        # 않아 정체로 오판된다. 기본 허용오차에서는 기존 RMPFLOW_STALL_*
+        # 값과 정확히 같아진다.
+        position_progress_delta = 0.2 * position_tolerance
+        orientation_progress_delta = orientation_tolerance / 3.0
         best_position_error = float("inf")
         best_orientation_error = float("inf")
         steps_without_progress = 0
@@ -2352,13 +2456,13 @@ def move_arm_to_pregrasp(
             progressed = False
             if (
                 position_error
-                <= best_position_error - RMPFLOW_STALL_POSITION_DELTA_M
+                <= best_position_error - position_progress_delta
             ):
                 best_position_error = position_error
                 progressed = True
             if (
                 orientation_error
-                <= best_orientation_error - RMPFLOW_STALL_ROTATION_DELTA_DEG
+                <= best_orientation_error - orientation_progress_delta
             ):
                 best_orientation_error = orientation_error
                 progressed = True
@@ -2367,8 +2471,8 @@ def move_arm_to_pregrasp(
             else:
                 steps_without_progress += 1
             if (
-                position_error <= TARGET_POSITION_TOLERANCE_M
-                and orientation_error <= TARGET_ORIENTATION_TOLERANCE_DEG
+                position_error <= position_tolerance
+                and orientation_error <= orientation_tolerance
             ):
                 print(
                     f"   [TRANSIT ] {route_name} "
@@ -2448,6 +2552,7 @@ def move_arm_to_pregrasp(
 
     def external_route_has_ik(waypoints, rotations):
         """개인 PC가 만든 waypoint를 현재 관절 자세에서 순차 IK 검사한다."""
+
         arm_indices = np.asarray(
             [robot.get_dof_index(name) for name in ARM_JOINTS], dtype=np.int32
         )
@@ -2532,14 +2637,27 @@ def move_arm_to_pregrasp(
         for index, (waypoint, waypoint_rotation) in enumerate(
             zip(waypoints, rotations)
         ):
-            if index == len(waypoints) - 1:
+            final_waypoint = index == len(waypoints) - 1
+            if final_waypoint:
                 collision_motion.disable_target_apple()
+            # 마지막 waypoint가 pre-grasp이며 여기서 swept clearance를 재고
+            # 곧바로 진입하므로 정밀 허용오차를 사용한다.
             reached = follow_waypoint(
                 "EXTERNAL APPROACH",
                 index + 1,
                 len(waypoints),
                 waypoint,
                 waypoint_rotation,
+                position_tolerance=(
+                    PREGRASP_POSITION_TOLERANCE_M
+                    if final_waypoint
+                    else TARGET_POSITION_TOLERANCE_M
+                ),
+                orientation_tolerance=(
+                    PREGRASP_ORIENTATION_TOLERANCE_DEG
+                    if final_waypoint
+                    else TARGET_ORIENTATION_TOLERANCE_DEG
+                ),
             )
             if reached is None:
                 return physics_steps, False
@@ -2664,6 +2782,8 @@ def move_arm_to_pregrasp(
         1,
         np.asarray(pregrasp_tcp),
         approach_rotation,
+        position_tolerance=PREGRASP_POSITION_TOLERANCE_M,
+        orientation_tolerance=PREGRASP_ORIENTATION_TOLERANCE_DEG,
     )
     if pregrasp_reached is None:
         return physics_steps, False

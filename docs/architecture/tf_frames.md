@@ -17,6 +17,7 @@
 - `odom`
 - `base_link` (`robot_base`의 표준 ROS 링크 프레임)
 - M0617의 각 joint/link frame
+- `palm` (USD 그리퍼 palm 링크. 물리 수확 TCP의 기준 frame)
 - `gripper_frame`
 - `base_camera`
 - `arm_camera`
@@ -24,6 +25,34 @@
 - `apple_<id>`
 - `conveyor_<id>`
 
+<<<<<<< Updated upstream
+=======
+## TF 발행
+
+GPU PC 1의 `vision_apple_pick.py`가 Isaac Sim Action Graph로 모두 발행하며,
+timestamp는 `/clock` simulation time을 사용한다.
+
+- `world → odom`: 항등 변환, `/tf_static`
+- `odom → base_link`: USD 조립 자세에서 읽은 고정 변환, `/tf_static`
+- `base_link → robot links`: articulation 상태 기반 동적 변환, `/tf`
+- `/joint_states`: M0617 articulation 관절 상태
+- 카메라 고정 TF: `world → base_camera`, `/tf_static`
+- 동일한 TF를 두 노드가 중복 발행하지 않는다. `robot_state_publisher`는
+  사용하지 않는다.
+
+M0617이 고정 설치된 MVP에서는 `odom → base_link`가 변하지 않는다. 3차 레일 도입 시 동적 변환으로 확장한다.
+
+### 레일 링크를 TF에서 제외하는 이유
+
+레일(`m0617_rail`)은 M0617과 같은 articulation이지만 TF 대상에서 제외한다.
+레일 URDF의 베이스 링크 이름이 `world`여서 ROS의 `world` 프레임과 충돌하기
+때문이다. 이 prim은 `Assets/Robot_Rail/` 참조 에셋에서 들어오고
+articulation root joint와 `rail_joint`가 경로로 참조하고 있어 rename할 수
+없다. 따라서 Action Graph는 `/World/Xform_01/m0617` 아래 rigid body 링크만
+대상으로 지정한다. MVP에서 레일은 고정이므로 TF에서 빠져도 무방하며, 3차
+레일 도입 시 이 제약을 다시 설계한다.
+
+>>>>>>> Stashed changes
 ## 수확 TCP와 Lula 제어 프레임
 
 - 물리 수확 TCP는 USD `palm` 원점에서 palm 로컬 `+Y` 방향 `0.0908 m`에

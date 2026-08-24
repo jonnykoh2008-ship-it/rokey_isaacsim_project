@@ -16,6 +16,40 @@
 - Preserve the distinction between feature specifications (`docs/features`) and delivery phases (`docs/phases`). Phase documents reference feature documents rather than duplicating them.
 - Unresolved requirements must be written as `TBD`; do not invent final values without user approval.
 
+## PC ownership and edit boundaries
+
+This repository is developed by four PCs. Source ownership follows the PC that
+executes and maintains the function, not the PC that happens to discover a bug.
+
+| Owner | Responsibilities | Current owned source examples |
+|---|---|---|
+| GPU PC 1 | Isaac Sim, physics, sensors, apple detection, planning-scene publication, robot Action execution, and runtime safety monitoring | `apple_pick.py`, `vision_apple_pick.py`, `base_apple_detector.py`, `base_camera_publish.py`, Isaac Sim robot/gripper assets and runtime configuration |
+| GPU PC 2 | Quality-image inference and apple-level quality-result integration | Quality inference and result-integration source; current path is `TBD` |
+| Personal PC 1 | Harvest coordination, planning-proxy-based global waypoint planning, and Goal sequencing | `harvest_coordinator.py`, `harvest_route_planner.py`, and their tests |
+| Personal PC 2 | Monitoring, result display, retry requests, and phase-2 pusher selection | Monitoring and pusher-selection source; current path is `TBD` |
+
+Shared contracts and documentation include `appleproj_interfaces/`, `docs/`,
+`README.md`, `AGENTS.md`, and cross-PC build or network configuration. They are
+not owned exclusively by one PC. Modify a shared file only after the user
+explicitly approves that exact file and scope, and report every affected PC.
+
+The active implementation scope is task-specific and must be established from
+the user's request and the execution PC. This document does not designate one
+PC as the permanent current work environment.
+
+- Before every source edit, state which PC executes the code and confirm that
+  the file belongs to that PC. If ownership is missing or ambiguous, stop and
+  ask the user instead of editing.
+- Do not make opportunistic edits to another PC's source while changing shared
+  interfaces or documentation.
+- A request to fix system behavior does not by itself transfer ownership of the
+  executing PC's source. If the fix belongs to another PC, identify that owner
+  and obtain the required approval for the file and scope.
+- When a change is needed in another PC's source, submit a modification review
+  request to that PC's owner instead of editing the file. Include the target
+  file and function, observed problem, proposed behavior, interface impact,
+  and verification steps.
+
 ## Required documentation routing
 
 Before planning or implementing a task, read the documents mapped to its scope.
