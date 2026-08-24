@@ -41,7 +41,8 @@ target을 계산하고, GPU PC 1이 Lula RRT 기반 경로 계획과 로봇 실�
 
 ## 품질 검사
 
-- 컨베이어 2에서 RGB 프레임 수집
+- GPU PC 1에서 컨베이어 2 raw RGB/depth/CameraInfo와 checkpoint event 발행
+- GPU PC 2에서 ROI/tracker, 후보 RGB 프레임 수집 및 대표 프레임 선택
 - GPU PC 2 품질 추론 인터페이스
 - 상·중·하 결과 산출
 - 컨베이어 3에서 `apple_id`와 품질 결과 연결 확인

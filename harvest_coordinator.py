@@ -1,18 +1,24 @@
-"""개인 PC 1용 분산 충돌 계획 상태 머신 및 RobotMotion Action Client."""
+"""GPU PC 1용 수확 supervisor와 RobotMotion Action Client."""
 
 import argparse
 from collections import deque
+import math
 
 import numpy as np
 import rclpy
 from appleproj_interfaces.action import RobotMotion
-from appleproj_interfaces.msg import MotionStatus, PlanningScene, SimulationState
+from appleproj_interfaces.msg import (
+    HarvestPerceptionStatus,
+    HarvestTarget,
+    MotionStatus,
+    PlanningScene,
+    SimulationState,
+)
 from appleproj_interfaces.srv import GetPlanningScene
 from geometry_msgs.msg import PoseStamped
 from harvest_route_planner import (
-    Proxy,
     RoutePlanningError,
-    plan_approach_route,
+    approach_orientation_xyzw,
     validate_scene_version,
 )
 from rclpy.action import ActionClient
@@ -40,6 +46,16 @@ SEQUENCE = [
 TCP_FRAME = "palm"
 PALM_TO_TCP_Y_M = 0.0908
 
+# Threshold 값은 통합 시험 전까지 TBD다. 음수 sentinel은 해당 검사를
+# 비활성화하며, 범위·세대·frame·timestamp 일치 검사는 항상 수행한다.
+TARGET_MAX_AGE_SEC = -1.0
+MIN_TARGET_CONFIDENCE = -1.0
+MIN_VALID_DEPTH_RATIO = -1.0
+MAX_TF_TIME_ERROR_SEC = -1.0
+
+TARGET_TOPIC = "/harvest/target"
+PERCEPTION_STATUS_TOPIC = "/harvest/perception_status"
+
 
 class HarvestCoordinator(Node):
     def __init__(self, execute, sample_count, maximum_spread):
@@ -63,11 +79,24 @@ class HarvestCoordinator(Node):
         self.simulation_state = None
         self.plan_reset_id = 0
         self.plan_scene_version = 0
-        self.approach_waypoints = []
         self.approach_orientation = None
         self.snapshot_request_pending = False
         self.generation = 0
         self._last_tcp_lookup_failure = None
+        self._sample_target_key = None
+        self._active_target_key = None
+        self._latest_target_stamps = {}
+        self._started_target_keys = set()
+        self.target_max_age_sec = self._optional_threshold(TARGET_MAX_AGE_SEC)
+        self.minimum_target_confidence = self._optional_threshold(
+            MIN_TARGET_CONFIDENCE
+        )
+        self.minimum_valid_depth_ratio = self._optional_threshold(
+            MIN_VALID_DEPTH_RATIO
+        )
+        self.maximum_tf_time_error_sec = self._optional_threshold(
+            MAX_TF_TIME_ERROR_SEC
+        )
 
         latched_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -96,10 +125,130 @@ class HarvestCoordinator(Node):
         self.create_subscription(
             SimulationState, "/simulation/state", self.on_state, latched_qos
         )
+        target_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
         self.create_subscription(
-            PoseStamped, "/harvest/target_pose", self.on_pose, 10
+            HarvestTarget, TARGET_TOPIC, self.on_target, target_qos
+        )
+        perception_status_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        self.create_subscription(
+            HarvestPerceptionStatus,
+            PERCEPTION_STATUS_TOPIC,
+            self.on_perception_status,
+            perception_status_qos,
         )
         self.snapshot_retry_timer = self.create_timer(0.5, self._retry_snapshot)
+
+    @staticmethod
+    def _optional_threshold(value):
+        value = float(value)
+        if not math.isfinite(value) or value < 0.0:
+            return None
+        return value
+
+    @staticmethod
+    def _stamp_ns(stamp):
+        return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+    @staticmethod
+    def _point_is_finite(point):
+        return bool(
+            np.all(
+                np.isfinite(
+                    [float(point.x), float(point.y), float(point.z)]
+                )
+            )
+        )
+
+    def _validate_target(self, message):
+        """Validate the v2 HarvestTarget contract before planning starts."""
+        if message.header.frame_id != "world":
+            return "HarvestTarget header.frame_id는 world여야 합니다."
+        if not str(message.target_id).strip():
+            return "HarvestTarget target_id가 비어 있습니다."
+        stamp_ns = self._stamp_ns(message.header.stamp)
+        source_stamp_ns = self._stamp_ns(message.source_point.header.stamp)
+        if stamp_ns <= 0:
+            return "HarvestTarget header timestamp가 유효하지 않습니다."
+        if source_stamp_ns != stamp_ns:
+            return "source_point와 target의 timestamp가 일치하지 않습니다."
+        if not str(message.source_point.header.frame_id).strip():
+            return "source_point 원본 camera frame이 비어 있습니다."
+        if message.source_point.header.frame_id == "world":
+            return "source_point는 원본 camera frame이어야 합니다."
+        if not self._point_is_finite(message.position):
+            return "HarvestTarget world position에 NaN 또는 Inf가 있습니다."
+        if not self._point_is_finite(message.source_point.point):
+            return "HarvestTarget source_point에 NaN 또는 Inf가 있습니다."
+        values = (
+            float(message.confidence),
+            float(message.valid_depth_ratio),
+            float(message.tf_time_error_sec),
+        )
+        if not all(math.isfinite(value) for value in values):
+            return "HarvestTarget 품질 메타데이터에 NaN 또는 Inf가 있습니다."
+        confidence, valid_depth_ratio, tf_time_error_sec = values
+        if not 0.0 <= confidence <= 1.0:
+            return "confidence는 0.0~1.0 범위여야 합니다."
+        if not 0.0 <= valid_depth_ratio <= 1.0:
+            return "valid_depth_ratio는 0.0~1.0 범위여야 합니다."
+        if tf_time_error_sec < 0.0:
+            return "tf_time_error_sec는 0 이상이어야 합니다."
+        if (
+            self.minimum_target_confidence is not None
+            and confidence < self.minimum_target_confidence
+        ):
+            return "target confidence threshold 미달입니다."
+        if (
+            self.minimum_valid_depth_ratio is not None
+            and valid_depth_ratio < self.minimum_valid_depth_ratio
+        ):
+            return "valid depth ratio threshold 미달입니다."
+        if (
+            self.maximum_tf_time_error_sec is not None
+            and tf_time_error_sec > self.maximum_tf_time_error_sec
+        ):
+            return "TF timestamp error threshold 초과입니다."
+        if self.target_max_age_sec is not None:
+            age_sec = (
+                self.get_clock().now().nanoseconds - stamp_ns
+            ) / 1_000_000_000.0
+            if age_sec > self.target_max_age_sec:
+                return (
+                    "target timestamp가 stale합니다: "
+                    f"age={age_sec:.3f}s, limit={self.target_max_age_sec:.3f}s"
+                )
+        return None
+
+    def _reject_target(self, message, reason, error_code="309:INVALID_TARGET_POSE"):
+        self.samples.clear()
+        self._sample_target_key = None
+        self._publish_status("TARGET_RECEIVED", False, 0.0, error_code, reason)
+        self.get_logger().warning(
+            f"HarvestTarget 거부 target_id={message.target_id}: {reason}"
+        )
+
+    def on_perception_status(self, message):
+        if message.status == HarvestPerceptionStatus.OK:
+            self.get_logger().debug(
+                f"perception OK target_id={message.target_id}"
+            )
+            return
+        self.get_logger().warning(
+            "perception status: "
+            f"status={message.status}, target_id={message.target_id}, "
+            f"reset={message.reset_id}/{message.scene_version}, "
+            f"message={message.message}"
+        )
 
     def _retry_snapshot(self):
         if self.simulation_state is None or self.simulation_state.state not in (
@@ -168,10 +317,11 @@ class HarvestCoordinator(Node):
             self.failed_target = self._xyz(self.target.pose.position)
         self.running = False
         self.goal_handle = None
+        self._active_target_key = None
         self.target = None
-        self.approach_waypoints = []
         self.approach_orientation = None
         self.samples.clear()
+        self._sample_target_key = None
 
     def _report_plan_failure(self, center, error):
         code = self._planning_error_code(error)
@@ -341,12 +491,16 @@ class HarvestCoordinator(Node):
             self.running = False
             self.goal_handle = None
             self.target = None
-            self.approach_waypoints = []
             self.approach_orientation = None
             self.samples.clear()
+            self._sample_target_key = None
+            self._active_target_key = None
             if version_changed:
                 self.failed_target = None
                 self.planning_scene = None
+                self._latest_target_stamps.clear()
+                if previous.reset_id != message.reset_id:
+                    self._started_target_keys.clear()
         if message.state in (SimulationState.READY, SimulationState.PLAYING):
             if (
                 self.planning_scene is None
@@ -400,25 +554,6 @@ class HarvestCoordinator(Node):
     def _xyz(position):
         return np.array([position.x, position.y, position.z], dtype=float)
 
-    @staticmethod
-    def _proxy_from_message(message):
-        orientation = message.pose.orientation
-        return Proxy(
-            obstacle_id=message.obstacle_id,
-            shape=int(message.shape),
-            position=HarvestCoordinator._xyz(message.pose.position),
-            orientation_xyzw=np.array(
-                [orientation.x, orientation.y, orientation.z, orientation.w],
-                dtype=float,
-            ),
-            dimensions=np.array(
-                [message.dimensions.x, message.dimensions.y, message.dimensions.z],
-                dtype=float,
-            ),
-            safety_margin=float(message.safety_margin),
-            obstacle_class=int(message.obstacle_class),
-        )
-
     def _planning_inputs_synchronized(self):
         state = self.simulation_state
         if state is None or state.state not in (
@@ -441,7 +576,13 @@ class HarvestCoordinator(Node):
             return False
         return True
 
-    def _prepare_approach_plan(self, center, target_header):
+    def _prepare_approach_goal(self, center):
+        """현재 scene 세대를 고정하고 GPU PC 1의 기본 접근 자세를 계산한다.
+
+        실제 c-space 경로 생성과 collision 재검증은 같은 GPU PC 1에서 실행되는
+        RobotMotion Action 서버가 담당한다. 이 coordinator는 외부 waypoint를
+        만들어 Action Goal에 주입하지 않는다.
+        """
         if self.simulation_state is None or self.simulation_state.state not in (
             SimulationState.READY,
             SimulationState.PLAYING,
@@ -462,85 +603,81 @@ class HarvestCoordinator(Node):
             self.planning_scene = None
             self.request_snapshot()
             raise RoutePlanningError("planning scene 버전이 현재 simulation과 다릅니다.")
-        planning_start = (
-            self._current_tcp_pose()
-            if self.execute_enabled
-            else scene.robot_tcp_pose
-        )
-        start_tcp = self._xyz(planning_start.pose.position)
-        start_orientation = np.array(
-            [
-                planning_start.pose.orientation.x,
-                planning_start.pose.orientation.y,
-                planning_start.pose.orientation.z,
-                planning_start.pose.orientation.w,
-            ],
-            dtype=float,
-        )
         robot_base = self._xyz(scene.robot_base_pose.pose.position)
-        proxies = [self._proxy_from_message(value) for value in scene.obstacles]
-        route = plan_approach_route(
-            start_tcp,
-            robot_base,
-            center,
-            proxies,
-            start_orientation_xyzw=start_orientation,
-        )
-        waypoints = []
-        for planned_waypoint in route.waypoints:
-            position = planned_waypoint.position
-            q = planned_waypoint.orientation_xyzw
-            waypoint = PoseStamped()
-            waypoint.header = target_header
-            waypoint.header.frame_id = "world"
-            waypoint.pose.position.x = float(position[0])
-            waypoint.pose.position.y = float(position[1])
-            waypoint.pose.position.z = float(position[2])
-            waypoint.pose.orientation.x = float(q[0])
-            waypoint.pose.orientation.y = float(q[1])
-            waypoint.pose.orientation.z = float(q[2])
-            waypoint.pose.orientation.w = float(q[3])
-            waypoints.append(waypoint)
+        approach_orientation = approach_orientation_xyzw(robot_base, center)
         self.get_logger().info(
-            f"APPROACH plan={route.name}, waypoints={len(waypoints)}, "
-            f"phases={','.join(value.phase for value in route.waypoints)}, "
-            f"clearance={route.minimum_clearance:.3f} m, "
-            f"closest={route.closest_obstacle}"
+            "APPROACH target 승인: GPU PC 1 Action 서버가 현재 관절 상태와 "
+            f"scene {scene.reset_id}/{scene.scene_version}으로 경로를 생성합니다."
         )
         return (
             scene.reset_id,
             scene.scene_version,
-            waypoints,
-            route.final_orientation_xyzw,
+            approach_orientation,
         )
 
-    def on_pose(self, message):
-        if message.header.frame_id != "world" or self.running:
-            return
-        orientation = np.array(
-            [
-                message.pose.orientation.x,
-                message.pose.orientation.y,
-                message.pose.orientation.z,
-                message.pose.orientation.w,
-            ],
-            dtype=float,
-        )
-        if not np.all(np.isfinite(orientation)) or np.linalg.norm(orientation) <= 1e-12:
-            self._publish_status(
-                "TARGET_RECEIVED",
-                False,
-                0.0,
-                "309:INVALID_TARGET_POSE",
-                "target_pose orientation이 유효하지 않습니다.",
+    def on_target(self, message):
+        """Receive and validate the v2 HarvestTarget contract."""
+        if self.running:
+            self.get_logger().debug(
+                f"실행 중 target 갱신 무시 target_id={message.target_id}"
             )
             return
-        sample = self._xyz(message.pose.position)
-        if not np.all(np.isfinite(sample)):
+        validation_error = self._validate_target(message)
+        if validation_error is not None:
+            self._reject_target(message, validation_error)
+            return
+
+        state = self.simulation_state
+        if state is None or state.state not in (
+            SimulationState.READY,
+            SimulationState.PLAYING,
+        ):
+            self._reject_target(
+                message,
+                "SimulationState가 READY 또는 PLAYING이 아닙니다.",
+                "306:GOAL_REJECTED",
+            )
+            return
+        if (
+            int(message.reset_id) != int(state.reset_id)
+            or int(message.scene_version) != int(state.scene_version)
+        ):
+            self._reject_target(
+                message,
+                "target reset_id/scene_version이 현재 SimulationState와 다릅니다.",
+                "308:SIMULATION_RESET",
+            )
             return
         if not self._planning_inputs_synchronized():
-            self.samples.clear()
+            self._reject_target(
+                message,
+                "planning scene 또는 현재 TCP가 아직 동기화되지 않았습니다.",
+                "306:GOAL_REJECTED",
+            )
             return
+
+        target_key = (int(message.reset_id), str(message.target_id))
+        if target_key in self._started_target_keys:
+            self.get_logger().debug(
+                "이미 Action이 시작된 HarvestTarget 갱신 무시: "
+                f"target_id={message.target_id}, reset_id={message.reset_id}"
+            )
+            return
+        stamp_ns = self._stamp_ns(message.header.stamp)
+        previous_stamp_ns = self._latest_target_stamps.get(target_key)
+        if previous_stamp_ns is not None and stamp_ns <= previous_stamp_ns:
+            self.get_logger().debug(
+                "오래된 HarvestTarget 무시: "
+                f"target_id={message.target_id}, stamp={stamp_ns}, "
+                f"latest={previous_stamp_ns}"
+            )
+            return
+        self._latest_target_stamps[target_key] = stamp_ns
+
+        sample = self._xyz(message.position)
+        if self._sample_target_key != target_key:
+            self.samples.clear()
+            self._sample_target_key = target_key
         self.samples.append(sample)
         if len(self.samples) < self.samples.maxlen:
             return
@@ -558,11 +695,15 @@ class HarvestCoordinator(Node):
                 "직전 실패 사과와 같은 위치이므로 자동 재시도하지 않습니다. "
                 "재시도하려면 coordinator를 다시 시작하세요."
             )
-            self.samples.clear()
+            self._reject_target(
+                message,
+                "직전 실패 target과 같은 위치라 자동 재시도하지 않습니다.",
+                "301:APPROACH_UNREACHABLE",
+            )
             return
         try:
-            reset_id, scene_version, waypoints, approach_orientation = self._prepare_approach_plan(
-                center, message.header
+            reset_id, scene_version, approach_orientation = (
+                self._prepare_approach_goal(center)
             )
         except (RoutePlanningError, ValueError) as error:
             self._report_plan_failure(center, error)
@@ -574,9 +715,10 @@ class HarvestCoordinator(Node):
                 True,
                 1.0,
                 "",
-                f"계획 검증 완료: waypoints={len(waypoints)}",
+                "target·scene·접근 자세 검증 완료; 경로 실행은 비활성화됨",
             )
             self.samples.clear()
+            self._sample_target_key = None
             return
         self.target = PoseStamped()
         self.target.header = message.header
@@ -594,8 +736,9 @@ class HarvestCoordinator(Node):
         self.samples.clear()
         self.plan_reset_id = int(reset_id)
         self.plan_scene_version = int(scene_version)
-        self.approach_waypoints = waypoints
         self.approach_orientation = approach_orientation
+        self._active_target_key = target_key
+        self._sample_target_key = None
         self.running, self.index = True, 0
         self.send_next()
 
@@ -604,8 +747,9 @@ class HarvestCoordinator(Node):
             self.get_logger().info("수확 Action 시퀀스 완료")
             self.running = False
             self.target = None
-            self.approach_waypoints = []
             self.samples.clear()
+            self._sample_target_key = None
+            self._active_target_key = None
             return
         generation = self.generation
         motion_type = SEQUENCE[self.index]
@@ -630,8 +774,6 @@ class HarvestCoordinator(Node):
         goal.target_pose = target_pose
         goal.reset_id = self.plan_reset_id
         goal.scene_version = self.plan_scene_version
-        if goal.motion_type == RobotMotion.Goal.APPROACH:
-            goal.waypoints = self.approach_waypoints
         future = self.client.send_goal_async(goal, feedback_callback=self.on_feedback)
         future.add_done_callback(
             lambda result_future: self.on_goal_response(result_future, generation)
@@ -658,6 +800,8 @@ class HarvestCoordinator(Node):
             )
             self._clear_run(remember_target=True)
             return
+        if self.index == 0 and self._active_target_key is not None:
+            self._started_target_keys.add(self._active_target_key)
         self.goal_handle = handle
         handle.get_result_async().add_done_callback(
             lambda result_future: self.on_result(result_future, generation)

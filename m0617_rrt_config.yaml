@@ -1,0 +1,41 @@
+# M0617 Lula RRT trial tuning for Isaac Sim 5.1.0.
+#
+# 이 값들은 Phase 2 시뮬레이션 계측을 위한 임시값이다. 경로 성공률, 계획 시간,
+# 최소 clearance, 관절 변화량 및 RMPflow 추종 결과를 수집한 뒤 정식값으로
+# 승인하기 전까지 TBD 상태로 취급한다.
+
+seed: 123456
+step_size: 0.05
+max_iterations: 50000
+max_sampling: 10000
+distance_metric_weights: [3.0, 2.0, 2.0, 1.5, 1.5, 1.0]
+task_space_frame_name: "link_6"
+
+# M0617 base_link 기준 시험용 sampling box. 실제 target/나무 배치별 계측 후
+# 범위를 축소하거나 goal별 동적 범위로 교체한다.
+task_space_limits: [[-1.8, 1.8], [-1.8, 1.8], [-0.4, 2.2]]
+
+cuda_tree_params:
+  max_num_nodes: 10000
+  max_buffer_size: 30
+  num_nodes_cpu_gpu_crossover: 3000
+
+c_space_planning_params:
+  exploration_fraction: 0.5
+
+task_space_planning_params:
+  translation_target_zone_tolerance: 0.05
+  orientation_target_zone_tolerance: 0.09
+  translation_target_final_tolerance: 1.0e-4
+  orientation_target_final_tolerance: 0.005
+  translation_gradient_weight: 1.0
+  orientation_gradient_weight: 0.125
+  nn_translation_distance_weight: 1.0
+  nn_orientation_distance_weight: 0.125
+  task_space_exploitation_fraction: 0.4
+  task_space_exploration_fraction: 0.1
+  max_extension_substeps_away_from_target: 6
+  max_extension_substeps_near_target: 50
+  extension_substep_target_region_scale_factor: 2.0
+  unexploited_nodes_culling_scalar: 1.0
+  gradient_substep_size: 0.025

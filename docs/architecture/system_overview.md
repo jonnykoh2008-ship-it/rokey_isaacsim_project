@@ -35,7 +35,8 @@ RRT는 정적 planning scene에서 transit/staging/pre-grasp/retract의 전역�
 - GPU PC 1: Isaac Sim, 물리, 센서·TF·`/clock`, planning scene 발행, Lula RRT 및
   trajectory planning, RMPflow 기반 로봇 실행, 실제 PhysX collider 기반 최종 안전
   감시, motion planning 시각화 토픽 발행
-- GPU PC 2: 품질 영상 추론 및 사과 단위 결과 통합
+- GPU PC 2: 컨베이어 카메라 영상 수신, ROI/tracker, 후보 프레임 수집·대표 프레임
+  선택, 품질 영상 추론 및 사과 단위 결과 통합
 - 개인 PC 1: GPU PC 1의 RGB-D/CameraInfo/TF를 받아 사과 검출과 3D world 좌표를
   계산하고 target을 발행, GPU PC 1의 계획 결과를 RViz로 원격 표시
 - 개인 PC 2: 모니터링 및 2차 개발의 푸셔 선택
@@ -59,7 +60,8 @@ planning scene과 계획 시각화 토픽을 구독하지만 계획 결과의 �
   계산해 GPU PC 1의 수확 기능에 전달한다.
 - GPU PC 1의 수확 기능은 target의 세대·시간·frame을 검증하고 계획·실행한다.
 - 수확 기능은 품질을 판정하지 않는다.
-- 품질 분류는 컨베이어 상단 카메라에서 독립적으로 수행한다.
+- GPU PC 1은 컨베이어 물리·checkpoint와 컨베이어 카메라 raw 스트림 발행을 담당하고,
+  GPU PC 2가 영상 수집·프레임 선택·품질 분류를 수행한다.
 - MVP에서는 가상·실제 푸셔를 구현하지 않는다. 2차 개발에서 컨베이어 4와 실제 푸셔 3개를 추가한다.
 
 ## 시각화 경계

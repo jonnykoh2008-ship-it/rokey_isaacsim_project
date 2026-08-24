@@ -1,4 +1,4 @@
-"""개인 PC 1에서 실행 가능한 planning-proxy 기반 전역 waypoint planner."""
+"""GPU PC 1의 planning-proxy 기반 접근 자세·coarse route 진단 도구."""
 
 from dataclasses import dataclass
 
@@ -258,8 +258,8 @@ def _select_corridor_proxies(start_tcp, route_points, proxies):
     """경로 주변 proxy만 가까운 순서로 선택한다.
 
     시작 TCP와 이미 겹친 proxy는 현재 자세를 가두는 원인이 될 수 있으므로
-    개인 PC 1의 후보 경로 검사에서는 제외한다. GPU PC 1은 실행 직전 실제
-    PhysX overlap을 별도로 검사해야 한다.
+    coarse route 후보 검사에서는 제외한다. GPU PC 1은 실행 직전 실제 PhysX
+    overlap을 별도로 검사해야 한다.
     """
     selected = []
     for proxy in proxies:
