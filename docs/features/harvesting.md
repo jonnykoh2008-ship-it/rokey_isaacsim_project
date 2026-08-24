@@ -5,7 +5,10 @@
 - 로봇: Doosan M0617
 - 그리퍼: AGS-001-MTCP
 - solver: LulaKinematicsSolver
-- 물리 목표: palm 로컬 `+Y 0.093 m`의 수확 TCP
+- 물리 수확 TCP: USD `palm` 원점에서 palm 로컬 `+Y 0.0908 m`
+- GPU PC 1은 Isaac Sim 동적 TF에 `palm` frame을 발행한다.
+- 개인 PC 1은 `world → palm`을 조회하고 palm 로컬 `+Y` offset을 적용해
+  현재 TCP pose를 계산한다.
 - Lula/RMPflow 제어 frame: `link_6`
 
 ## 상태 흐름

@@ -34,13 +34,11 @@ SEQUENCE = [
     RobotMotion.Goal.RETRACT,
 ]
 
-# 물리 수확 TCP는 USD `palm` 기준으로 정의되는데 palm은 URDF에 없어 TF로
-# 조회할 수 없다. 보조 frame인 `gripper_frame`은 link_6에서 125 mm 떨어져
-# 있고 RPY도 달라 TCP 기준으로 쓸 수 없다(docs/architecture/tf_frames.md).
-# 대신 GPU PC 1이 발행한 `PlanningScene.robot_tcp_pose`와 같은 시각의
-# link_6 TF를 비교해 `link_6 → TCP` 고정변환을 한 번 보정하고, 이후에는
-# 현재 link_6 TF에 그 변환을 적용한다.
-CONTROL_FRAME = "link_6"
+# The physical harvest TCP is defined from the USD `palm` frame. GPU PC 1
+# publishes that frame in the dynamic TF tree, so no link_6-to-TCP
+# calibration or gripper_frame approximation is needed here.
+TCP_FRAME = "palm"
+PALM_TO_TCP_Y_M = 0.0908
 
 
 class HarvestCoordinator(Node):
@@ -69,9 +67,7 @@ class HarvestCoordinator(Node):
         self.approach_orientation = None
         self.snapshot_request_pending = False
         self.generation = 0
-        # link_6 → TCP는 기계적 고정변환이므로 reset 후에도 유지한다.
-        self.control_to_tcp_rotation = None
-        self.control_to_tcp_translation = None
+        self._last_tcp_lookup_failure = None
 
         latched_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -116,6 +112,9 @@ class HarvestCoordinator(Node):
             or self.planning_scene.scene_version != self.simulation_state.scene_version
         ):
             self.request_snapshot()
+            return
+        if self.execute_enabled:
+            self._tcp_pose_available()
 
     def _publish_status(self, state, success, progress, error_code="", message=""):
         value = MotionStatus()
@@ -245,15 +244,15 @@ class HarvestCoordinator(Node):
                 )
         return q / np.linalg.norm(q)
 
-    def _lookup_control_frame(self, stamp):
-        """world → link_6 변환을 회전행렬과 위치로 반환한다."""
+    def _lookup_tcp_frame(self, stamp):
+        """Return the world-to-palm transform as rotation and position."""
         try:
             transform = self.tf_buffer.lookup_transform(
-                "world", CONTROL_FRAME, stamp
+                "world", TCP_FRAME, stamp
             )
         except TransformException as error:
             raise RoutePlanningError(
-                f"{CONTROL_FRAME} TF를 읽지 못했습니다: {error}"
+                f"{TCP_FRAME} TF is unavailable: {error}"
             )
         rotation = self._matrix_from_quaternion_xyzw(
             transform.transform.rotation.x,
@@ -271,55 +270,35 @@ class HarvestCoordinator(Node):
         )
         return rotation, position
 
-    def _calibrate_control_frame_to_tcp(self, scene):
-        """GPU PC 1의 robot_tcp_pose로 link_6 → TCP 고정변환을 보정한다."""
-        tcp_pose = scene.robot_tcp_pose
-        if tcp_pose.header.frame_id != "world":
-            self.get_logger().warning(
-                "robot_tcp_pose frame_id가 world가 아니라 TCP 보정을 건너뜁니다."
-            )
-            return
+    def _report_tcp_lookup_failure(self, message):
+        """Report a changed TCP lookup failure with the live TF tree."""
         try:
-            link_rotation, link_position = self._lookup_control_frame(
-                Time.from_msg(scene.header.stamp)
-            )
-        except RoutePlanningError as error:
-            self.get_logger().warning(f"TCP 보정 실패: {error}")
+            frames = self.tf_buffer.all_frames_as_string()
+        except Exception as error:
+            frames = f"Unable to read TF tree: {error}"
+        failure = f"{message}\nCurrent TF tree:\n{frames}"
+        if failure == self._last_tcp_lookup_failure:
             return
+        self._last_tcp_lookup_failure = failure
+        self.get_logger().warning(failure)
+
+    def _tcp_pose_available(self):
         try:
-            tcp_rotation = self._matrix_from_quaternion_xyzw(
-                tcp_pose.pose.orientation.x,
-                tcp_pose.pose.orientation.y,
-                tcp_pose.pose.orientation.z,
-                tcp_pose.pose.orientation.w,
-            )
+            self._lookup_tcp_frame(Time())
         except RoutePlanningError as error:
-            self.get_logger().warning(f"TCP 보정 실패: {error}")
-            return
-        tcp_position = self._xyz(tcp_pose.pose.position)
-        self.control_to_tcp_rotation = link_rotation.T @ tcp_rotation
-        self.control_to_tcp_translation = link_rotation.T @ (
-            tcp_position - link_position
-        )
-        self.get_logger().info(
-            f"{CONTROL_FRAME} → TCP 보정: translation="
-            f"{np.round(self.control_to_tcp_translation, 5)} m"
-        )
+            self._report_tcp_lookup_failure(str(error))
+            return False
+        self._last_tcp_lookup_failure = None
+        return True
 
     def _current_tcp_pose(self):
-        """보정된 link_6 → TCP 변환을 현재 link_6 TF에 적용한다."""
-        if (
-            self.control_to_tcp_rotation is None
-            or self.control_to_tcp_translation is None
-        ):
-            raise RoutePlanningError(
-                "link_6 → TCP 보정이 아직 없습니다. GPU PC 1의 planning scene "
-                "robot_tcp_pose를 먼저 받아야 합니다."
-            )
-        link_rotation, link_position = self._lookup_control_frame(Time())
-        tcp_position = link_position + link_rotation @ self.control_to_tcp_translation
-        tcp_rotation = link_rotation @ self.control_to_tcp_rotation
-        quaternion = self._quaternion_xyzw_from_matrix(tcp_rotation)
+        """Read the current world-to-palm TF and apply the palm-local TCP offset."""
+        palm_rotation, palm_position = self._lookup_tcp_frame(Time())
+        tcp_position = palm_position + palm_rotation @ np.array(
+            [0.0, PALM_TO_TCP_Y_M, 0.0],
+            dtype=float,
+        )
+        quaternion = self._quaternion_xyzw_from_matrix(palm_rotation)
         value = PoseStamped()
         value.header.stamp = self.get_clock().now().to_msg()
         value.header.frame_id = "world"
@@ -393,7 +372,6 @@ class HarvestCoordinator(Node):
             return
         self.planning_scene = message
         self.snapshot_request_pending = False
-        self._calibrate_control_frame_to_tcp(message)
         self.get_logger().info(
             f"planning scene 동기화: reset={message.reset_id}, "
             f"version={message.scene_version}, obstacles={len(message.obstacles)}"
@@ -458,6 +436,8 @@ class HarvestCoordinator(Node):
         ):
             self.planning_scene = None
             self.request_snapshot()
+            return False
+        if self.execute_enabled and not self._tcp_pose_available():
             return False
         return True
 
