@@ -33,22 +33,22 @@ Shared contracts and documentation include `appleproj_interfaces/`, `docs/`,
 not owned exclusively by one PC. Modify a shared file only after the user
 explicitly approves that exact file and scope, and report every affected PC.
 
-The active implementation scope for this working environment is Personal PC 1.
+The active implementation scope is task-specific and must be established from
+the user's request and the execution PC. This document does not designate one
+PC as the permanent current work environment.
 
-- Modify only Personal PC 1-owned source and tests after the normal approval gate.
-- For GPU PC 1, GPU PC 2, or Personal PC 2-owned source, perform read-only
-  inspection and provide a concrete change proposal or handoff instructions;
-  do not edit the file.
+- Before every source edit, state which PC executes the code and confirm that
+  the file belongs to that PC. If ownership is missing or ambiguous, stop and
+  ask the user instead of editing.
+- Do not make opportunistic edits to another PC's source while changing shared
+  interfaces or documentation.
 - A request to fix system behavior does not by itself transfer ownership of the
   executing PC's source. If the fix belongs to another PC, identify that owner
-  and propose the required file, function, behavior, and verification steps.
-- Before every source edit, state which PC executes the code and confirm that
-  the file is Personal PC 1-owned. If ownership is missing or ambiguous, stop
-  and ask the user instead of editing.
-- Do not make opportunistic edits to another PC's source while changing shared
-  interfaces or Personal PC 1 code.
-- Changing this ownership boundary requires an explicit user request to revise
-  the ownership rule itself.
+  and obtain the required approval for the file and scope.
+- When a change is needed in another PC's source, submit a modification review
+  request to that PC's owner instead of editing the file. Include the target
+  file and function, observed problem, proposed behavior, interface impact,
+  and verification steps.
 
 ## Required documentation routing
 
