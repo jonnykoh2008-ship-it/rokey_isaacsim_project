@@ -1,5 +1,16 @@
 # TF 및 시뮬레이션 시간
 
+## TF 발행
+
+- `world → odom`: GPU PC 1이 static identity transform으로 발행한다.
+- `odom → base_link`: GPU PC 1이 Isaac Sim transform으로 `/tf`에 발행한다.
+  MVP에서는 고정값이지만, 3차 레일 도입 시 동적 변환으로 확장한다.
+- `base_link → robot links`: GPU PC 1의 Isaac Sim
+  `ROS2PublishTransformTree`가 `/tf`에 발행한다.
+  `robot_state_publisher`는 사용하지 않아 중복 TF를 방지한다.
+- 카메라 고정 TF: Isaac Sim Action Graph가 `/tf_static`으로 발행한다.
+- 동일한 TF를 두 노드가 중복 발행하지 않는다.
+
 ## 좌표계
 
 - `world`
@@ -12,15 +23,6 @@
 - `tree_<id>`
 - `apple_<id>`
 - `conveyor_<id>`
-
-## TF 발행
-
-- `odom → base_link`: Isaac Sim ROS 2 Bridge의 Odometry Publisher
-- `base_link → robot links`: `robot_state_publisher`, `/joint_states` 기반
-- 카메라 고정 TF: Isaac Sim Action Graph
-- 동일한 TF를 두 노드가 중복 발행하지 않는다.
-
-M0617이 고정 설치된 MVP에서는 `odom → base_link`가 변하지 않는다. 3차 레일 도입 시 동적 변환으로 확장한다.
 
 ## 수확 TCP와 Lula 제어 프레임
 
