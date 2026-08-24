@@ -119,6 +119,7 @@ ERROR_CODES = {
 
 CAMERA_PATH = "/World/base_rsd455/RSD455/Camera_OmniVision_OV9782_Color"
 CAMERA_GRAPH_PATH = "/BaseCameraRosGraph"
+ROBOT_TF_GRAPH_PATH = "/RobotTfRosGraph"
 
 
 def _multiply_xyzw(a, b):
@@ -196,6 +197,126 @@ def create_base_camera_graph(stage):
                     ("Tf.inputs:childFrameId", "base_camera"),
                     ("Tf.inputs:staticPublisher", True),
                     ("Tf.inputs:translation", position), ("Tf.inputs:rotation", rotation),
+                ],
+            },
+        )
+
+
+def create_robot_tf_graph(stage):
+    """M0617의 /joint_states와 전체 로봇 TF를 /clock 시각으로 발행한다.
+
+    docs/architecture/tf_frames.md의 구조를 따른다.
+
+        world → odom → base_link → link_1 … link_6 → palm → 손가락
+
+    `world → odom`은 항등, `odom → base_link`는 MVP에서 로봇이 고정이므로
+    USD에서 읽은 고정 변환이다. 로봇 링크만 Isaac이 동적으로 발행한다.
+
+    레일(`m0617_rail`)은 TF 대상에서 제외한다. 레일 URDF의 베이스 링크
+    이름이 `world`라서 ROS의 `world` 프레임과 충돌하기 때문이다. 그 prim은
+    참조 에셋에서 들어오고 articulation root joint와 rail_joint가 경로로
+    참조하고 있어 rename할 수 없다. MVP에서 레일은 고정이므로 TF에서 빠져도
+    무방하며, 3차 레일 도입 시 재설계한다.
+
+    같은 TF를 두 노드가 중복 발행하지 않도록 robot_state_publisher는 쓰지
+    않는다.
+    """
+    # ArticulationRootAPI는 Xform이 아니라 root_joint에 적용돼 있다
+    # (apple_pick.validate_articulation_setup 참고). SingleManipulator는
+    # 하위를 탐색해 찾아내지만 OmniGraph 노드는 정확한 prim을 요구하므로
+    # ARTICULATION_PRIM_PATH를 주면 "is not an articulation"으로 실패한다.
+    articulation_path = harvest.ARTICULATION_ROOT_JOINT_PATH
+    articulation = harvest.require_prim(stage, articulation_path)
+    if not articulation.HasAPI(harvest.UsdPhysics.ArticulationRootAPI):
+        raise RuntimeError(
+            f"Articulation Root API가 없습니다: {articulation_path}"
+        )
+    if stage.GetPrimAtPath(ROBOT_TF_GRAPH_PATH).IsValid():
+        raise RuntimeError(f"로봇 TF 그래프가 이미 존재합니다: {ROBOT_TF_GRAPH_PATH}")
+    enable_extension("isaacsim.ros2.bridge")
+    harvest.simulation_app.update()
+
+    # TF가 USD 월드 기준인지 대조할 수 있게 기준값을 남긴다. 카메라 static
+    # TF와 같은 좌표계여야 detector가 낸 사과 좌표와 로봇이 맞물린다.
+    base_world, _base_quat = harvest.get_prim_world_pose(
+        stage, harvest.ROBOT_BASE_PATH
+    )
+    # 레일의 `world` 링크를 피하려고 로봇 서브트리의 rigid body만 고른다.
+    # base_link는 parentPrim이므로 자기참조를 막기 위해 제외한다.
+    robot_root = harvest.require_prim(stage, harvest.ROBOT_PRIM_PATH)
+    link_paths = [
+        str(prim.GetPath())
+        for prim in Usd.PrimRange(robot_root)
+        if prim.HasAPI(harvest.UsdPhysics.RigidBodyAPI)
+        and str(prim.GetPath()) != harvest.ROBOT_BASE_PATH
+    ]
+    if not link_paths:
+        raise RuntimeError(
+            f"로봇 링크를 찾지 못했습니다: {harvest.ROBOT_PRIM_PATH}"
+        )
+    # get_prim_world_pose는 wxyz를 돌려주지만 RawTransformTree는 xyzw를
+    # 요구한다(카메라 노드와 동일 규약). 순서를 바꾸지 않으면 회전이 어긋난다.
+    base_quat = [
+        float(_base_quat[1]),
+        float(_base_quat[2]),
+        float(_base_quat[3]),
+        float(_base_quat[0]),
+    ]
+    print(f"   Robot TF     articulation {articulation_path}")
+    print(f"   Robot TF     base_link USD world {harvest.vec(base_world)}")
+    print(f"   Robot TF     동적 링크 {len(link_paths)}개 (레일 제외)")
+
+    k = og.Controller.Keys
+    with Usd.EditContext(stage, stage.GetSessionLayer()):
+        og.Controller.edit(
+            {"graph_path": ROBOT_TF_GRAPH_PATH, "evaluator_name": "execution",
+             "pipeline_stage": og.GraphPipelineStage.GRAPH_PIPELINE_STAGE_SIMULATION},
+            {
+                k.CREATE_NODES: [
+                    ("Tick", "omni.graph.action.OnPlaybackTick"),
+                    ("Time", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                    ("JointState", "isaacsim.ros2.bridge.ROS2PublishJointState"),
+                    ("WorldOdom", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
+                    ("OdomBase", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
+                    ("RobotTf", "isaacsim.ros2.bridge.ROS2PublishTransformTree"),
+                ],
+                k.CONNECT: [
+                    ("Tick.outputs:tick", "JointState.inputs:execIn"),
+                    ("Time.outputs:simulationTime", "JointState.inputs:timeStamp"),
+                    ("Tick.outputs:tick", "WorldOdom.inputs:execIn"),
+                    ("Time.outputs:simulationTime", "WorldOdom.inputs:timeStamp"),
+                    ("Tick.outputs:tick", "OdomBase.inputs:execIn"),
+                    ("Time.outputs:simulationTime", "OdomBase.inputs:timeStamp"),
+                    ("Tick.outputs:tick", "RobotTf.inputs:execIn"),
+                    ("Time.outputs:simulationTime", "RobotTf.inputs:timeStamp"),
+                ],
+                k.SET_VALUES: [
+                    ("JointState.inputs:targetPrim",
+                     [usdrt.Sdf.Path(articulation_path)]),
+                    ("JointState.inputs:topicName", "/joint_states"),
+                    # world → odom: MVP에서는 항등 변환이다.
+                    ("WorldOdom.inputs:topicName", "/tf_static"),
+                    ("WorldOdom.inputs:parentFrameId", "world"),
+                    ("WorldOdom.inputs:childFrameId", "odom"),
+                    ("WorldOdom.inputs:staticPublisher", True),
+                    ("WorldOdom.inputs:translation", [0.0, 0.0, 0.0]),
+                    ("WorldOdom.inputs:rotation", [0.0, 0.0, 0.0, 1.0]),
+                    # odom → base_link: USD 조립 자세에서 읽은 고정 변환이다.
+                    # 카메라 static TF와 동일한 방식이라 좌표계가 일치한다.
+                    ("OdomBase.inputs:topicName", "/tf_static"),
+                    ("OdomBase.inputs:parentFrameId", "odom"),
+                    ("OdomBase.inputs:childFrameId", "base_link"),
+                    ("OdomBase.inputs:staticPublisher", True),
+                    ("OdomBase.inputs:translation", list(base_world)),
+                    ("OdomBase.inputs:rotation", base_quat),
+                    # base_link 기준으로 로봇 링크만 동적 발행한다.
+                    # articulation 전체를 주면 레일의 `world` 링크까지 딸려와
+                    # ROS world 프레임과 충돌하므로 링크를 명시한다.
+                    ("RobotTf.inputs:topicName", "/tf"),
+                    ("RobotTf.inputs:parentPrim",
+                     [usdrt.Sdf.Path(harvest.ROBOT_BASE_PATH)]),
+                    ("RobotTf.inputs:targetPrims",
+                     [usdrt.Sdf.Path(path) for path in link_paths]),
                 ],
             },
         )
@@ -455,7 +576,7 @@ class MotionEngine:
         self.expected_index = 0
         self.fsm = None
         self.collision_motion = None
-        self.joint_break = harvest.JointBreakMonitor()
+        self.joint_break = harvest.JointBreakMonitor(stage)
         self.tree_contact = harvest.RobotTreeContactMonitor(stage)
         self.apple_contact = harvest.RobotAppleContactMonitor(stage)
         self.gripper_drive_max_force = harvest.GRIPPER_GRASP_MAX_FORCE
@@ -466,6 +587,8 @@ class MotionEngine:
         self.progress_tcp_position = None
         self.progress_tcp_rotation = None
         self.entry_preshape = harvest.GRIPPER_OPEN.copy()
+        # swept clearance를 측정한 시점의 기준 자세와 여유이다.
+        self.entry_reference = None
 
     def close(self):
         self.joint_break.close()
@@ -498,6 +621,7 @@ class MotionEngine:
         self.tree_contact.reset()
         self.apple_contact.reset()
         self.entry_preshape = harvest.GRIPPER_OPEN.copy()
+        self.entry_reference = None
 
     def _hold_robot(self):
         """실행 실패 시 후퇴 동작 없이 현재 관절 위치를 유지한다."""
@@ -667,6 +791,11 @@ class MotionEngine:
     def _wait_for_gripper_open_before_enter(self, handle, apple_center):
         """실제 collider swept clearance가 가장 큰 entry pre-shape를 선택한다."""
         hold_arm_positions = self._require_arm_joint_positions().copy()
+        # swept clearance는 이후 ENTER에서 실제로 유지될 자세에서 재야 의미가
+        # 있으므로, 측정 구간부터 진입과 같은 Drive 토크를 사용한다.
+        self._set_gripper_drive_max_force(
+            harvest.GRIPPER_ENTRY_MAX_FORCE, "ENTRY_PRESHAPE", report=True
+        )
         # 이 구간은 팔을 고정한 채 그리퍼만 움직이므로 TCP는 설계상 정지해
         # 있다. TCP 진전 기반 watchdog을 그대로 두면 정상 동작이
         # MOTION_TIMEOUT으로 오판되므로 명시적으로 중단한다. 대신 아래
@@ -757,9 +886,27 @@ class MotionEngine:
                 f"candidate={name}, closest={closest_path}",
             )
         self.entry_preshape = target.copy()
+        # ENTER는 이 자세에서 사과 중심을 향한 순수 평행이동을 가정하고 측정한
+        # 여유로 진입한다. 실제 팔은 남은 위치/자세 오차를 진입 중에 함께
+        # 보정하므로 기준값을 남겨 매 검사마다 실측과 대조한다.
+        _measured_tcp, measured_rotation = self._current_tcp_pose()
+        lever_arm = harvest.compute_gripper_entry_lever_arm(self.stage, tcp)
+        self.entry_reference = {
+            "tcp": tcp.copy(),
+            "rotation": measured_rotation.copy(),
+            "apple_center": harvest.np.asarray(apple_center, dtype=float).copy(),
+            "direction": harvest.np.asarray(apple_center, dtype=float) - tcp,
+            "clearance": float(clearance),
+            "lever_arm": float(lever_arm),
+        }
         print(
             f"   [OPEN READY] {name}: swept clearance {clearance:.4f} m, "
             f"closest={closest_path}"
+        )
+        print(
+            f"   [ENTRY BUDGET] 여유 {clearance:.4f} m, "
+            f"회전 지렛대 {lever_arm:.4f} m "
+            f"(1 deg 회전 = {harvest.np.deg2rad(1.0) * lever_arm * 1000:.1f} mm)"
         )
         self.feedback(handle, "GRIPPER_OPEN_READY", 0.4)
 
@@ -1098,6 +1245,80 @@ class MotionEngine:
                 f"{harvest.APPLE_GRASP_MAX_DISTANCE_M:.4f} m",
             )
 
+    def _gripper_preshape_deviation(self):
+        """진입 중 실제 그리퍼 관절이 측정 자세에서 얼마나 벗어났는지 반환한다."""
+        try:
+            actual = self._require_gripper_joint_positions()
+        except MotionExecutionError:
+            return None
+        return float(
+            harvest.np.max(harvest.np.abs(actual - self.entry_preshape))
+        )
+
+    def _entry_drift(self):
+        """측정 전제에서 팔이 벗어난 양을 위치분과 회전분으로 나눠 반환한다."""
+        reference = self.entry_reference
+        if reference is None:
+            return None
+        position, rotation = self._current_tcp_pose()
+        lateral = harvest.point_to_line_distance(
+            position, reference["tcp"], reference["direction"]
+        )
+        rotation_rad = harvest.np.deg2rad(
+            harvest.rotation_error_deg(rotation, reference["rotation"])
+        )
+        return lateral, rotation_rad * reference["lever_arm"], reference["clearance"]
+
+    def _check_entry_arm_deviation(self, motion_state):
+        """진입 중 실제 남은 swept clearance를 다시 재서 판정한다.
+
+        측정 여유에서 이탈량을 빼는 방식은 횡방향 이탈과 손목 회전이 모두
+        사과 쪽을 향한다고 보고 단순 합산하므로 지나치게 보수적이다. 현재
+        자세에서 clearance를 다시 재면 팔이 어떤 경로로 왔는지와 무관하게
+        실제 남은 여유를 알 수 있다. 이탈량은 원인 파악용 로그로만 남긴다.
+        """
+        if motion_state not in {"ENTER", "ENTER_SLOW"}:
+            return
+        if self.entry_reference is None:
+            return
+        if self.fsm.frame % harvest.ENTRY_LIVE_CHECK_INTERVAL_STEPS != 0:
+            return
+        position, _rotation = self._current_tcp_pose()
+        clearance, closest_path = harvest.compute_gripper_entry_swept_clearance(
+            self.stage,
+            position,
+            self.entry_reference["apple_center"],
+            self.apple_radius,
+            vertices_only=True,
+        )
+        if self.fsm.frame % 60 == 0:
+            drift = self._entry_drift()
+            detail = ""
+            if drift is not None:
+                lateral, swing, measured = drift
+                # 손가락 편차도 같이 찍어 팔 이탈과 그리퍼 처짐을 구분한다.
+                preshape = self._gripper_preshape_deviation()
+                preshape_text = (
+                    "n/a" if preshape is None else f"{preshape:.4f} rad"
+                )
+                detail = (
+                    f", lateral {lateral * 1000:.1f} mm, "
+                    f"swing {swing * 1000:.1f} mm, "
+                    f"측정시 {measured * 1000:.1f} mm, finger {preshape_text}"
+                )
+            print(
+                f"   [ENTRY LIVE] {motion_state} frame {self.fsm.frame}: "
+                f"실측 여유 {clearance * 1000:.1f} mm{detail}"
+            )
+        if clearance < harvest.ENTRY_LIVE_MIN_CLEARANCE_M:
+            raise MotionExecutionError(
+                "302:COLLISION_RISK",
+                f"{motion_state} 중 실측 swept clearance가 "
+                f"{clearance * 1000:.1f} mm로 한계 "
+                f"{harvest.ENTRY_LIVE_MIN_CLEARANCE_M * 1000:.1f} mm 아래입니다: "
+                f"closest={closest_path}. 사과에 닿기 전에 진입을 중단합니다.",
+            )
+
     def _handle_entry_apple_contact(self, motion_state, arm_positions):
         """ENTER 접촉 순서를 검사하고 palm 접촉이면 즉시 현재 pose를 유지한다."""
         if motion_state not in {"ENTER", "ENTER_SLOW"}:
@@ -1254,6 +1475,15 @@ class MotionEngine:
                     report=reported_force_state != "HOLD",
                 )
                 reported_force_state = "HOLD"
+            elif motion_state in {"PREGRASP", "ENTER", "ENTER_SLOW"}:
+                # 진입 중 손가락이 측정 자세를 유지해야 swept clearance 판정이
+                # 유효하다. GRASP 저토크는 사과 접촉 직전에만 적용한다.
+                self._set_gripper_drive_max_force(
+                    harvest.GRIPPER_ENTRY_MAX_FORCE,
+                    motion_state,
+                    report=reported_force_state != "ENTRY",
+                )
+                reported_force_state = "ENTRY"
             elif motion_state in {"RELEASE", "LIFT", "EXIT"}:
                 self._set_gripper_drive_max_force(
                     harvest.GRIPPER_GRASP_MAX_FORCE,
@@ -1318,6 +1548,7 @@ class MotionEngine:
             self._handle_entry_apple_contact(
                 motion_state, self._require_arm_joint_positions()
             )
+            self._check_entry_arm_deviation(motion_state)
             if self.tree_contact.detected:
                 raise MotionExecutionError(
                     "302:COLLISION_RISK",
@@ -1353,6 +1584,10 @@ def main():
         physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0,
     )
     robot = harvest.create_robot(world)
+    # create_robot 안의 world.reset()이 articulation과 PhysX view를 초기화한
+    # 뒤라야 TF/JointState 노드가 articulation을 찾을 수 있다. 그 전에 그래프를
+    # 만들면 "did not match any articulations"로 빈 TF만 발행된다.
+    create_robot_tf_graph(stage)
     rclpy.init()
     node = RobotMotionNode()
     engine = MotionEngine(
