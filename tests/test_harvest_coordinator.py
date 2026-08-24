@@ -1,4 +1,5 @@
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,7 +9,6 @@ from appleproj_interfaces.msg import PlanningScene, SimulationState
 from geometry_msgs.msg import PoseStamped
 from harvest_coordinator import HarvestCoordinator
 from harvest_route_planner import RoutePlanningError
-from std_msgs.msg import Header
 
 
 class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
@@ -20,6 +20,19 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator.failed_target = None
         coordinator.execute_enabled = True
         coordinator.running = False
+        coordinator._sample_target_key = None
+        coordinator._active_target_key = None
+        coordinator._latest_target_stamps = {}
+        coordinator._started_target_keys = set()
+        coordinator.target_max_age_sec = None
+        coordinator.minimum_target_confidence = None
+        coordinator.minimum_valid_depth_ratio = None
+        coordinator.maximum_tf_time_error_sec = None
+        coordinator.generation = 0
+        coordinator.goal_handle = None
+        coordinator.approach_orientation = None
+        coordinator.target = None
+        coordinator.samples = deque(maxlen=1)
         coordinator._last_tcp_lookup_failure = None
         coordinator.tf_buffer = Mock()
         coordinator.tf_buffer.all_frames_as_string.return_value = "world -> palm"
@@ -41,11 +54,47 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         return coordinator
 
     @staticmethod
+    def target_message(
+        *,
+        target_id="apple-1",
+        stamp_sec=10,
+        source_stamp_sec=None,
+        frame_id="world",
+        source_frame="base_camera",
+        confidence=0.9,
+        valid_depth_ratio=0.8,
+        tf_time_error_sec=0.01,
+    ):
+        if source_stamp_sec is None:
+            source_stamp_sec = stamp_sec
+        return SimpleNamespace(
+            header=SimpleNamespace(
+                frame_id=frame_id,
+                stamp=SimpleNamespace(sec=stamp_sec, nanosec=0),
+            ),
+            target_id=target_id,
+            reset_id=2,
+            scene_version=3,
+            position=SimpleNamespace(x=0.8, y=0.4, z=1.2),
+            source_point=SimpleNamespace(
+                header=SimpleNamespace(
+                    frame_id=source_frame,
+                    stamp=SimpleNamespace(sec=source_stamp_sec, nanosec=0),
+                ),
+                point=SimpleNamespace(x=0.1, y=0.2, z=0.7),
+            ),
+            confidence=confidence,
+            valid_depth_ratio=valid_depth_ratio,
+            tf_time_error_sec=tf_time_error_sec,
+        )
+
+    @staticmethod
     def state(state, reset_id=2, scene_version=3):
         return SimpleNamespace(
             state=state,
             reset_id=reset_id,
             scene_version=scene_version,
+            message="test",
         )
 
     @staticmethod
@@ -65,6 +114,31 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
             self.assertFalse(coordinator._planning_inputs_synchronized())
 
         coordinator.request_snapshot.assert_not_called()
+
+    def test_harvest_target_contract_accepts_valid_message(self):
+        coordinator = self.make_coordinator()
+
+        self.assertIsNone(
+            coordinator._validate_target(self.target_message())
+        )
+
+    def test_harvest_target_contract_rejects_unsynchronized_source_stamp(self):
+        coordinator = self.make_coordinator()
+
+        reason = coordinator._validate_target(
+            self.target_message(source_stamp_sec=9)
+        )
+
+        self.assertIn("timestamp가 일치", reason)
+
+    def test_harvest_target_contract_rejects_invalid_ranges(self):
+        coordinator = self.make_coordinator()
+
+        reason = coordinator._validate_target(
+            self.target_message(confidence=1.1)
+        )
+
+        self.assertIn("confidence", reason)
 
     def test_requests_snapshot_when_ready_without_scene(self):
         coordinator = self.make_coordinator()
@@ -164,7 +238,7 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
             [0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)],
         )
 
-    def test_approach_plan_moves_then_rotates_at_same_safe_point(self):
+    def test_approach_goal_keeps_path_generation_on_gpu_action_server(self):
         coordinator = self.make_coordinator()
         coordinator.simulation_state = self.state(SimulationState.PLAYING)
         scene = PlanningScene()
@@ -183,43 +257,47 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         current_tcp.pose.orientation.w = np.sqrt(0.5)
         coordinator._current_tcp_pose = Mock(return_value=current_tcp)
 
-        _, _, waypoints, approach_orientation = coordinator._prepare_approach_plan(
-            np.array([0.8, 0.4, 1.2]),
-            Header(),
+        reset_id, scene_version, approach_orientation = (
+            coordinator._prepare_approach_goal(
+                np.array([0.8, 0.4, 1.2]),
+            )
         )
 
-        self.assertEqual(len(waypoints), 3)
-        np.testing.assert_allclose(
-            [
-                waypoints[0].pose.position.x,
-                waypoints[0].pose.position.y,
-                waypoints[0].pose.position.z,
-            ],
-            [
-                waypoints[1].pose.position.x,
-                waypoints[1].pose.position.y,
-                waypoints[1].pose.position.z,
-            ],
+        self.assertEqual((reset_id, scene_version), (2, 3))
+        self.assertEqual(approach_orientation.shape, (4,))
+        self.assertAlmostEqual(np.linalg.norm(approach_orientation), 1.0)
+        coordinator._current_tcp_pose.assert_not_called()
+
+    def test_accepted_approach_marks_target_as_started(self):
+        coordinator = self.make_coordinator()
+        coordinator.running = True
+        coordinator.index = 0
+        coordinator.generation = 4
+        coordinator._active_target_key = (2, "apple-1")
+        result_future = Mock()
+        result_future.add_done_callback = Mock()
+        handle = Mock(accepted=True)
+        handle.get_result_async.return_value = result_future
+        future = Mock()
+        future.result.return_value = handle
+
+        coordinator.on_goal_response(future, generation=4)
+
+        self.assertIn((2, "apple-1"), coordinator._started_target_keys)
+        self.assertIs(coordinator.goal_handle, handle)
+
+    def test_reset_change_clears_started_target_keys(self):
+        coordinator = self.make_coordinator()
+        coordinator._started_target_keys.add((2, "apple-1"))
+        coordinator.simulation_state = self.state(
+            SimulationState.PLAYING, reset_id=2, scene_version=3
         )
-        np.testing.assert_allclose(
-            [
-                waypoints[0].pose.orientation.x,
-                waypoints[0].pose.orientation.y,
-                waypoints[0].pose.orientation.z,
-                waypoints[0].pose.orientation.w,
-            ],
-            [0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)],
+
+        coordinator.on_state(
+            self.state(SimulationState.READY, reset_id=3, scene_version=1)
         )
-        np.testing.assert_allclose(
-            [
-                waypoints[-1].pose.orientation.x,
-                waypoints[-1].pose.orientation.y,
-                waypoints[-1].pose.orientation.z,
-                waypoints[-1].pose.orientation.w,
-            ],
-            approach_orientation,
-        )
-        coordinator._current_tcp_pose.assert_called_once_with()
+
+        self.assertEqual(coordinator._started_target_keys, set())
 
     def test_tcp_lookup_failure_is_logged_once(self):
         coordinator = self.make_coordinator()

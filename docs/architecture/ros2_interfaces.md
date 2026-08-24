@@ -12,6 +12,8 @@
 - 상태·결과 메시지는 신뢰성 우선 QoS를 사용한다. 정확한 QoS는 TBD다.
 - v2.0에서 영상의 송신·센서 권위자는 GPU PC 1이고, 영상 수신·사과 3D 좌표
   계산·target 발행 주체는 개인 PC 1이다.
+- `/harvest/target`은 개인 PC 1에서 GPU PC 1으로 전달하는 수확 전용 target
+  계약이며, `/harvest/perception_status`는 target 생성 전후의 인식 상태 계약이다.
 - v2.0에서 경로 계획·궤적 생성·로봇 실행의 권위자는 GPU PC 1이다. 개인 PC 1은
   최종 waypoint를 발행하지 않는다.
 
@@ -22,7 +24,8 @@
 | Topic | `/base_camera/color/image_raw` | `sensor_msgs/msg/Image` (raw) | GPU PC 1 | 개인 PC 1 |
 | Topic | `/base_camera/depth/image_raw` | `sensor_msgs/msg/Image` (raw) | GPU PC 1 | 개인 PC 1 |
 | Topic | `/base_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | GPU PC 1 | 개인 PC 1 |
-| Topic | `/harvest/target` | custom target 메시지 (`TBD`) | 개인 PC 1 | GPU PC 1 |
+| Topic | `/harvest/target` | `appleproj_interfaces/msg/HarvestTarget` | 개인 PC 1 | GPU PC 1 |
+| Topic | `/harvest/perception_status` | `appleproj_interfaces/msg/HarvestPerceptionStatus` | 개인 PC 1 | GPU PC 1·모니터링 |
 | Topic | `/simulation/state` | `appleproj_interfaces/msg/SimulationState` | GPU PC 1 | 개인 PC 1 |
 | Topic | `/planning_scene` | `appleproj_interfaces/msg/PlanningScene` | GPU PC 1 | 개인 PC 1 |
 | Service | `/planning_scene/get_snapshot` | `appleproj_interfaces/srv/GetPlanningScene` | GPU PC 1 | 개인 PC 1 (debug/RViz) |
@@ -30,7 +33,7 @@
 | Topic | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | GPU PC 1 | 개인 PC 1·개인 PC 2 |
 | Topic | `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` (`TBD`) | GPU PC 1 | 개인 PC 1 RViz |
 | Topic | `/harvest/planned_path` | `nav_msgs/msg/Path` (`TBD`) | GPU PC 1 | 개인 PC 1 RViz |
-| Topic | `/quality/inspection_images` | `appleproj_interfaces/msg/InspectionImage` | GPU PC 1 | GPU PC 2 |
+| Topic | 컨베이어 raw RGB/depth/CameraInfo 토픽 (`TBD`) | `sensor_msgs/msg/Image`, `sensor_msgs/msg/CameraInfo` | GPU PC 1 | GPU PC 2 |
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
 | Service | `/quality/retry_inspection` | `appleproj_interfaces/srv/RetryInspection` | GPU PC 1 | 개인 PC 2 |
 | Topic | `/conveyor/checkpoint_events` | `appleproj_interfaces/msg/CheckpointEvent` | GPU PC 1 | 개인 PC 2 |
@@ -50,25 +53,54 @@ Action과 Service 표에서 서버는 요청을 실행하는 쪽이고 클라이
 
 ```text
 토픽: /harvest/target
-타입: custom target 메시지 (`TBD`)
+타입: appleproj_interfaces/msg/HarvestTarget
+송신: 개인 PC 1
+수신: GPU PC 1
+QoS: Reliable, Volatile, Keep Last 1
 frame_id: world
-의미: 개인 PC 1이 RGB-D로 계산한 사과 중심과 검증 메타데이터
 ```
 
-필요 필드 후보:
+필드:
 
-- `header`: 영상 촬영 시각, `frame_id=world`
-- `position`: 사과 중심
-- `target_id` 또는 `apple_id`
-- `reset_id`
-- `confidence`
-- depth 유효성·TF 시간 오차·검출 상태
+- `header`: RGB-D 촬영 시각, `/clock` 기준, `frame_id=world`
+- `target_id`: 동일 `reset_id` 내 수확 대상 식별자
+- `reset_id`, `scene_version`: 개인 PC 1이 마지막으로 확인한 SimulationState 세대
+- `position`: world 좌표계 사과 중심
+- `source_point`: world 변환 전 카메라 좌표 검출점
+- `confidence`: 0.0~1.0 검출 신뢰도
+- `valid_depth_ratio`: 검출 영역 내 유효 depth 픽셀 비율
+- `tf_time_error_sec`: 영상 timestamp와 사용 TF timestamp의 절대 차이
 
-최종 메시지 이름, 필드, QoS 및 기존 `/harvest/target_pose` 호환 여부는 `TBD`다.
-개인 PC 1은 orientation을 결정하지 않는다. GPU PC 1은 target을 수신할 때 현재
-`reset_id`, timestamp, frame, position 및 confidence를 다시 검증한 뒤, 현재
-로봇 상태와 planning scene에 맞는 접근 orientation과 pre-grasp pose를 결정한다.
-세대가 맞지 않는 target은 계획에 사용하지 않는다.
+GPU PC 1은 다음 조건을 모두 확인한 뒤 target을 계획에 사용한다.
+
+- `SimulationState`가 `READY` 또는 `PLAYING`
+- `header.frame_id == "world"`
+- target timestamp가 stale하지 않음
+- 현재 `reset_id`, `scene_version`과 일치
+- confidence, valid depth ratio, TF 시간 오차가 각 threshold를 만족
+
+confidence·depth·TF 시간 threshold 값은 `TBD`다. 개인 PC 1은 orientation과
+pre-grasp pose를 발행하지 않으며, GPU PC 1이 현재 로봇 상태와 planning scene을
+기준으로 계산한다. 동일 `(reset_id, target_id)`에서는 최신 timestamp만 사용하고,
+Action 실행이 시작된 target의 후속 갱신은 새 Goal로 실행하지 않는다. 실패한 target은
+`/harvest/motion_status`로 거부 사유를 반환한다. `/harvest/target`에는 Transient
+Local을 사용하지 않는다.
+
+## HarvestPerceptionStatus
+
+```text
+토픽: /harvest/perception_status
+타입: appleproj_interfaces/msg/HarvestPerceptionStatus
+송신: 개인 PC 1
+수신: GPU PC 1·모니터링 노드
+QoS: Reliable, Volatile, Keep Last 10
+```
+
+`status` 값은 `OK`, `NO_DETECTION`, `DEPTH_INVALID`, `TF_UNAVAILABLE`,
+`STALE_FRAME`, `LOW_CONFIDENCE`, `RESET_MISMATCH`, `SIMULATION_NOT_READY`,
+`INPUT_NOT_SYNCHRONIZED`, `INTERNAL_ERROR` 중 하나다. target 생성 전 실패한 경우
+`target_id`는 빈 문자열이며, 계산할 수 없는 수치 필드는 NaN으로 채운다. `header`는
+검사 대상 RGB-D 프레임의 촬영 시각과 원본 카메라 frame을 사용한다.
 
 ## SimulationState
 
@@ -134,12 +166,10 @@ admission에 영향을 주지 않는다.
 
 ## InspectionImage
 
-GPU PC 1이 컨베이어 2의 대표 검사 이미지를 GPU PC 2로 전달한다.
-
-```text
-토픽: /quality/inspection_images
-타입: appleproj_interfaces/msg/InspectionImage
-```
+GPU PC 2가 컨베이어 raw 스트림에서 후보 프레임을 수집하고 대표 프레임을 선택한
+뒤 품질 추론에 전달한다. `InspectionImage` 메시지는 GPU PC 2 내부 캡처→추론
+단계의 후보 계약으로 사용할 수 있으며, 별도 cross-PC 토픽으로 발행할지와 토픽
+이름/QoS는 `TBD`다.
 
 필드:
 

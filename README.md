@@ -31,7 +31,9 @@ GPU PC 1: Isaac Sim RGB-D/TF/장애물 발행
 - 영상 기반 수확 인식의 실행 주체는 개인 PC 1이다.
 - 경로 계획, 계획 검증, Action 실행 및 최종 충돌 감시는 GPU PC 1이다.
 - motion planning 시각화 데이터는 GPU PC 1이 발행하고 RViz GUI는 개인 PC 1에서 실행한다.
-- GPU PC 2의 품질 추론과 개인 PC 2의 결과 표시·푸셔 선택은 기존 분리를 유지한다.
+- GPU PC 2는 컨베이어 카메라 영상을 받아 ROI/tracker, 후보 프레임 수집·대표 프레임
+  선택, 품질 추론 및 사과 단위 결과 통합을 수행하고, 개인 PC 2는 결과 표시·푸셔
+  선택을 담당한다.
 
 쉽게 말하면 개인 PC 1은 카메라로 보는 **눈**, GPU PC 1은 경로를 결정하고 로봇을
 움직이는 **두뇌와 팔**, 개인 PC 1의 RViz는 결과를 보는 **화면**이다.
@@ -41,7 +43,7 @@ GPU PC 1: Isaac Sim RGB-D/TF/장애물 발행
 | PC | 담당 기능 | 유지·개발 대상 |
 |---|---|---|
 | GPU PC 1 | Isaac Sim, 물리, 센서·TF·planning scene, Lula RRT/trajectory/RMPflow, 로봇 실행, 충돌 감시, 계획 시각화 | `apple_pick.py`, `vision_apple_pick.py`, `base_camera_publish.py`, planner/executor |
-| GPU PC 2 | 품질 영상 추론 및 사과 단위 품질 결과 통합 | 품질 추론·결과 통합 소스 (`TBD`) |
+| GPU PC 2 | 컨베이어 카메라 수신, ROI/tracker, 후보 프레임 수집·대표 프레임 선택, 품질 영상 추론 및 사과 단위 품질 결과 통합 | 품질 캡처·추론·결과 통합 소스 (`TBD`) |
 | 개인 PC 1 | RGB-D 기반 사과 검출·3D 좌표 계산·target 발행, RViz 원격 표시 | PC1 perception 노드 및 RViz 설정 (`TBD`) |
 | 개인 PC 2 | 모니터링, 품질 결과 표시, 재검 요청, 2차 푸셔 선택 | 모니터링·푸셔 선택 소스 (`TBD`) |
 

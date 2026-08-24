@@ -12,7 +12,7 @@
 | 장비 | IP | 기본 역할 |
 |---|---|---|
 | GPU PC 1 | `10.10.0.1` | Isaac Sim, 센서·TF 발행, Lula RRT/trajectory/RMPflow, 로봇 실행·안전 감시, motion visualization 발행 |
-| GPU PC 2 | `10.10.0.2` | 품질 추론 |
+| GPU PC 2 | `10.10.0.2` | 컨베이어 영상 수신·프레임 수집/선택·품질 추론 |
 | 개인 PC 1 | `10.10.0.3` | RGB-D 수신·사과 3D 좌표 계산·target 발행, RViz 원격 표시 |
 | 개인 PC 2 | `10.10.0.4` | 분류 제어·모니터링 |
 
@@ -26,8 +26,9 @@
 - 수확 v2.0의 RGB와 depth 입력은 raw `sensor_msgs/msg/Image`로 확정한다.
 - GPU PC 1은 RGB/depth/CameraInfo를 개인 PC 1으로 전달하고, 개인 PC 1은 사과
   3D target을 GPU PC 1으로 반환한다. 해상도와 FPS는 별도 시험값으로 관리한다.
-- 수확 입력에는 compressed transport를 사용하지 않는다. 품질검사용
-  `/quality/inspection_images`의 압축 RGB는 별도 계약으로 유지한다.
+- 수확 입력과 컨베이어 품질 입력은 GPU PC 1에서 raw RGB/depth/CameraInfo로
+  발행한다. GPU PC 2가 raw 스트림을 구독해 후보 프레임 수집과 대표 프레임 선택을
+  수행하며, 대표 이미지의 전용 cross-PC 압축 토픽과 이름/QoS는 `TBD`다.
 - motion planning visualization은 GPU PC 1에서 발행하고 개인 PC 1의 RViz가
   원격 표시한다. RViz 데이터는 안전·실행 경로가 아니므로 유실을 허용한다.
 - planning scene은 GPU PC 1에서 RRT/RMPflow에 직접 사용하고, 개인 PC 1에는

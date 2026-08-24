@@ -21,6 +21,7 @@ M0617 + Robotiq 3F 그리퍼 사과 수확 동작
 """
 
 import argparse
+import time
 import traceback
 from pathlib import Path
 
@@ -78,9 +79,11 @@ from isaacsim.robot.manipulators.manipulators import SingleManipulator
 from isaacsim.robot_motion.motion_generation import (
     ArticulationKinematicsSolver,
     ArticulationMotionPolicy,
+    LulaCSpaceTrajectoryGenerator,
     LulaKinematicsSolver,
     RmpFlow,
 )
+from isaacsim.robot_motion.motion_generation.lula import RRT
 
 
 # ══════════════════════════════════════════════════════════════
@@ -90,6 +93,7 @@ PROJECT_DIR = Path(__file__).resolve().parent
 STAGE_PATH = PROJECT_DIR / "m0617_3fgripper08201638.usd"
 DESCRIPTION_PATH = PROJECT_DIR / "m0617_robot_description.yaml"
 RMPFLOW_CONFIG_PATH = PROJECT_DIR / "m0617_rmpflow_config.yaml"
+RRT_CONFIG_PATH = PROJECT_DIR / "m0617_rrt_config.yaml"
 URDF_PATH = (
     PROJECT_DIR
     / "m0617_gripper"
@@ -231,6 +235,19 @@ TREE_OUTSIDE_WAYPOINT_OFFSET_M = 0.45
 RMPFLOW_STALL_STEPS = 120
 RMPFLOW_STALL_POSITION_DELTA_M = 0.005
 RMPFLOW_STALL_ROTATION_DELTA_DEG = 2.0
+
+# Phase 2 M0617 trajectory 시험용 임시 제한. RRT/trajectory 로그와 영상으로
+# 추종성·계획 시간·관절 움직임을 확인한 뒤 정식값 승인 전까지 TBD로 유지한다.
+RRT_TRAJECTORY_VELOCITY_LIMITS = np.array(
+    [0.8, 0.8, 0.8, 1.0, 1.0, 1.0], dtype=float
+)
+RRT_TRAJECTORY_ACCELERATION_LIMITS = np.array(
+    [1.5, 1.5, 2.0, 3.0, 3.0, 3.0], dtype=float
+)
+RRT_TRAJECTORY_JERK_LIMITS = np.array(
+    [20.0, 20.0, 25.0, 40.0, 40.0, 40.0], dtype=float
+)
+RRT_TRAJECTORY_SAMPLE_DT_S = 1.0 / 60.0
 
 # 충돌 시 1e8 수준의 강한 Drive가 컨베이어를 억지로 뚫지 않도록 제한한다.
 # M0617이 느린 보간 목표를 추종할 수 있는 범위에서 보수적으로 낮춘 값이다.
@@ -473,7 +490,13 @@ def open_project_stage():
     """저장된 조립 USD를 열고 모든 참조가 로드될 때까지 기다린다."""
     global APPLE_PATH, BRANCH_BODY_PATH
 
-    for path in (STAGE_PATH, DESCRIPTION_PATH, RMPFLOW_CONFIG_PATH, URDF_PATH):
+    for path in (
+        STAGE_PATH,
+        DESCRIPTION_PATH,
+        RMPFLOW_CONFIG_PATH,
+        RRT_CONFIG_PATH,
+        URDF_PATH,
+    ):
         if not path.exists():
             raise FileNotFoundError(path)
 
@@ -1707,14 +1730,6 @@ class ApproachUnreachableError(RuntimeError):
     """충돌 없는 pre-grasp 경로를 만들거나 실행할 수 없을 때 발생한다."""
 
 
-class CollisionRiskError(ApproachUnreachableError):
-    """외부 경로가 GPU planning proxy와 겹치는 경우 발생한다."""
-
-
-class IkFailedError(ApproachUnreachableError):
-    """외부 waypoint의 순차 IK 검증이 실패한 경우 발생한다."""
-
-
 def _point_to_segment_distances(points, start, end):
     """각 점과 월드 선분 사이의 최단거리를 계산한다."""
     points = np.asarray(points, dtype=float)
@@ -1998,7 +2013,7 @@ def create_planning_obstacles(stage, path_start, pregrasp_tcp, apple_center):
 
 
 class CollisionAwareMotion:
-    """RMPflow와 planning proxy를 소유하는 한 수확 사이클의 motion policy."""
+    """Lula RRT·trajectory·RMPflow와 planning proxy를 소유한다."""
 
     def __init__(
         self,
@@ -2028,8 +2043,28 @@ class CollisionAwareMotion:
             end_effector_frame_name=EE_FRAME_NAME,
             maximum_substep_size=RMPFLOW_MAXIMUM_SUBSTEP_S,
         )
+        self.rrt = RRT(
+            robot_description_path=str(DESCRIPTION_PATH),
+            urdf_path=str(URDF_PATH),
+            rrt_config_path=str(RRT_CONFIG_PATH),
+            end_effector_frame_name=EE_FRAME_NAME,
+        )
+        self.trajectory_generator = LulaCSpaceTrajectoryGenerator(
+            robot_description_path=str(DESCRIPTION_PATH),
+            urdf_path=str(URDF_PATH),
+        )
+        self.trajectory_generator.set_c_space_velocity_limits(
+            RRT_TRAJECTORY_VELOCITY_LIMITS.copy()
+        )
+        self.trajectory_generator.set_c_space_acceleration_limits(
+            RRT_TRAJECTORY_ACCELERATION_LIMITS.copy()
+        )
+        self.trajectory_generator.set_c_space_jerk_limits(
+            RRT_TRAJECTORY_JERK_LIMITS.copy()
+        )
         base_position, base_orientation = get_prim_world_pose(stage, ROBOT_BASE_PATH)
         self.rmpflow.set_robot_base_pose(base_position, base_orientation)
+        self.rrt.set_robot_base_pose(base_position, base_orientation)
         self.articulation_policy = ArticulationMotionPolicy(
             robot,
             self.rmpflow,
@@ -2117,15 +2152,32 @@ class CollisionAwareMotion:
                     f"RMPflow planning obstacle을 추가하지 못했습니다: "
                     f"{obstacle.prim_path}"
                 )
-        arm_indices = [robot.get_dof_index(name) for name in ARM_JOINTS]
+            if not self.rrt.add_obstacle(obstacle, static=True):
+                raise RuntimeError(
+                    f"RRT planning obstacle을 추가하지 못했습니다: "
+                    f"{obstacle.prim_path}"
+                )
+        self.rrt_active_joints = tuple(self.rrt.get_active_joints())
+        self.rrt_watched_joints = tuple(self.rrt.get_watched_joints())
+        if self.rrt_active_joints != tuple(ARM_JOINTS):
+            raise RuntimeError(
+                "M0617 RRT active joint 순서가 실행 관절과 다릅니다: "
+                f"rrt={self.rrt_active_joints}, expected={tuple(ARM_JOINTS)}"
+            )
+        arm_indices = [robot.get_dof_index(name) for name in self.rrt_active_joints]
         current_arm = robot.get_joint_positions(
             joint_indices=np.asarray(arm_indices, dtype=np.int32)
         )
         if current_arm is not None:
             self.rmpflow.set_cspace_target(np.asarray(current_arm, dtype=float))
         self.rmpflow.update_world()
+        self.rrt.update_world()
         self.apple_obstacle_enabled = True
         print(f"   RMPflow      frame {EE_FRAME_NAME}, obstacles {len(self.obstacles)}")
+        print(
+            f"   RRT          frame {EE_FRAME_NAME}, joints "
+            f"{','.join(self.rrt_active_joints)}, obstacles {len(self.obstacles)}"
+        )
         print(f"   Outside TCP  {vec(self.outside_waypoint)}")
 
     @staticmethod
@@ -2306,6 +2358,141 @@ class CollisionAwareMotion:
             rot_matrix_to_quat(link_rotation),
         )
 
+    @staticmethod
+    def _joint_positions(robot, joint_names):
+        """Lula가 선언한 순서 그대로 유효한 관절값을 읽는다."""
+        if not joint_names:
+            return np.empty((0,), dtype=np.float64)
+        indices = np.asarray(
+            [robot.get_dof_index(name) for name in joint_names],
+            dtype=np.int32,
+        )
+        if np.any(indices < 0):
+            raise ApproachUnreachableError(
+                f"RRT 관절을 Articulation에서 찾지 못했습니다: {joint_names}"
+            )
+        positions = robot.get_joint_positions(joint_indices=indices)
+        if positions is None:
+            raise ApproachUnreachableError(
+                f"RRT 관절 위치를 읽지 못했습니다: {joint_names}"
+            )
+        positions = np.asarray(positions, dtype=np.float64)
+        if positions.shape != (len(joint_names),) or not np.all(
+            np.isfinite(positions)
+        ):
+            raise ApproachUnreachableError(
+                f"RRT 관절 위치가 유효하지 않습니다: {positions}"
+            )
+        return positions
+
+    def plan_rrt_trajectory(self, robot, target_tcp, target_rotation, segment_name):
+        """현재 관절에서 TCP 목표까지 RRT 경로와 시간 궤적을 만든다."""
+        target_tcp = np.asarray(target_tcp, dtype=float)
+        target_rotation = np.asarray(target_rotation, dtype=float)
+        link_position, link_rotation = tcp_target_to_link6(
+            target_tcp,
+            target_rotation,
+            self.link6_to_palm_translation,
+            self.link6_to_palm_rotation,
+        )
+        active_positions = self._joint_positions(robot, self.rrt_active_joints)
+        watched_positions = self._joint_positions(robot, self.rrt_watched_joints)
+        self.rrt.update_world()
+        self.rrt.set_end_effector_target(
+            link_position,
+            rot_matrix_to_quat(link_rotation),
+        )
+        started_at = time.perf_counter()
+        path = self.rrt.compute_path(active_positions, watched_positions)
+        planning_time = time.perf_counter() - started_at
+        if path is None:
+            print(
+                f"   [RRT FAILED] {segment_name}: path 없음, "
+                f"planning {planning_time:.3f} s"
+            )
+            return None
+        path = np.asarray(path, dtype=np.float64)
+        if (
+            path.ndim != 2
+            or path.shape[1] != len(self.rrt_active_joints)
+            or path.shape[0] < 2
+            or not np.all(np.isfinite(path))
+        ):
+            raise ApproachUnreachableError(
+                f"RRT가 유효하지 않은 c-space 경로를 반환했습니다: {path.shape}"
+            )
+        start_error = float(np.linalg.norm(path[0] - active_positions))
+        maximum_joint_step = float(
+            np.max(np.linalg.norm(np.diff(path, axis=0), axis=1))
+        )
+        if start_error > 1.0e-3:
+            raise ApproachUnreachableError(
+                f"RRT 경로 시작점이 현재 관절과 다릅니다: {start_error:.6f} rad"
+            )
+        trajectory = self.trajectory_generator.compute_c_space_trajectory(path)
+        if trajectory is None:
+            print(
+                f"   [TRAJECTORY FAILED] {segment_name}: "
+                f"RRT points={len(path)}"
+            )
+            return None
+        duration = float(trajectory.end_time - trajectory.start_time)
+        if not np.isfinite(duration) or duration <= 0.0:
+            raise ApproachUnreachableError(
+                f"Lula trajectory duration이 유효하지 않습니다: {duration}"
+            )
+        # Spline이 관절 limit을 벗어나거나 NaN을 만들지 않는지 60 Hz로
+        # 선검증한다. 이 표본은 검증용이며 실제 실행은 RMPflow가 담당한다.
+        sample_count = max(2, int(np.ceil(duration / RRT_TRAJECTORY_SAMPLE_DT_S)) + 1)
+        lower_limits, upper_limits = (
+            self.trajectory_generator.get_c_space_position_limits()
+        )
+        lower_limits = np.asarray(lower_limits, dtype=float)
+        upper_limits = np.asarray(upper_limits, dtype=float)
+        for sample_time in np.linspace(
+            trajectory.start_time,
+            trajectory.end_time,
+            sample_count,
+        ):
+            joint_target, joint_velocity = trajectory.get_joint_targets(sample_time)
+            joint_target = np.asarray(joint_target, dtype=float)
+            joint_velocity = np.asarray(joint_velocity, dtype=float)
+            if (
+                joint_target.shape != active_positions.shape
+                or joint_velocity.shape != active_positions.shape
+                or not np.all(np.isfinite(joint_target))
+                or not np.all(np.isfinite(joint_velocity))
+            ):
+                raise ApproachUnreachableError(
+                    f"Lula trajectory sample이 유효하지 않습니다: t={sample_time:.3f}"
+                )
+            if np.any(joint_target < lower_limits - 1.0e-6) or np.any(
+                joint_target > upper_limits + 1.0e-6
+            ):
+                raise ApproachUnreachableError(
+                    f"Lula trajectory가 관절 limit을 벗어났습니다: t={sample_time:.3f}"
+                )
+        print(
+            f"   [RRT PLAN] {segment_name}: points={len(path)}, "
+            f"planning={planning_time:.3f} s, max_joint_step={maximum_joint_step:.3f} rad"
+        )
+        print(
+            f"   [TRAJECTORY] {segment_name}: duration={duration:.3f} s, "
+            f"samples={sample_count}"
+        )
+        return trajectory
+
+    def set_trajectory_cspace_target(self, joint_positions):
+        """시간 궤적 표본을 RMPflow c-space 추종 목표로 설정한다."""
+        joint_positions = np.asarray(joint_positions, dtype=float)
+        if joint_positions.shape != (len(self.rrt_active_joints),) or not np.all(
+            np.isfinite(joint_positions)
+        ):
+            raise ApproachUnreachableError(
+                f"RMPflow trajectory target이 유효하지 않습니다: {joint_positions}"
+            )
+        self.rmpflow.set_cspace_target(joint_positions)
+
     def next_action(self):
         self.rmpflow.update_world()
         return self.articulation_policy.get_next_articulation_action()
@@ -2314,7 +2501,10 @@ class CollisionAwareMotion:
         if self.apple_obstacle_enabled:
             if not self.rmpflow.disable_obstacle(self.target_apple):
                 raise RuntimeError("목표 사과 planning obstacle을 해제하지 못했습니다.")
+            if not self.rrt.disable_obstacle(self.target_apple):
+                raise RuntimeError("목표 사과 RRT obstacle을 해제하지 못했습니다.")
             self.rmpflow.update_world()
+            self.rrt.update_world()
             self.apple_obstacle_enabled = False
             print(
                 "   Planning     target apple obstacle disabled at staging "
@@ -2356,15 +2546,13 @@ def move_arm_to_pregrasp(
     approach_rotation,
     max_physics_steps=0,
     contact_guard=None,
-    external_waypoints=None,
-    external_waypoint_rotations=None,
     execution_guard=None,
     pause_callback=None,
     resume_callback=None,
 ):
-    """사과 obstacle staging을 거쳐 충돌 없는 pregrasp 경로를 실행한다."""
+    """GPU PC 1에서 사과 obstacle staging을 거쳐 pregrasp 경로를 실행한다."""
     lateral_axis = np.asarray(approach_rotation[:, 2], dtype=float)
-    # 개인 PC planner 규약: staging/pre-grasp/사과 진입은 항상 world +Z.
+    # GPU PC 1 기본 규약: staging/pre-grasp/사과 진입은 항상 world +Z.
     approach_axis = np.array([0.0, 0.0, 1.0], dtype=float)
     release_offset = APPLE_OBSTACLE_RELEASE_DISTANCE_M - PREGRASP_DISTANCE_M
     if release_offset <= 0.0:
@@ -2503,6 +2691,98 @@ def move_arm_to_pregrasp(
                 )
         return False
 
+    def follow_rrt_waypoint(
+        route_name,
+        waypoint_index,
+        waypoint_count,
+        waypoint,
+        target_rotation,
+        position_tolerance=TARGET_POSITION_TOLERANCE_M,
+        orientation_tolerance=TARGET_ORIENTATION_TOLERANCE_DEG,
+    ):
+        """RRT 궤적을 RMPflow로 추종한 뒤 목표 pose에 정착한다."""
+        nonlocal physics_steps
+        trajectory = collision_motion.plan_rrt_trajectory(
+            robot,
+            waypoint,
+            target_rotation,
+            route_name,
+        )
+        if trajectory is None:
+            return False
+        duration = float(trajectory.end_time - trajectory.start_time)
+        sample_count = max(
+            2,
+            int(np.ceil(duration / RRT_TRAJECTORY_SAMPLE_DT_S)) + 1,
+        )
+        for sample_index, sample_time in enumerate(
+            np.linspace(
+                trajectory.start_time,
+                trajectory.end_time,
+                sample_count,
+            )
+        ):
+            if execution_guard is not None:
+                execution_guard()
+            if not simulation_app.is_running():
+                return None
+            if max_physics_steps > 0 and physics_steps >= max_physics_steps:
+                return None
+            pause_reported = False
+            while not world.is_playing():
+                if execution_guard is not None:
+                    execution_guard()
+                if world.is_stopped() or not simulation_app.is_running():
+                    return None
+                if not pause_reported and pause_callback is not None:
+                    pause_callback()
+                    pause_reported = True
+                world.step(render=not args.headless)
+            if pause_reported and resume_callback is not None:
+                resume_callback()
+            if contact_guard is not None and contact_guard():
+                raise ApproachUnreachableError(
+                    "RRT trajectory 실행 중 목표 사과 stem joint가 파손됐습니다."
+                )
+
+            joint_target, _joint_velocity = trajectory.get_joint_targets(sample_time)
+            collision_motion.set_trajectory_cspace_target(joint_target)
+            action = collision_motion.next_action()
+            positions = action.joint_positions
+            if positions is None or not np.all(np.isfinite(positions)):
+                raise ApproachUnreachableError(
+                    "RRT trajectory 추종 중 RMPflow 관절 목표가 유효하지 않습니다."
+                )
+            robot.apply_action(action)
+            apply_gripper_target(robot, gripper_indices, 0.0)
+            world.step(render=not args.headless)
+            physics_steps += 1
+            if world.is_stopped():
+                return None
+            if contact_guard is not None and contact_guard():
+                raise ApproachUnreachableError(
+                    "RRT trajectory 실행 중 목표 사과 stem joint가 파손됐습니다."
+                )
+            if sample_index == 0 or (sample_index + 1) % 60 == 0:
+                actual_tcp, _actual_rotation = current_tcp_pose(robot)
+                print(
+                    f"   RRT EXEC     {route_name:24s} "
+                    f"{sample_index + 1:3d}/{sample_count} "
+                    f"TCP {vec(actual_tcp)}"
+                )
+
+        # RMPflow가 시간 궤적을 추종하며 남긴 작은 오차만 task-space 목표로
+        # 정착시킨다. 이 단계에서도 동일 planning world와 접촉 감시를 유지한다.
+        return follow_waypoint(
+            route_name,
+            waypoint_index,
+            waypoint_count,
+            waypoint,
+            target_rotation,
+            position_tolerance=position_tolerance,
+            orientation_tolerance=orientation_tolerance,
+        )
+
     def outside_candidate_has_ik(candidate, current_rotation):
         """현재 관절 자세를 seed로 바깥 후보의 세 자세를 순차 검사한다."""
         arm_indices = np.asarray(
@@ -2550,124 +2830,6 @@ def move_arm_to_pregrasp(
         print(f"   Outside IK   {candidate['name']:13s} OK (3 poses)")
         return True
 
-    def external_route_has_ik(waypoints, rotations):
-        """개인 PC가 만든 waypoint를 현재 관절 자세에서 순차 IK 검사한다."""
-
-        arm_indices = np.asarray(
-            [robot.get_dof_index(name) for name in ARM_JOINTS], dtype=np.int32
-        )
-        warm_start = robot.get_joint_positions(joint_indices=arm_indices)
-        if warm_start is None:
-            raise ApproachUnreachableError(
-                "외부 waypoint IK 검사 전에 로봇 관절 위치를 읽지 못했습니다."
-            )
-        warm_start = np.asarray(warm_start, dtype=float)
-        if not np.all(np.isfinite(warm_start)):
-            raise ApproachUnreachableError("외부 waypoint IK seed가 유효하지 않습니다.")
-        for index, (waypoint, waypoint_rotation) in enumerate(
-            zip(waypoints, rotations)
-        ):
-            link_position, link_rotation = tcp_target_to_link6(
-                waypoint,
-                waypoint_rotation,
-                collision_motion.link6_to_palm_translation,
-                collision_motion.link6_to_palm_rotation,
-            )
-            joint_goal, solved = lula_solver.compute_inverse_kinematics(
-                frame_name=EE_FRAME_NAME,
-                target_position=link_position,
-                target_orientation=rot_matrix_to_quat(link_rotation),
-                warm_start=warm_start,
-                position_tolerance=0.005,
-                orientation_tolerance=np.deg2rad(5.0),
-            )
-            if not solved:
-                print(f"   External IK  waypoint {index + 1} FAILED {vec(waypoint)}")
-                return False
-            warm_start = np.asarray(joint_goal, dtype=float)
-        print(f"   External IK  {len(waypoints)} waypoints OK")
-        return True
-
-    if external_waypoints is not None:
-        waypoints = [np.asarray(point, dtype=float) for point in external_waypoints]
-        if external_waypoint_rotations is None:
-            rotations = [np.asarray(approach_rotation, dtype=float)] * len(waypoints)
-        else:
-            rotations = [
-                np.asarray(rotation, dtype=float)
-                for rotation in external_waypoint_rotations
-            ]
-        if not waypoints:
-            raise ApproachUnreachableError("개인 PC의 APPROACH waypoint가 비어 있습니다.")
-        if len(rotations) != len(waypoints):
-            raise ApproachUnreachableError(
-                "외부 waypoint 위치와 자세 개수가 다릅니다."
-            )
-        if any(point.shape != (3,) or not np.all(np.isfinite(point)) for point in waypoints):
-            raise ApproachUnreachableError("개인 PC의 APPROACH waypoint가 유효하지 않습니다.")
-        if any(
-            rotation.shape != (3, 3)
-            or not np.all(np.isfinite(rotation))
-            or not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-4)
-            or np.linalg.det(rotation) < 0.999
-            for rotation in rotations
-        ):
-            raise ApproachUnreachableError(
-                "개인 PC의 APPROACH waypoint orientation이 유효하지 않습니다."
-            )
-        if np.linalg.norm(waypoints[-1] - np.asarray(pregrasp_tcp)) > 0.01:
-            raise ApproachUnreachableError(
-                "외부 경로의 마지막 waypoint가 GPU pregrasp 목표와 일치하지 않습니다."
-            )
-        current_tcp, _ = current_tcp_pose(robot)
-        clearance, obstacle_name = collision_motion._route_clearance(
-            [current_tcp, *waypoints]
-        )
-        if clearance < 0.0:
-            raise CollisionRiskError(
-                f"GPU proxy 재검사에서 외부 경로가 {obstacle_name}과 "
-                f"{clearance:.3f} m 겹칩니다."
-            )
-        if not external_route_has_ik(waypoints, rotations):
-            raise IkFailedError("외부 APPROACH 경로의 순차 IK 검사에 실패했습니다.")
-        print(
-            f"   External plan {len(waypoints)} waypoints, "
-            f"GPU clearance {clearance:.3f} m to {obstacle_name}"
-        )
-        for index, (waypoint, waypoint_rotation) in enumerate(
-            zip(waypoints, rotations)
-        ):
-            final_waypoint = index == len(waypoints) - 1
-            if final_waypoint:
-                collision_motion.disable_target_apple()
-            # 마지막 waypoint가 pre-grasp이며 여기서 swept clearance를 재고
-            # 곧바로 진입하므로 정밀 허용오차를 사용한다.
-            reached = follow_waypoint(
-                "EXTERNAL APPROACH",
-                index + 1,
-                len(waypoints),
-                waypoint,
-                waypoint_rotation,
-                position_tolerance=(
-                    PREGRASP_POSITION_TOLERANCE_M
-                    if final_waypoint
-                    else TARGET_POSITION_TOLERANCE_M
-                ),
-                orientation_tolerance=(
-                    PREGRASP_ORIENTATION_TOLERANCE_DEG
-                    if final_waypoint
-                    else TARGET_ORIENTATION_TOLERANCE_DEG
-                ),
-            )
-            if reached is None:
-                return physics_steps, False
-            if not reached:
-                raise ApproachUnreachableError(
-                    f"외부 APPROACH waypoint {index + 1}/{len(waypoints)}에 "
-                    "도달하지 못했습니다."
-                )
-        return physics_steps, True
-
     print(
         f"   Staging TCP  {vec(staging_tcp)} "
         f"({APPLE_OBSTACLE_RELEASE_DISTANCE_M:.2f} m below apple)"
@@ -2698,7 +2860,7 @@ def move_arm_to_pregrasp(
         for waypoint_index, (target_name, waypoint, target_rotation) in enumerate(
             outside_route
         ):
-            reached = follow_waypoint(
+            reached = follow_rrt_waypoint(
                 f"OUTSIDE {candidate['name']} {target_name}",
                 waypoint_index + 1,
                 len(outside_route),
@@ -2729,7 +2891,7 @@ def move_arm_to_pregrasp(
             print(f"   [REPLAN  ] {route_name} waypoint로 경로를 다시 생성합니다.")
         route_complete = True
         for waypoint_index, waypoint in enumerate(waypoints):
-            reached = follow_waypoint(
+            reached = follow_rrt_waypoint(
                 f"STAGING {route_name}",
                 waypoint_index + 1,
                 len(waypoints),
@@ -2749,7 +2911,7 @@ def move_arm_to_pregrasp(
                 "   [RETRACT ] 다음 재계획 전에 나무 바깥 안전 waypoint로 "
                 "후퇴합니다."
             )
-            retracted = follow_waypoint(
+            retracted = follow_rrt_waypoint(
                 "RETRACT OUTSIDE",
                 1,
                 1,
@@ -2776,7 +2938,7 @@ def move_arm_to_pregrasp(
         )
 
     collision_motion.disable_target_apple()
-    pregrasp_reached = follow_waypoint(
+    pregrasp_reached = follow_rrt_waypoint(
         "PREGRASP +Z",
         1,
         1,
