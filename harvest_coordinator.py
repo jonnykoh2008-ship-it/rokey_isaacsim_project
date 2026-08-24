@@ -34,7 +34,13 @@ SEQUENCE = [
     RobotMotion.Goal.RETRACT,
 ]
 
-PALM_TO_TCP_Y_M = 0.093
+# 물리 수확 TCP는 USD `palm` 기준으로 정의되는데 palm은 URDF에 없어 TF로
+# 조회할 수 없다. 보조 frame인 `gripper_frame`은 link_6에서 125 mm 떨어져
+# 있고 RPY도 달라 TCP 기준으로 쓸 수 없다(docs/architecture/tf_frames.md).
+# 대신 GPU PC 1이 발행한 `PlanningScene.robot_tcp_pose`와 같은 시각의
+# link_6 TF를 비교해 `link_6 → TCP` 고정변환을 한 번 보정하고, 이후에는
+# 현재 link_6 TF에 그 변환을 적용한다.
+CONTROL_FRAME = "link_6"
 
 
 class HarvestCoordinator(Node):
@@ -63,6 +69,9 @@ class HarvestCoordinator(Node):
         self.approach_orientation = None
         self.snapshot_request_pending = False
         self.generation = 0
+        # link_6 → TCP는 기계적 고정변환이므로 reset 후에도 유지한다.
+        self.control_to_tcp_rotation = None
+        self.control_to_tcp_translation = None
 
         latched_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -172,40 +181,155 @@ class HarvestCoordinator(Node):
         self._publish_status("PRE_GRASP_PLANNING", False, 0.0, code, str(error))
         self.get_logger().warning(f"APPROACH 계획 실패 {code}: {error}")
 
-    def _current_tcp_pose(self):
-        """현재 물리 수확 TCP pose를 gripper_frame TF에서 계산한다."""
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                "world", "gripper_frame", Time()
-            )
-        except TransformException as error:
-            raise RoutePlanningError(f"현재 gripper_frame TF를 읽지 못했습니다: {error}")
-        value = PoseStamped()
-        value.header = transform.header
-        value.header.frame_id = "world"
-        q = np.array(
+    @staticmethod
+    def _matrix_from_quaternion_xyzw(x, y, z, w):
+        q = np.array([x, y, z, w], dtype=float)
+        norm = float(np.linalg.norm(q))
+        if not np.isfinite(norm) or norm <= 1e-12:
+            raise RoutePlanningError("quaternion이 유효하지 않습니다.")
+        x, y, z, w = q / norm
+        return np.array(
             [
-                transform.transform.rotation.x,
-                transform.transform.rotation.y,
-                transform.transform.rotation.z,
-                transform.transform.rotation.w,
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
             ],
             dtype=float,
         )
-        q_norm = np.linalg.norm(q)
-        if not np.isfinite(q_norm) or q_norm <= 1e-12:
-            raise RoutePlanningError("현재 gripper_frame quaternion이 유효하지 않습니다.")
-        q /= q_norm
-        q_xyz = q[:3]
-        local_offset = np.array([0.0, PALM_TO_TCP_Y_M, 0.0], dtype=float)
-        rotated_offset = (
-            local_offset
-            + 2.0 * np.cross(q_xyz, np.cross(q_xyz, local_offset) + q[3] * local_offset)
+
+    @staticmethod
+    def _quaternion_xyzw_from_matrix(matrix):
+        matrix = np.asarray(matrix, dtype=float)
+        trace = float(np.trace(matrix))
+        if trace > 0.0:
+            scale = np.sqrt(trace + 1.0) * 2.0
+            q = np.array(
+                [
+                    (matrix[2, 1] - matrix[1, 2]) / scale,
+                    (matrix[0, 2] - matrix[2, 0]) / scale,
+                    (matrix[1, 0] - matrix[0, 1]) / scale,
+                    0.25 * scale,
+                ]
+            )
+        else:
+            index = int(np.argmax(np.diag(matrix)))
+            if index == 0:
+                scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+                q = np.array(
+                    [
+                        0.25 * scale,
+                        (matrix[0, 1] + matrix[1, 0]) / scale,
+                        (matrix[0, 2] + matrix[2, 0]) / scale,
+                        (matrix[2, 1] - matrix[1, 2]) / scale,
+                    ]
+                )
+            elif index == 1:
+                scale = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+                q = np.array(
+                    [
+                        (matrix[0, 1] + matrix[1, 0]) / scale,
+                        0.25 * scale,
+                        (matrix[1, 2] + matrix[2, 1]) / scale,
+                        (matrix[0, 2] - matrix[2, 0]) / scale,
+                    ]
+                )
+            else:
+                scale = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+                q = np.array(
+                    [
+                        (matrix[0, 2] + matrix[2, 0]) / scale,
+                        (matrix[1, 2] + matrix[2, 1]) / scale,
+                        0.25 * scale,
+                        (matrix[1, 0] - matrix[0, 1]) / scale,
+                    ]
+                )
+        return q / np.linalg.norm(q)
+
+    def _lookup_control_frame(self, stamp):
+        """world → link_6 변환을 회전행렬과 위치로 반환한다."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "world", CONTROL_FRAME, stamp
+            )
+        except TransformException as error:
+            raise RoutePlanningError(
+                f"{CONTROL_FRAME} TF를 읽지 못했습니다: {error}"
+            )
+        rotation = self._matrix_from_quaternion_xyzw(
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
         )
-        value.pose.position.x = transform.transform.translation.x + rotated_offset[0]
-        value.pose.position.y = transform.transform.translation.y + rotated_offset[1]
-        value.pose.position.z = transform.transform.translation.z + rotated_offset[2]
-        value.pose.orientation = transform.transform.rotation
+        position = np.array(
+            [
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+                transform.transform.translation.z,
+            ],
+            dtype=float,
+        )
+        return rotation, position
+
+    def _calibrate_control_frame_to_tcp(self, scene):
+        """GPU PC 1의 robot_tcp_pose로 link_6 → TCP 고정변환을 보정한다."""
+        tcp_pose = scene.robot_tcp_pose
+        if tcp_pose.header.frame_id != "world":
+            self.get_logger().warning(
+                "robot_tcp_pose frame_id가 world가 아니라 TCP 보정을 건너뜁니다."
+            )
+            return
+        try:
+            link_rotation, link_position = self._lookup_control_frame(
+                Time.from_msg(scene.header.stamp)
+            )
+        except RoutePlanningError as error:
+            self.get_logger().warning(f"TCP 보정 실패: {error}")
+            return
+        try:
+            tcp_rotation = self._matrix_from_quaternion_xyzw(
+                tcp_pose.pose.orientation.x,
+                tcp_pose.pose.orientation.y,
+                tcp_pose.pose.orientation.z,
+                tcp_pose.pose.orientation.w,
+            )
+        except RoutePlanningError as error:
+            self.get_logger().warning(f"TCP 보정 실패: {error}")
+            return
+        tcp_position = self._xyz(tcp_pose.pose.position)
+        self.control_to_tcp_rotation = link_rotation.T @ tcp_rotation
+        self.control_to_tcp_translation = link_rotation.T @ (
+            tcp_position - link_position
+        )
+        self.get_logger().info(
+            f"{CONTROL_FRAME} → TCP 보정: translation="
+            f"{np.round(self.control_to_tcp_translation, 5)} m"
+        )
+
+    def _current_tcp_pose(self):
+        """보정된 link_6 → TCP 변환을 현재 link_6 TF에 적용한다."""
+        if (
+            self.control_to_tcp_rotation is None
+            or self.control_to_tcp_translation is None
+        ):
+            raise RoutePlanningError(
+                "link_6 → TCP 보정이 아직 없습니다. GPU PC 1의 planning scene "
+                "robot_tcp_pose를 먼저 받아야 합니다."
+            )
+        link_rotation, link_position = self._lookup_control_frame(Time())
+        tcp_position = link_position + link_rotation @ self.control_to_tcp_translation
+        tcp_rotation = link_rotation @ self.control_to_tcp_rotation
+        quaternion = self._quaternion_xyzw_from_matrix(tcp_rotation)
+        value = PoseStamped()
+        value.header.stamp = self.get_clock().now().to_msg()
+        value.header.frame_id = "world"
+        value.pose.position.x = float(tcp_position[0])
+        value.pose.position.y = float(tcp_position[1])
+        value.pose.position.z = float(tcp_position[2])
+        value.pose.orientation.x = float(quaternion[0])
+        value.pose.orientation.y = float(quaternion[1])
+        value.pose.orientation.z = float(quaternion[2])
+        value.pose.orientation.w = float(quaternion[3])
         return value
 
     def on_state(self, message):
@@ -269,6 +393,7 @@ class HarvestCoordinator(Node):
             return
         self.planning_scene = message
         self.snapshot_request_pending = False
+        self._calibrate_control_frame_to_tcp(message)
         self.get_logger().info(
             f"planning scene 동기화: reset={message.reset_id}, "
             f"version={message.scene_version}, obstacles={len(message.obstacles)}"
