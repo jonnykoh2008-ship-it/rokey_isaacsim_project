@@ -26,17 +26,19 @@
 
 ## 수확 TCP와 Lula 제어 프레임
 
-- 물리 수확 TCP는 USD `palm` 원점에서 palm 로컬 `+Y` 방향 `0.093 m`에
-  위치한다. 이 값은 palm collision mesh 앞면 `0.0508 m`, 명목 사과 반지름
-  `0.040 m`, 접촉 여유 `0.0022 m`를 합한 포위 파지 중심이다.
-- Lula IK와 RMPflow의 제어 frame은 URDF `link_6`를 사용한다.
-- 원하는 TCP pose는 실행 시 USD에서 읽은 `link_6 → palm` 고정변환과 위 TCP
-  offset을 사용해 `link_6` 목표 pose로 변환한다.
+- 물리 수확 TCP는 USD `palm` 원점에서 palm 로컬 `+Y` 방향 `0.0908 m`에
+  위치한다. 이 값은 palm collision mesh 앞면 `0.0508 m`과 명목 사과 반지름
+  `0.040 m`의 합이며 접촉 여유를 포함하지 않는다.
+- GPU PC 1은 Isaac Sim 동적 TF에 `palm` frame을 발행한다. 개인 PC 1은
+  `world → palm`을 조회한 뒤 palm 로컬 `+Y` offset을 적용해 TCP pose를
+  계산한다.
+- Lula IK와 RMPflow의 제어 frame은 URDF `link_6`를 사용한다. GPU PC 1은
+  외부 TCP 목표를 `link_6` 제어 목표로 변환한다.
 - URDF의 보조 `gripper_frame`을 TCP 목표로 직접 사용하지 않는다. USD 조립
   자세와 보조 frame의 RPY가 다르면 실제 TCP와 Lula 목표가 서로 다른 위치에
   수렴할 수 있기 때문이다.
-- 시작 시 `link_6 → palm` translation을 로그로 출력하며, 이 변환을 얻지
-  못하면 로봇을 움직이지 않고 실패한다.
+- `palm` TF를 조회할 수 없으면 개인 PC 1은 로봇을 움직이지 않고
+  `TF_UNAVAILABLE`로 실패한다.
 
 ## 사과 pose 규약
 

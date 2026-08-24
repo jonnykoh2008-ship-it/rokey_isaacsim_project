@@ -18,11 +18,21 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator.failed_target = None
         coordinator.execute_enabled = True
         coordinator.running = False
-        coordinator.control_to_tcp_rotation = np.eye(3)
-        coordinator.control_to_tcp_translation = np.zeros(3)
-        coordinator._last_calibration_failure = None
+        coordinator._last_tcp_lookup_failure = None
         coordinator.tf_buffer = Mock()
-        coordinator.tf_buffer.all_frames_as_string.return_value = "world -> link_6"
+        coordinator.tf_buffer.all_frames_as_string.return_value = "world -> palm"
+        coordinator._lookup_tcp_frame = Mock(
+            return_value=(np.eye(3), np.zeros(3))
+        )
+        coordinator.get_clock = Mock(
+            return_value=SimpleNamespace(
+                now=Mock(
+                    return_value=SimpleNamespace(
+                        to_msg=Mock(return_value=SimpleNamespace())
+                    )
+                )
+            )
+        )
         coordinator.request_snapshot = Mock()
         coordinator._publish_status = Mock()
         coordinator.get_logger = Mock(return_value=Mock())
@@ -78,109 +88,102 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         self.assertTrue(coordinator._planning_inputs_synchronized())
         coordinator.request_snapshot.assert_not_called()
 
-    def test_execute_waits_for_tcp_calibration(self):
+    def test_execute_waits_until_palm_tf_is_available(self):
         coordinator = self.make_coordinator()
         coordinator.simulation_state = self.state(SimulationState.READY)
         coordinator.planning_scene = self.scene()
-        coordinator.control_to_tcp_rotation = None
-        coordinator.control_to_tcp_translation = None
+        coordinator._lookup_tcp_frame = Mock(
+            side_effect=RoutePlanningError("palm TF is unavailable")
+        )
 
         self.assertFalse(coordinator._planning_inputs_synchronized())
+        coordinator.tf_buffer.all_frames_as_string.assert_called_once_with()
 
-    def test_dry_run_does_not_require_tcp_calibration(self):
+    def test_dry_run_does_not_require_palm_tf(self):
         coordinator = self.make_coordinator()
         coordinator.execute_enabled = False
         coordinator.simulation_state = self.state(SimulationState.READY)
         coordinator.planning_scene = self.scene()
-        coordinator.control_to_tcp_rotation = None
-        coordinator.control_to_tcp_translation = None
+        coordinator._lookup_tcp_frame = Mock(
+            side_effect=RoutePlanningError("palm TF is unavailable")
+        )
 
         self.assertTrue(coordinator._planning_inputs_synchronized())
+        coordinator._lookup_tcp_frame.assert_not_called()
 
-    @staticmethod
-    def calibration_scene():
-        scene = PlanningScene()
-        scene.header.frame_id = "world"
-        scene.robot_tcp_pose.header.frame_id = "world"
-        scene.robot_tcp_pose.pose.position.x = 0.3
-        scene.robot_tcp_pose.pose.position.y = 0.4
-        scene.robot_tcp_pose.pose.position.z = 0.5
-        scene.robot_tcp_pose.pose.orientation.w = 1.0
-        return scene
-
-    def test_calibration_uses_scene_stamp_when_available(self):
+    def test_current_tcp_pose_uses_palm_local_y_offset(self):
         coordinator = self.make_coordinator()
-        coordinator.control_to_tcp_rotation = None
-        coordinator.control_to_tcp_translation = None
-        coordinator._lookup_control_frame = Mock(
-            return_value=(np.eye(3), np.array([0.1, 0.1, 0.1]))
+        coordinator._lookup_tcp_frame = Mock(
+            return_value=(np.eye(3), np.array([0.1, 0.2, 0.3]))
         )
 
-        self.assertTrue(
-            coordinator._calibrate_control_frame_to_tcp(self.calibration_scene())
+        pose = coordinator._current_tcp_pose()
+
+        np.testing.assert_allclose(
+            [pose.pose.position.x, pose.pose.position.y, pose.pose.position.z],
+            [0.1, 0.2908, 0.3],
         )
         np.testing.assert_allclose(
-            coordinator.control_to_tcp_translation, [0.2, 0.3, 0.4]
+            [
+                pose.pose.orientation.x,
+                pose.pose.orientation.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            ],
+            [0.0, 0.0, 0.0, 1.0],
         )
-        coordinator._lookup_control_frame.assert_called_once()
 
-    def test_calibration_falls_back_to_latest_tf_only_when_idle(self):
+    def test_current_tcp_pose_rotates_palm_local_y_offset(self):
         coordinator = self.make_coordinator()
-        coordinator.simulation_state = self.state(SimulationState.PLAYING)
-        coordinator.control_to_tcp_rotation = None
-        coordinator.control_to_tcp_translation = None
-        coordinator._lookup_control_frame = Mock(
-            side_effect=[
-                RoutePlanningError("stamp predates buffer"),
-                (np.eye(3), np.array([0.1, 0.1, 0.1])),
+        palm_rotation = np.array(
+            [
+                [0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
             ]
         )
-
-        self.assertTrue(
-            coordinator._calibrate_control_frame_to_tcp(self.calibration_scene())
+        coordinator._lookup_tcp_frame = Mock(
+            return_value=(palm_rotation, np.zeros(3))
         )
-        self.assertEqual(coordinator._lookup_control_frame.call_count, 2)
-        coordinator.get_logger.return_value.warning.assert_called_once()
 
-    def test_calibration_does_not_fall_back_while_running(self):
+        pose = coordinator._current_tcp_pose()
+
+        np.testing.assert_allclose(
+            [pose.pose.position.x, pose.pose.position.y, pose.pose.position.z],
+            [-0.0908, 0.0, 0.0],
+        )
+        np.testing.assert_allclose(
+            [
+                pose.pose.orientation.x,
+                pose.pose.orientation.y,
+                pose.pose.orientation.z,
+                pose.pose.orientation.w,
+            ],
+            [0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)],
+        )
+
+    def test_tcp_lookup_failure_is_logged_once(self):
         coordinator = self.make_coordinator()
-        coordinator.running = True
-        coordinator.simulation_state = self.state(SimulationState.PLAYING)
-        coordinator.control_to_tcp_rotation = None
-        coordinator.control_to_tcp_translation = None
-        coordinator._lookup_control_frame = Mock(
-            side_effect=RoutePlanningError("stamp predates buffer")
+        coordinator._lookup_tcp_frame = Mock(
+            side_effect=RoutePlanningError("palm TF is unavailable")
         )
 
-        self.assertFalse(
-            coordinator._calibrate_control_frame_to_tcp(self.calibration_scene())
-        )
-        coordinator._lookup_control_frame.assert_called_once()
-        coordinator.tf_buffer.all_frames_as_string.assert_called_once_with()
+        self.assertFalse(coordinator._tcp_pose_available())
+        self.assertFalse(coordinator._tcp_pose_available())
+        self.assertEqual(coordinator.get_logger.return_value.warning.call_count, 1)
 
-    def test_successful_calibration_is_not_recomputed(self):
-        coordinator = self.make_coordinator()
-        coordinator._lookup_control_frame = Mock()
-
-        self.assertTrue(
-            coordinator._calibrate_control_frame_to_tcp(self.calibration_scene())
-        )
-        coordinator._lookup_control_frame.assert_not_called()
-
-    def test_retry_timer_retries_tcp_calibration_for_matching_scene(self):
+    def test_retry_timer_checks_palm_tf_for_matching_scene(self):
         coordinator = self.make_coordinator()
         coordinator.simulation_state = self.state(SimulationState.READY)
         coordinator.planning_scene = self.scene()
-        coordinator.control_to_tcp_rotation = None
-        coordinator.control_to_tcp_translation = None
-        coordinator._calibrate_control_frame_to_tcp = Mock(return_value=False)
+        coordinator._lookup_tcp_frame = Mock(
+            side_effect=RoutePlanningError("palm TF is unavailable")
+        )
 
         coordinator._retry_snapshot()
 
         coordinator.request_snapshot.assert_not_called()
-        coordinator._calibrate_control_frame_to_tcp.assert_called_once_with(
-            coordinator.planning_scene
-        )
+        coordinator._lookup_tcp_frame.assert_called_once()
 
     def test_simulation_reset_does_not_latch_failed_target(self):
         coordinator = self.make_coordinator()
