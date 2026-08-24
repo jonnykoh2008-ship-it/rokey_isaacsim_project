@@ -56,9 +56,11 @@ jobs:
           colcon build --packages-select appleproj_interfaces quality_grading_system
           source install/setup.bash
           python3 -c "from appleproj_interfaces.msg import InspectionCompleted, InspectionImage; message = InspectionImage(); assert hasattr(message, 'ignore_mask')"
-      - name: Run ROS package tests
+      - name: Run quality grading tests in ROS environment
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          PYTHONPATH: quality_grading_system
         run: |
           source /opt/ros/jazzy/setup.bash
           source install/setup.bash
-          colcon test --packages-select quality_grading_system --event-handlers console_direct+
-          colcon test-result --verbose
+          python3 -m unittest discover -s quality_grading_system/test -v
