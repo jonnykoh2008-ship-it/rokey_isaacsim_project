@@ -5,8 +5,10 @@ from unittest.mock import Mock
 import numpy as np
 
 from appleproj_interfaces.msg import PlanningScene, SimulationState
+from geometry_msgs.msg import PoseStamped
 from harvest_coordinator import HarvestCoordinator
 from harvest_route_planner import RoutePlanningError
+from std_msgs.msg import Header
 
 
 class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
@@ -161,6 +163,63 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
             ],
             [0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)],
         )
+
+    def test_approach_plan_moves_then_rotates_at_same_safe_point(self):
+        coordinator = self.make_coordinator()
+        coordinator.simulation_state = self.state(SimulationState.PLAYING)
+        scene = PlanningScene()
+        scene.reset_id = 2
+        scene.scene_version = 3
+        scene.robot_base_pose.pose.position.x = 1.5
+        scene.robot_base_pose.pose.position.y = 0.6
+        scene.robot_base_pose.pose.position.z = 0.5
+        coordinator.planning_scene = scene
+
+        current_tcp = PoseStamped()
+        current_tcp.pose.position.x = 1.5
+        current_tcp.pose.position.y = 0.6
+        current_tcp.pose.position.z = 2.0
+        current_tcp.pose.orientation.z = np.sqrt(0.5)
+        current_tcp.pose.orientation.w = np.sqrt(0.5)
+        coordinator._current_tcp_pose = Mock(return_value=current_tcp)
+
+        _, _, waypoints, approach_orientation = coordinator._prepare_approach_plan(
+            np.array([0.8, 0.4, 1.2]),
+            Header(),
+        )
+
+        self.assertEqual(len(waypoints), 3)
+        np.testing.assert_allclose(
+            [
+                waypoints[0].pose.position.x,
+                waypoints[0].pose.position.y,
+                waypoints[0].pose.position.z,
+            ],
+            [
+                waypoints[1].pose.position.x,
+                waypoints[1].pose.position.y,
+                waypoints[1].pose.position.z,
+            ],
+        )
+        np.testing.assert_allclose(
+            [
+                waypoints[0].pose.orientation.x,
+                waypoints[0].pose.orientation.y,
+                waypoints[0].pose.orientation.z,
+                waypoints[0].pose.orientation.w,
+            ],
+            [0.0, 0.0, np.sqrt(0.5), np.sqrt(0.5)],
+        )
+        np.testing.assert_allclose(
+            [
+                waypoints[-1].pose.orientation.x,
+                waypoints[-1].pose.orientation.y,
+                waypoints[-1].pose.orientation.z,
+                waypoints[-1].pose.orientation.w,
+            ],
+            approach_orientation,
+        )
+        coordinator._current_tcp_pose.assert_called_once_with()
 
     def test_tcp_lookup_failure_is_logged_once(self):
         coordinator = self.make_coordinator()
