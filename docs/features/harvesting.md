@@ -5,7 +5,10 @@
 - 로봇: Doosan M0617
 - 그리퍼: AGS-001-MTCP
 - solver: LulaKinematicsSolver
-- 물리 목표: palm 로컬 `+Y 0.093 m`의 수확 TCP
+- 물리 수확 TCP: USD `palm` 원점에서 palm 로컬 `+Y 0.0908 m`
+- GPU PC 1은 Isaac Sim 동적 TF에 `palm` frame을 발행한다.
+- 개인 PC 1은 `world → palm`을 조회하고 palm 로컬 `+Y` offset을 적용해
+  현재 TCP pose를 계산한다.
 - Lula/RMPflow 제어 frame: `link_6`
 
 ## 상태 흐름
@@ -59,6 +62,24 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
   `+Z` 반대 방향으로 `0.30 m` 떨어진 staging pose에 도달한 뒤 해제한다.
 - 목표 사과 obstacle 해제 후 같은 접근축을 따라 `0.15 m` pre-grasp pose로
   이동하고, 이어서 의도된 `+Z` grasp 접근을 수행한다.
+- `0.15 m` pre-grasp에서 사과 아래 `0.03 m`까지 저속 진입하고, 마지막
+  `0.03 m`는 더 낮은 속도로 접근한다. 두 구간의 360 simulation step과
+  `0.03 m` 전환 거리는
+  실제 collider 접촉 시험 후 조정할 임시값이다.
+- 진입 중 두 측면 palm joint는 URDF의 바깥쪽 limit인 각각 `+0.25 rad`,
+  `-0.25 rad`로 벌린다. 세 distal joint는 `-1.20 rad`로 접어 손가락 끝을
+  접근축에서 사과 통로 바깥으로 빼며, 이 값은 collider 시험용 임시값이다.
+- 가운데 손가락 proximal joint 후보 `0.00`, `0.10`, `0.35`, `0.60 rad`를
+  pre-grasp에서 시험하고, 현재 authored collision mesh를 TCP→사과 중심
+  선분으로 sweep했을 때 최소 clearance가 가장 큰 자세를 선택한다. 후보값은
+  시뮬레이션 시험 후 조정할 임시값이다.
+- swept clearance는 사과 반지름을 제외하고 최소 `5 mm`를 확보해야 한다.
+  확보하지 못하면 실제 ENTER를 시작하지 않고 `COLLISION_RISK`를 반환한다.
+- gripper 물리 표현은 각 링크의 authored collision mesh 하나만 사용한다.
+  동일 형상의 runtime 복제 collider를 동시에 활성화하지 않는다.
+- 최종 저속 접근에서 palm collider의 사과 접촉이 확인되면 즉시 팔 pose를
+  유지하고 `GRASP`를 허용한다. palm보다 손가락 collider가 먼저 접촉하거나
+  일반 진입 구간에서 접촉하면 즉시 정지하고 `COLLISION_RISK`를 반환한다.
 - pre-grasp → grasp → twist → pull → retract 구간에도 나무 obstacle을
   유지하며 매 simulation step에서 RMPflow world를 갱신한다.
 - 작은 가지는 물리 collision이 비활성화되어도 planning obstacle에서 제외하지
@@ -101,9 +122,9 @@ RMPflow gain, proxy voxel 크기, proxy 수 제한 및 영향 반경은 시뮬�
 
 ## Twist & Pull
 
-파지는 세 손가락 끝으로만 누르는 방식이 아니라 사과 뒷면이 palm 지지면에
-약 2mm 이내로 접근하고 세 손가락이 사과를 감싸는 포위 파지를 사용한다. 명목
-지름 80mm 사과의 중심 목표는 palm 로컬 `+Y 0.093 m`이다. 이 접촉 형상으로
+파지는 세 손가락 끝으로만 누르는 방식이 아니라 사과 뒷면의 palm collider
+접촉을 먼저 확인하고 세 손가락이 사과를 감싸는 포위 파지를 사용한다. 명목
+지름 80mm 사과의 중심 목표는 palm 로컬 `+Y 0.0908 m`이다. 이 접촉 형상으로
 손목 TWIST 토크가 손가락 미끄럼 대신 사과와 줄기에 전달되도록 한다.
 
 1. 그리퍼를 폐합한다.

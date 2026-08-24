@@ -34,7 +34,11 @@ SEQUENCE = [
     RobotMotion.Goal.RETRACT,
 ]
 
-PALM_TO_TCP_Y_M = 0.093
+# The physical harvest TCP is defined from the USD `palm` frame. GPU PC 1
+# publishes that frame in the dynamic TF tree, so no link_6-to-TCP
+# calibration or gripper_frame approximation is needed here.
+TCP_FRAME = "palm"
+PALM_TO_TCP_Y_M = 0.0908
 
 
 class HarvestCoordinator(Node):
@@ -63,6 +67,7 @@ class HarvestCoordinator(Node):
         self.approach_orientation = None
         self.snapshot_request_pending = False
         self.generation = 0
+        self._last_tcp_lookup_failure = None
 
         latched_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -107,6 +112,9 @@ class HarvestCoordinator(Node):
             or self.planning_scene.scene_version != self.simulation_state.scene_version
         ):
             self.request_snapshot()
+            return
+        if self.execute_enabled:
+            self._tcp_pose_available()
 
     def _publish_status(self, state, success, progress, error_code="", message=""):
         value = MotionStatus()
@@ -172,40 +180,135 @@ class HarvestCoordinator(Node):
         self._publish_status("PRE_GRASP_PLANNING", False, 0.0, code, str(error))
         self.get_logger().warning(f"APPROACH 계획 실패 {code}: {error}")
 
-    def _current_tcp_pose(self):
-        """현재 물리 수확 TCP pose를 gripper_frame TF에서 계산한다."""
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                "world", "gripper_frame", Time()
-            )
-        except TransformException as error:
-            raise RoutePlanningError(f"현재 gripper_frame TF를 읽지 못했습니다: {error}")
-        value = PoseStamped()
-        value.header = transform.header
-        value.header.frame_id = "world"
-        q = np.array(
+    @staticmethod
+    def _matrix_from_quaternion_xyzw(x, y, z, w):
+        q = np.array([x, y, z, w], dtype=float)
+        norm = float(np.linalg.norm(q))
+        if not np.isfinite(norm) or norm <= 1e-12:
+            raise RoutePlanningError("quaternion이 유효하지 않습니다.")
+        x, y, z, w = q / norm
+        return np.array(
             [
-                transform.transform.rotation.x,
-                transform.transform.rotation.y,
-                transform.transform.rotation.z,
-                transform.transform.rotation.w,
+                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
             ],
             dtype=float,
         )
-        q_norm = np.linalg.norm(q)
-        if not np.isfinite(q_norm) or q_norm <= 1e-12:
-            raise RoutePlanningError("현재 gripper_frame quaternion이 유효하지 않습니다.")
-        q /= q_norm
-        q_xyz = q[:3]
-        local_offset = np.array([0.0, PALM_TO_TCP_Y_M, 0.0], dtype=float)
-        rotated_offset = (
-            local_offset
-            + 2.0 * np.cross(q_xyz, np.cross(q_xyz, local_offset) + q[3] * local_offset)
+
+    @staticmethod
+    def _quaternion_xyzw_from_matrix(matrix):
+        matrix = np.asarray(matrix, dtype=float)
+        trace = float(np.trace(matrix))
+        if trace > 0.0:
+            scale = np.sqrt(trace + 1.0) * 2.0
+            q = np.array(
+                [
+                    (matrix[2, 1] - matrix[1, 2]) / scale,
+                    (matrix[0, 2] - matrix[2, 0]) / scale,
+                    (matrix[1, 0] - matrix[0, 1]) / scale,
+                    0.25 * scale,
+                ]
+            )
+        else:
+            index = int(np.argmax(np.diag(matrix)))
+            if index == 0:
+                scale = np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2]) * 2.0
+                q = np.array(
+                    [
+                        0.25 * scale,
+                        (matrix[0, 1] + matrix[1, 0]) / scale,
+                        (matrix[0, 2] + matrix[2, 0]) / scale,
+                        (matrix[2, 1] - matrix[1, 2]) / scale,
+                    ]
+                )
+            elif index == 1:
+                scale = np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2]) * 2.0
+                q = np.array(
+                    [
+                        (matrix[0, 1] + matrix[1, 0]) / scale,
+                        0.25 * scale,
+                        (matrix[1, 2] + matrix[2, 1]) / scale,
+                        (matrix[0, 2] - matrix[2, 0]) / scale,
+                    ]
+                )
+            else:
+                scale = np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1]) * 2.0
+                q = np.array(
+                    [
+                        (matrix[0, 2] + matrix[2, 0]) / scale,
+                        (matrix[1, 2] + matrix[2, 1]) / scale,
+                        0.25 * scale,
+                        (matrix[1, 0] - matrix[0, 1]) / scale,
+                    ]
+                )
+        return q / np.linalg.norm(q)
+
+    def _lookup_tcp_frame(self, stamp):
+        """Return the world-to-palm transform as rotation and position."""
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "world", TCP_FRAME, stamp
+            )
+        except TransformException as error:
+            raise RoutePlanningError(
+                f"{TCP_FRAME} TF is unavailable: {error}"
+            )
+        rotation = self._matrix_from_quaternion_xyzw(
+            transform.transform.rotation.x,
+            transform.transform.rotation.y,
+            transform.transform.rotation.z,
+            transform.transform.rotation.w,
         )
-        value.pose.position.x = transform.transform.translation.x + rotated_offset[0]
-        value.pose.position.y = transform.transform.translation.y + rotated_offset[1]
-        value.pose.position.z = transform.transform.translation.z + rotated_offset[2]
-        value.pose.orientation = transform.transform.rotation
+        position = np.array(
+            [
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+                transform.transform.translation.z,
+            ],
+            dtype=float,
+        )
+        return rotation, position
+
+    def _report_tcp_lookup_failure(self, message):
+        """Report a changed TCP lookup failure with the live TF tree."""
+        try:
+            frames = self.tf_buffer.all_frames_as_string()
+        except Exception as error:
+            frames = f"Unable to read TF tree: {error}"
+        failure = f"{message}\nCurrent TF tree:\n{frames}"
+        if failure == self._last_tcp_lookup_failure:
+            return
+        self._last_tcp_lookup_failure = failure
+        self.get_logger().warning(failure)
+
+    def _tcp_pose_available(self):
+        try:
+            self._lookup_tcp_frame(Time())
+        except RoutePlanningError as error:
+            self._report_tcp_lookup_failure(str(error))
+            return False
+        self._last_tcp_lookup_failure = None
+        return True
+
+    def _current_tcp_pose(self):
+        """Read the current world-to-palm TF and apply the palm-local TCP offset."""
+        palm_rotation, palm_position = self._lookup_tcp_frame(Time())
+        tcp_position = palm_position + palm_rotation @ np.array(
+            [0.0, PALM_TO_TCP_Y_M, 0.0],
+            dtype=float,
+        )
+        quaternion = self._quaternion_xyzw_from_matrix(palm_rotation)
+        value = PoseStamped()
+        value.header.stamp = self.get_clock().now().to_msg()
+        value.header.frame_id = "world"
+        value.pose.position.x = float(tcp_position[0])
+        value.pose.position.y = float(tcp_position[1])
+        value.pose.position.z = float(tcp_position[2])
+        value.pose.orientation.x = float(quaternion[0])
+        value.pose.orientation.y = float(quaternion[1])
+        value.pose.orientation.z = float(quaternion[2])
+        value.pose.orientation.w = float(quaternion[3])
         return value
 
     def on_state(self, message):
@@ -333,6 +436,8 @@ class HarvestCoordinator(Node):
         ):
             self.planning_scene = None
             self.request_snapshot()
+            return False
+        if self.execute_enabled and not self._tcp_pose_available():
             return False
         return True
 

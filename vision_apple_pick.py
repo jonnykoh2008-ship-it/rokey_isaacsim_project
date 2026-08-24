@@ -86,15 +86,25 @@ STOP_STATE = {
     RobotMotion.Goal.RELEASE: "LIFT",
     RobotMotion.Goal.RETRACT: "DONE",
 }
+# GRASP 완료 후 RELEASE 완료 전까지는 사과가 그리퍼에 물려 있을 수 있다.
+# 이 구간에서 실패하면 Drive 유지 토크를 낮추지 않는다.
+APPLE_HELD_INDEX_RANGE = (
+    MOTION_SEQUENCE.index(RobotMotion.Goal.TWIST),
+    MOTION_SEQUENCE.index(RobotMotion.Goal.RELEASE),
+)
 ACTION_TIMEOUT_S = 3.0
 # ENTER 전에 손가락 collider가 사과 쪽으로 남아 있지 않도록 실제 관절값을
 # 확인한다. 이 값은 Isaac Sim 그리퍼 Drive 정착 시험 후 조정할 초기값이다.
 GRIPPER_OPEN_TOLERANCE_RAD = 0.02
+# docs/architecture/ros2_interfaces.md의 오류 코드 표를 그대로 옮긴 것이다.
+# 현재 실행 경로는 문자열 리터럴을 직접 사용하므로 이 표는 참조용이며,
+# 리터럴을 이 표로 일원화하는 작업은 별도 정리 대상이다.
 ERROR_CODES = {
     "IK_FAILED": "300:IK_FAILED",
     "APPROACH_UNREACHABLE": "301:APPROACH_UNREACHABLE",
     "COLLISION_RISK": "302:COLLISION_RISK",
-    # 판정 threshold는 docs/features/harvesting.md의 튜닝 항목이므로 TBD.
+    # 미구현: 특이점 판정 threshold가 docs/features/harvesting.md에서 TBD이므로
+    # 임의 값으로 구현하지 않는다. threshold 확정 전까지 이 코드는 발행되지 않는다.
     "SINGULARITY_RISK": "303:SINGULARITY_RISK",
     "MOTION_TIMEOUT": "304:MOTION_TIMEOUT",
     "STEM_NOT_BROKEN": "305:STEM_NOT_BROKEN",
@@ -440,12 +450,14 @@ class MotionEngine:
         )
         robot_position, _ = harvest.get_prim_world_pose(stage, harvest.ROBOT_BASE_PATH)
         _, apple_size = harvest.compute_apple_center(stage)
+        self.apple_radius = 0.5 * float(harvest.np.max(apple_size))
         self.conveyor = harvest.compute_conveyor_start(stage, robot_position, apple_size)
         self.expected_index = 0
         self.fsm = None
         self.collision_motion = None
         self.joint_break = harvest.JointBreakMonitor()
         self.tree_contact = harvest.RobotTreeContactMonitor(stage)
+        self.apple_contact = harvest.RobotAppleContactMonitor(stage)
         self.gripper_drive_max_force = harvest.GRIPPER_GRASP_MAX_FORCE
         self.active_handle = None
         self.active_reset_id = None
@@ -453,23 +465,39 @@ class MotionEngine:
         self.action_last_progress_time = None
         self.progress_tcp_position = None
         self.progress_tcp_rotation = None
+        self.entry_preshape = harvest.GRIPPER_OPEN.copy()
 
     def close(self):
         self.joint_break.close()
         self.tree_contact.close()
+        self.apple_contact.close()
 
     def _reset_action_sequence(self, reason):
         """실패한 Goal의 부분 FSM을 폐기하고 다음 요청을 APPROACH로 맞춘다."""
-        self._set_gripper_drive_max_force(
-            harvest.GRIPPER_GRASP_MAX_FORCE,
-            f"RESET {reason}",
-            report=True,
-        )
+        held_low, held_high = APPLE_HELD_INDEX_RANGE
+        apple_may_be_held = held_low <= self.expected_index <= held_high
+        if apple_may_be_held:
+            # 사과를 이미 물고 있는 단계에서 실패하면 팔만 정지시키고 유지
+            # 토크는 그대로 둔다. 여기서 GRASP 수준으로 낮추면 실패 처리
+            # 자체가 사과를 떨어뜨린다.
+            self._set_gripper_drive_max_force(
+                harvest.GRIPPER_HOLD_MAX_FORCE,
+                f"HOLD {reason}",
+                report=True,
+            )
+        else:
+            self._set_gripper_drive_max_force(
+                harvest.GRIPPER_GRASP_MAX_FORCE,
+                f"RESET {reason}",
+                report=True,
+            )
         print(f"   Action reset {reason}: next expected APPROACH")
         self.expected_index = 0
         self.fsm = None
         self.collision_motion = None
         self.tree_contact.reset()
+        self.apple_contact.reset()
+        self.entry_preshape = harvest.GRIPPER_OPEN.copy()
 
     def _hold_robot(self):
         """실행 실패 시 후퇴 동작 없이 현재 관절 위치를 유지한다."""
@@ -636,16 +664,18 @@ class MotionEngine:
             )
         return positions
 
-    def _wait_for_gripper_open_before_enter(self, handle):
-        """pre-grasp에서 팔을 고정하고 실제 그리퍼 개방을 확인한다."""
+    def _wait_for_gripper_open_before_enter(self, handle, apple_center):
+        """실제 collider swept clearance가 가장 큰 entry pre-shape를 선택한다."""
         hold_arm_positions = self._require_arm_joint_positions().copy()
-        self.action_last_progress_time = float(self.world.current_time)
-        self.progress_tcp_position, self.progress_tcp_rotation = (
-            value.copy() for value in self._current_tcp_pose()
-        )
-        initial_error = None
-        frame = 0
-        while True:
+        # 이 구간은 팔을 고정한 채 그리퍼만 움직이므로 TCP는 설계상 정지해
+        # 있다. TCP 진전 기반 watchdog을 그대로 두면 정상 동작이
+        # MOTION_TIMEOUT으로 오판되므로 명시적으로 중단한다. 대신 아래
+        # 후보 sampling과 settle 루프의 고정 step 상한이 무한 대기를 막고,
+        # cancel/reset 검사는 _check_execution_guard에서 계속 수행한다.
+        self.action_last_progress_time = None
+        self.progress_tcp_position = None
+        self.progress_tcp_rotation = None
+        def step_gripper(target):
             self._check_execution_guard()
             pause_reported = False
             while not self.world.is_playing():
@@ -656,57 +686,85 @@ class MotionEngine:
                 harvest.simulation_app.update()
             if pause_reported:
                 self._publish_resume()
-
-            actual = self._require_gripper_joint_positions()
-            max_error = float(
-                harvest.np.max(harvest.np.abs(actual - harvest.GRIPPER_OPEN))
-            )
-            if initial_error is None:
-                initial_error = max(max_error, GRIPPER_OPEN_TOLERANCE_RAD)
-                print(
-                    f"   [OPEN CHECK] ENTER 전 그리퍼 개방 대기: "
-                    f"max error {max_error:.4f} rad"
-                )
-            if self.tree_contact.detected:
-                raise MotionExecutionError(
-                    "302:COLLISION_RISK",
-                    "ENTER 전 그리퍼 개방 중 실제 로봇 collider가 나무 collider에 "
-                    f"접촉했습니다: robot={self.tree_contact.robot_path}, "
-                    f"tree={self.tree_contact.tree_path}",
-                )
-            if self.joint_break.broken:
-                raise MotionExecutionError(
-                    "302:COLLISION_RISK",
-                    "ENTER 전 그리퍼 개방 중 사과 FixedJoint가 조기 파손됐습니다.",
-                )
-            if max_error <= GRIPPER_OPEN_TOLERANCE_RAD:
-                print(
-                    f"   [OPEN READY] ENTER 허용: max error "
-                    f"{max_error:.4f} rad"
-                )
-                self.feedback(handle, "GRIPPER_OPEN_READY", 0.4)
-                break
-
             self.robot.apply_action(
                 harvest.ArticulationAction(
                     joint_positions=hold_arm_positions,
                     joint_indices=self.arm_indices,
                 )
             )
-            harvest.apply_gripper_target(self.robot, self.gripper_indices, 0.0)
-            progress = 0.1 + 0.3 * (
-                1.0 - min(1.0, max_error / initial_error)
+            harvest.apply_gripper_positions(
+                self.robot, self.gripper_indices, target
             )
-            self.feedback(handle, "GRIPPER_OPENING", progress)
             self.world.step(render=not harvest.args.headless)
-            frame += 1
-            if frame == 1 or frame % 60 == 0:
-                print(
-                    f"   [OPENING] frame {frame}, max error "
-                    f"{max_error:.4f} rad"
+            if self.tree_contact.detected:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    "ENTRY_PRESHAPE 설정 중 로봇이 나무 collider에 접촉했습니다: "
+                    f"robot={self.tree_contact.robot_path}, "
+                    f"tree={self.tree_contact.tree_path}",
+                )
+            if self.apple_contact.finger_contacted or self.joint_break.broken:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    "ENTRY_PRESHAPE 설정 중 사과에 조기 접촉했습니다.",
                 )
 
-        # 개방 대기 시간이 다음 ENTER 단계의 무진전 시간에 합산되지 않게 한다.
+        results = []
+        for index, (name, target) in enumerate(harvest.GRIPPER_ENTRY_CANDIDATES):
+            for _frame in range(harvest.ENTRY_PRESHAPE_SAMPLE_STEPS):
+                step_gripper(target)
+            actual = self._require_gripper_joint_positions()
+            target_error = float(harvest.np.max(harvest.np.abs(actual - target)))
+            tcp, _rotation = self._current_tcp_pose()
+            clearance, closest_path = harvest.compute_gripper_entry_swept_clearance(
+                self.stage,
+                tcp,
+                apple_center,
+                self.apple_radius,
+            )
+            print(
+                f"   [ENTRY CANDIDATE] {name}: clearance {clearance:.4f} m, "
+                f"joint error {target_error:.4f} rad, closest={closest_path}"
+            )
+            results.append((clearance, name, target.copy(), closest_path))
+            self.feedback(
+                handle,
+                "ENTRY_PRESHAPE_TEST",
+                0.1 + 0.25 * (index + 1) / len(harvest.GRIPPER_ENTRY_CANDIDATES),
+            )
+
+        clearance, name, target, closest_path = max(results, key=lambda item: item[0])
+        for frame in range(harvest.ENTRY_PRESHAPE_MAX_SETTLE_STEPS):
+            actual = self._require_gripper_joint_positions()
+            max_error = float(harvest.np.max(harvest.np.abs(actual - target)))
+            if max_error <= GRIPPER_OPEN_TOLERANCE_RAD:
+                break
+            step_gripper(target)
+        else:
+            raise MotionExecutionError(
+                "304:MOTION_TIMEOUT",
+                f"선택한 ENTRY_PRESHAPE가 관절 목표에 도달하지 못했습니다: {name}",
+            )
+
+        tcp, _rotation = self._current_tcp_pose()
+        clearance, closest_path = harvest.compute_gripper_entry_swept_clearance(
+            self.stage, tcp, apple_center, self.apple_radius
+        )
+        if clearance < harvest.ENTRY_SWEEP_MIN_CLEARANCE_M:
+            raise MotionExecutionError(
+                "302:COLLISION_RISK",
+                f"ENTRY swept clearance가 부족합니다: {clearance:.4f} m, "
+                f"candidate={name}, closest={closest_path}",
+            )
+        self.entry_preshape = target.copy()
+        print(
+            f"   [OPEN READY] {name}: swept clearance {clearance:.4f} m, "
+            f"closest={closest_path}"
+        )
+        self.feedback(handle, "GRIPPER_OPEN_READY", 0.4)
+
+        # 그리퍼 전용 구간이 끝났으므로 TCP 진전 watchdog을 다시 켠다. 개방
+        # 대기 시간은 다음 ENTER 단계의 무진전 시간에 합산하지 않는다.
         self.action_last_progress_time = float(self.world.current_time)
         self.progress_tcp_position, self.progress_tcp_rotation = (
             value.copy() for value in self._current_tcp_pose()
@@ -803,26 +861,28 @@ class MotionEngine:
         self.progress_tcp_rotation = None
         try:
             self._check_execution_guard()
+            # docs/features/harvesting.md는 APPROACH가 아니라 Action 실행 직전
+            # 일반 조건으로 실제 PhysX collider 겹침 검사를 요구한다.
+            overlap = harvest.find_robot_tree_physx_overlap(self.stage)
+            if overlap is not None:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    f"실행 전 실제 PhysX collider가 겹쳐 있습니다: {overlap}",
+                )
             if request.motion_type == RobotMotion.Goal.APPROACH:
-                overlap = harvest.find_robot_tree_physx_overlap(self.stage)
-                if overlap is not None:
-                    raise MotionExecutionError(
-                        "302:COLLISION_RISK",
-                        f"실행 전 실제 PhysX collider가 겹쳐 있습니다: {overlap}",
-                    )
                 self._approach(handle, request.target_pose, request.waypoints)
             else:
                 self._run_fsm(handle, STOP_STATE[request.motion_type])
                 if request.motion_type == RobotMotion.Goal.GRASP:
                     self._report_grasp_state()
-                if (
-                    request.motion_type == RobotMotion.Goal.PULL
-                    and not self.joint_break.broken
-                ):
-                    raise MotionExecutionError(
-                        "305:STEM_NOT_BROKEN",
-                        "PULL 완료 시점까지 사과 FixedJoint가 분리되지 않았습니다.",
-                    )
+                if request.motion_type == RobotMotion.Goal.PULL:
+                    if not self.joint_break.broken:
+                        raise MotionExecutionError(
+                            "305:STEM_NOT_BROKEN",
+                            "PULL 완료 시점까지 사과 FixedJoint가 분리되지 "
+                            "않았습니다.",
+                        )
+                    self._verify_apple_follows_gripper("PULL")
         except MotionExecutionError as error:
             self._hold_robot()
             self._reset_action_sequence(error.error_code)
@@ -943,6 +1003,8 @@ class MotionEngine:
         self.joint_break.set_state("PRE_GRASP")
         self.tree_contact.reset()
         self.tree_contact.set_state("APPROACH")
+        self.apple_contact.reset()
+        self.apple_contact.set_state("APPROACH")
         self.feedback(handle, "APPROACH", 0.1)
         def contact_guard():
             if self.tree_contact.detected:
@@ -977,7 +1039,7 @@ class MotionEngine:
             raise harvest.ApproachUnreachableError(
                 "pregrasp 이동을 완료하지 못했습니다."
             )
-        self._wait_for_gripper_open_before_enter(handle)
+        self._wait_for_gripper_open_before_enter(handle, center)
         tcp, palm_rotation = self._current_tcp_pose()
         self.fsm = harvest.AppleHarvestFSM(
             tcp, palm_rotation, center, rotation, direction, *self.conveyor,
@@ -1014,6 +1076,64 @@ class MotionEngine:
                 f"사과 FixedJoint가 {self.joint_break.break_state} 중 조기 파손됐습니다.",
             )
 
+    def _verify_apple_follows_gripper(self, stage_name):
+        """stem 분리 후 사과가 실제로 그리퍼를 따라왔는지 확인한다.
+
+        stem이 끊겼더라도 파지가 불완전하면 사과가 그 자리에 떨어진다. 이
+        경우까지 성공으로 보고하면 개인 PC 1이 빈 그리퍼로 TRANSPORT와
+        PLACE를 진행한다. 단독 실행 경로(apple_pick.py)는 같은 검사를
+        APPLE_GRASP_MAX_DISTANCE_M로 수행한다.
+        """
+        tcp, _rotation = self._current_tcp_pose()
+        apple = harvest.compute_live_prim_center(self.stage, harvest.APPLE_PATH)
+        distance = float(harvest.np.linalg.norm(apple - tcp))
+        print(f"   [{stage_name} APPLE CHECK] TCP-apple={distance:.4f} m")
+        if distance > harvest.APPLE_GRASP_MAX_DISTANCE_M:
+            # 오류 코드 표에 "사과 이탈" 전용 심볼이 없어 물리 접촉 상태가
+            # 의도와 다른 경우에 이 파일이 이미 사용하는 302를 따른다.
+            raise MotionExecutionError(
+                "302:COLLISION_RISK",
+                f"{stage_name} 후 사과가 그리퍼를 따라오지 않았습니다: "
+                f"TCP-사과 거리 {distance:.4f} m > "
+                f"{harvest.APPLE_GRASP_MAX_DISTANCE_M:.4f} m",
+            )
+
+    def _handle_entry_apple_contact(self, motion_state, arm_positions):
+        """ENTER 접촉 순서를 검사하고 palm 접촉이면 즉시 현재 pose를 유지한다."""
+        if motion_state not in {"ENTER", "ENTER_SLOW"}:
+            return False
+        actual, actual_rotation = self._current_tcp_pose()
+        target = harvest.np.asarray(self.fsm.specs[self.fsm.state][0], dtype=float)
+        target_error = float(harvest.np.linalg.norm(target - actual))
+        if self.apple_contact.finger_contacted:
+            raise MotionExecutionError(
+                "302:COLLISION_RISK",
+                "GRASP 전에 손가락 collider가 사과에 먼저 접촉했습니다: "
+                f"robot={self.apple_contact.finger_path}, "
+                f"{motion_state} target_error={target_error:.4f} m",
+            )
+        if not self.apple_contact.palm_contacted:
+            return False
+        if motion_state != "ENTER_SLOW":
+            raise MotionExecutionError(
+                "302:COLLISION_RISK",
+                "저속 최종 접근 전에 palm이 사과에 조기 접촉했습니다: "
+                f"robot={self.apple_contact.palm_path}, "
+                f"{motion_state} target_error={target_error:.4f} m",
+            )
+        self.robot.apply_action(
+            harvest.ArticulationAction(
+                joint_positions=harvest.np.asarray(arm_positions, dtype=float).copy(),
+                joint_indices=self.arm_indices,
+            )
+        )
+        self.fsm.complete_current_on_contact(actual, actual_rotation)
+        print(
+            f"   [PALM READY] target error {target_error:.4f} m, "
+            "palm 접촉 위치에서 팔 정지, GRASP 허용"
+        )
+        return True
+
     def _run_fsm(self, handle, stop_state):
         if self.fsm is None or self.collision_motion is None:
             raise MotionExecutionError(
@@ -1037,6 +1157,12 @@ class MotionEngine:
             current_arm_positions = self._require_arm_joint_positions()
             motion_state = self.fsm.NAMES[self.fsm.state]
             self.tree_contact.set_state(motion_state)
+            self.apple_contact.set_state(motion_state)
+
+            if self._handle_entry_apple_contact(
+                motion_state, current_arm_positions
+            ):
+                continue
 
             if motion_state in {"GRASP", "RELEASE"} and hold_arm_positions is None:
                 hold_arm_positions = current_arm_positions.copy()
@@ -1060,7 +1186,10 @@ class MotionEngine:
                     )
                 )
                 harvest.apply_gripper_target(
-                    self.robot, self.gripper_indices, 0.0
+                    self.robot,
+                    self.gripper_indices,
+                    0.0,
+                    open_positions=self.entry_preshape,
                 )
                 completed = (
                     harvest.GRASP_SETTLE_STEPS - grasp_settle_remaining + 1
@@ -1151,7 +1280,21 @@ class MotionEngine:
                 self.robot.apply_action(action)
                 failures = 0
                 actual, actual_rotation = self._current_tcp_pose()
-                if self.fsm.advance(actual, actual_rotation) == "timeout":
+                completion_allowed = (
+                    motion_state != "ENTER_SLOW"
+                    or self.apple_contact.palm_contacted
+                )
+                advance_result = self.fsm.advance(
+                    actual,
+                    actual_rotation,
+                    completion_allowed=completion_allowed,
+                )
+                if advance_result == "timeout":
+                    if motion_state == "ENTER_SLOW":
+                        raise MotionExecutionError(
+                            "302:COLLISION_RISK",
+                            "저속 최종 접근에서 palm-사과 접촉이 확인되지 않았습니다.",
+                        )
                     raise MotionExecutionError(
                         "304:MOTION_TIMEOUT",
                         "TCP가 목표를 제한 시간 안에 추종하지 못했습니다.",
@@ -1163,10 +1306,18 @@ class MotionEngine:
                         "300:IK_FAILED",
                         "RMPflow 관절 목표가 연속으로 유효하지 않습니다.",
                     )
-            harvest.apply_gripper_target(self.robot, self.gripper_indices, grip)
+            harvest.apply_gripper_target(
+                self.robot,
+                self.gripper_indices,
+                grip,
+                open_positions=self.entry_preshape,
+            )
             state = self.fsm.NAMES[min(self.fsm.state, len(self.fsm.NAMES) - 1)]
             self.feedback(handle, state, 0.5)
             self.world.step(render=not harvest.args.headless)
+            self._handle_entry_apple_contact(
+                motion_state, self._require_arm_joint_positions()
+            )
             if self.tree_contact.detected:
                 raise MotionExecutionError(
                     "302:COLLISION_RISK",
@@ -1183,6 +1334,11 @@ class MotionEngine:
                     f"사과 FixedJoint가 {self.joint_break.break_state} 중 조기 파손됐습니다.",
                 )
         self._check_execution_guard()
+        if stop_state == "GRASP" and not self.apple_contact.palm_contacted:
+            raise MotionExecutionError(
+                "302:COLLISION_RISK",
+                "palm-사과 접촉이 확인되지 않아 GRASP를 허용하지 않습니다.",
+            )
         self.feedback(handle, stop_state, 1.0)
 
 
