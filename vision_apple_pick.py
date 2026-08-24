@@ -86,6 +86,15 @@ STOP_STATE = {
     RobotMotion.Goal.RELEASE: "LIFT",
     RobotMotion.Goal.RETRACT: "DONE",
 }
+RRT_FSM_STATES = {
+    "RETREAT",
+    "CLEAR_UP",
+    "OUTSIDE",
+    "ALIGN",
+    "TO_BELT",
+    "LIFT",
+    "EXIT",
+}
 # GRASP 완료 후 RELEASE 완료 전까지는 사과가 그리퍼에 물려 있을 수 있다.
 # 이 구간에서 실패하면 Drive 유지 토크를 낮추지 않는다.
 APPLE_HELD_INDEX_RANGE = (
@@ -397,10 +406,10 @@ class RobotMotionNode(Node):
                 request.reset_id == self.reset_id
                 and request.scene_version == self.scene_version
             )
-            valid_waypoints = (
-                request.motion_type != RobotMotion.Goal.APPROACH
-                or len(request.waypoints) > 0
-            )
+            # v2.0에서는 외부 PC가 waypoint를 주입하지 않는다. APPROACH
+            # 경로는 이 GPU PC 1 Action 서버가 현재 관절 상태와 동일한
+            # planning world로 생성한다.
+            valid_waypoints = len(request.waypoints) == 0
             if (
                 self.busy
                 or request.motion_type not in MOTION_SEQUENCE
@@ -420,7 +429,7 @@ class RobotMotionNode(Node):
         return GoalResponse.ACCEPT
 
     def on_motion_status(self, message):
-        """개인 PC의 Goal 전 계획 실패를 기록하되 Goal은 차단하지 않는다."""
+        """GPU PC 1 supervisor의 Goal 전 검증 실패를 진단용으로 기록한다."""
         if message.success:
             return
         with self.lock:
@@ -1038,16 +1047,6 @@ class MotionEngine:
             else:
                 handle.abort()
             return self.result(False, error.error_code, str(error))
-        except harvest.CollisionRiskError as error:
-            self._hold_robot()
-            self._reset_action_sequence("302:COLLISION_RISK")
-            handle.abort()
-            return self.result(False, "302:COLLISION_RISK", str(error))
-        except harvest.IkFailedError as error:
-            self._hold_robot()
-            self._reset_action_sequence("300:IK_FAILED")
-            handle.abort()
-            return self.result(False, "300:IK_FAILED", str(error))
         except harvest.ApproachUnreachableError as error:
             self._hold_robot()
             self._reset_action_sequence("301:APPROACH_UNREACHABLE")
@@ -1085,46 +1084,37 @@ class MotionEngine:
         direction = harvest.np.array([0.0, 0.0, 1.0], dtype=float)
         pregrasp = center - direction * harvest.PREGRASP_DISTANCE_M
         staging = center - direction * harvest.APPLE_OBSTACLE_RELEASE_DISTANCE_M
-        external_waypoints = []
-        external_rotations = []
-        for waypoint in waypoint_messages:
-            if waypoint.header.frame_id != "world":
-                raise MotionExecutionError(
-                    "309:INVALID_TARGET_POSE",
-                    "모든 APPROACH waypoint frame_id는 world여야 합니다.",
-                )
-            p = waypoint.pose.position
-            position = harvest.np.array([p.x, p.y, p.z], dtype=float)
-            q = waypoint.pose.orientation
-            quaternion_xyzw = harvest.np.array([q.x, q.y, q.z, q.w], dtype=float)
-            norm = float(harvest.np.linalg.norm(quaternion_xyzw))
-            if (
-                not harvest.np.all(harvest.np.isfinite(position))
-                or not harvest.np.all(harvest.np.isfinite(quaternion_xyzw))
-                or norm <= 1e-12
-            ):
-                raise MotionExecutionError(
-                    "309:INVALID_TARGET_POSE",
-                    "APPROACH waypoint 위치/자세가 유효하지 않습니다.",
-                )
-            quaternion_xyzw /= norm
-            rotation = harvest.quat_to_rot_matrix(
-                harvest.np.array(
-                    [
-                        quaternion_xyzw[3],
-                        quaternion_xyzw[0],
-                        quaternion_xyzw[1],
-                        quaternion_xyzw[2],
-                    ]
-                )
-            )
-            external_waypoints.append(position)
-            external_rotations.append(rotation)
-        if not external_waypoints:
+        if waypoint_messages:
             raise MotionExecutionError(
-                "309:INVALID_TARGET_POSE", "APPROACH waypoint가 비어 있습니다."
+                "306:GOAL_REJECTED",
+                "v2.0 APPROACH는 GPU PC 1 Action 서버가 계획하므로 외부 "
+                "waypoint를 허용하지 않습니다.",
             )
-        rotation = external_rotations[-1]
+        orientation = pose.pose.orientation
+        quaternion_xyzw = harvest.np.array(
+            [orientation.x, orientation.y, orientation.z, orientation.w],
+            dtype=float,
+        )
+        quaternion_norm = float(harvest.np.linalg.norm(quaternion_xyzw))
+        if (
+            not harvest.np.all(harvest.np.isfinite(quaternion_xyzw))
+            or quaternion_norm <= 1e-12
+        ):
+            raise MotionExecutionError(
+                "309:INVALID_TARGET_POSE",
+                "APPROACH target orientation이 유효하지 않습니다.",
+            )
+        quaternion_xyzw /= quaternion_norm
+        rotation = harvest.quat_to_rot_matrix(
+            harvest.np.array(
+                [
+                    quaternion_xyzw[3],
+                    quaternion_xyzw[0],
+                    quaternion_xyzw[1],
+                    quaternion_xyzw[2],
+                ]
+            )
+        )
         print(f"   Staging TCP  {harvest.vec(staging)} (world -Z 0.30 m)")
         print(f"   Pregrasp TCP {harvest.vec(pregrasp)} (world -Z 0.15 m)")
         planned = harvest.AppleHarvestFSM(
@@ -1172,8 +1162,6 @@ class MotionEngine:
             approach_rotation=rotation,
             max_physics_steps=0,
             contact_guard=contact_guard,
-            external_waypoints=external_waypoints,
-            external_waypoint_rotations=external_rotations,
             execution_guard=self._check_execution_guard,
             pause_callback=self._publish_pause,
             resume_callback=self._publish_resume,
@@ -1227,7 +1215,7 @@ class MotionEngine:
         """stem 분리 후 사과가 실제로 그리퍼를 따라왔는지 확인한다.
 
         stem이 끊겼더라도 파지가 불완전하면 사과가 그 자리에 떨어진다. 이
-        경우까지 성공으로 보고하면 개인 PC 1이 빈 그리퍼로 TRANSPORT와
+        경우까지 성공으로 보고하면 GPU PC 1 supervisor가 빈 그리퍼로 TRANSPORT와
         PLACE를 진행한다. 단독 실행 경로(apple_pick.py)는 같은 검사를
         APPLE_GRASP_MAX_DISTANCE_M로 수행한다.
         """
@@ -1379,6 +1367,10 @@ class MotionEngine:
             motion_state = self.fsm.NAMES[self.fsm.state]
             self.tree_contact.set_state(motion_state)
             self.apple_contact.set_state(motion_state)
+
+            if motion_state in RRT_FSM_STATES:
+                self._run_rrt_fsm_state(handle, motion_state)
+                continue
 
             if self._handle_entry_apple_contact(
                 motion_state, current_arm_positions
@@ -1571,6 +1563,160 @@ class MotionEngine:
                 "palm-사과 접촉이 확인되지 않아 GRASP를 허용하지 않습니다.",
             )
         self.feedback(handle, stop_state, 1.0)
+
+    def _run_rrt_fsm_state(self, handle, motion_state):
+        """비접촉 장거리 FSM 상태를 RRT→trajectory→RMPflow로 실행한다."""
+        target, rotation, state_steps, _grip0, grip1 = self.fsm.specs[
+            self.fsm.state
+        ]
+        trajectory = self.collision_motion.plan_rrt_trajectory(
+            self.robot,
+            target,
+            rotation,
+            motion_state,
+        )
+        if trajectory is None:
+            raise harvest.ApproachUnreachableError(
+                f"{motion_state} Lula RRT/trajectory 생성에 실패했습니다."
+            )
+        duration = float(trajectory.end_time - trajectory.start_time)
+        sample_count = max(
+            2,
+            int(
+                harvest.np.ceil(
+                    duration / harvest.RRT_TRAJECTORY_SAMPLE_DT_S
+                )
+            )
+            + 1,
+        )
+        self._set_gripper_drive_max_force(
+            (
+                harvest.GRIPPER_HOLD_MAX_FORCE
+                if grip1 > 0.5
+                else harvest.GRIPPER_GRASP_MAX_FORCE
+            ),
+            f"{motion_state} RRT",
+            report=True,
+        )
+        for sample_index, sample_time in enumerate(
+            harvest.np.linspace(
+                trajectory.start_time,
+                trajectory.end_time,
+                sample_count,
+            )
+        ):
+            self._check_execution_guard()
+            pause_reported = False
+            while not self.world.is_playing():
+                self._check_execution_guard()
+                if not pause_reported:
+                    self._publish_pause()
+                    pause_reported = True
+                harvest.simulation_app.update()
+            if pause_reported:
+                self._publish_resume()
+            joint_target, _joint_velocity = trajectory.get_joint_targets(
+                sample_time
+            )
+            self.collision_motion.set_trajectory_cspace_target(joint_target)
+            action = self.collision_motion.next_action()
+            if action.joint_positions is None or not harvest.np.all(
+                harvest.np.isfinite(action.joint_positions)
+            ):
+                raise MotionExecutionError(
+                    "300:IK_FAILED",
+                    f"{motion_state} trajectory 추종 중 RMPflow 목표가 유효하지 않습니다.",
+                )
+            self.robot.apply_action(action)
+            harvest.apply_gripper_target(
+                self.robot,
+                self.gripper_indices,
+                grip1,
+                open_positions=self.entry_preshape,
+            )
+            self.feedback(
+                handle,
+                motion_state,
+                (sample_index + 1) / float(sample_count),
+            )
+            self.world.step(render=not harvest.args.headless)
+            if self.tree_contact.detected:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    f"{motion_state} RRT 실행 중 실제 로봇 collider가 나무와 "
+                    f"접촉했습니다: robot={self.tree_contact.robot_path}, "
+                    f"tree={self.tree_contact.tree_path}",
+                )
+            if sample_index == 0 or (sample_index + 1) % 60 == 0:
+                actual, actual_rotation = self._current_tcp_pose()
+                print(
+                    f"   RRT FSM      {motion_state:8s} "
+                    f"{sample_index + 1:3d}/{sample_count} "
+                    f"position {harvest.np.linalg.norm(target - actual):.4f} m, "
+                    f"rotation {harvest.rotation_error_deg(actual_rotation, rotation):.2f} deg"
+                )
+
+        # 시간 궤적 추종 뒤 남은 오차는 같은 planning world의 task-space
+        # 목표로 제한된 횟수만 정착시킨다.
+        self.collision_motion.set_target(target, rotation)
+        actual = None
+        actual_rotation = None
+        for settle_index in range(harvest.MAX_TARGET_SETTLE_STEPS):
+            self._check_execution_guard()
+            pause_reported = False
+            while not self.world.is_playing():
+                self._check_execution_guard()
+                if not pause_reported:
+                    self._publish_pause()
+                    pause_reported = True
+                harvest.simulation_app.update()
+            if pause_reported:
+                self._publish_resume()
+            action = self.collision_motion.next_action()
+            if action.joint_positions is None or not harvest.np.all(
+                harvest.np.isfinite(action.joint_positions)
+            ):
+                raise MotionExecutionError(
+                    "300:IK_FAILED",
+                    f"{motion_state} 최종 pose 정착 목표가 유효하지 않습니다.",
+                )
+            self.robot.apply_action(action)
+            harvest.apply_gripper_target(
+                self.robot,
+                self.gripper_indices,
+                grip1,
+                open_positions=self.entry_preshape,
+            )
+            self.world.step(render=not harvest.args.headless)
+            actual, actual_rotation = self._current_tcp_pose()
+            position_error = float(harvest.np.linalg.norm(target - actual))
+            orientation_error = harvest.rotation_error_deg(
+                actual_rotation,
+                rotation,
+            )
+            if (
+                position_error <= harvest.TARGET_POSITION_TOLERANCE_M
+                and orientation_error <= harvest.TARGET_ORIENTATION_TOLERANCE_DEG
+            ):
+                break
+            if self.tree_contact.detected:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    f"{motion_state} 정착 중 실제 로봇 collider가 나무와 접촉했습니다.",
+                )
+        else:
+            raise MotionExecutionError(
+                "304:MOTION_TIMEOUT",
+                f"{motion_state} RRT trajectory 최종 pose에 정착하지 못했습니다.",
+            )
+
+        self.fsm.frame = state_steps
+        advance_result = self.fsm.advance(actual, actual_rotation)
+        if advance_result not in {"advanced", "done"}:
+            raise MotionExecutionError(
+                "304:MOTION_TIMEOUT",
+                f"{motion_state} RRT 상태 완료 판정에 실패했습니다: {advance_result}",
+            )
 
 
 def main():

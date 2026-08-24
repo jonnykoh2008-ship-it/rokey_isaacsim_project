@@ -4,23 +4,26 @@
 
 컨베이어 2 상단 D455 카메라 한 대로 사과 영상을 수집하고 상·중·하 등급을 산출한다. 수확용 사과 위치 인식과는 별도 기능이다.
 
-v2.0에서도 품질 파이프라인의 실행 위치는 변경하지 않는다. GPU PC 1은 컨베이어
-영상·checkpoint·대표 프레임을 발행하고 GPU PC 2는 품질 추론을 수행한다. 개인
+v2.0에서 GPU PC 1은 컨베이어 물리·checkpoint와 컨베이어 카메라 raw RGB/depth/
+CameraInfo 스트림을 발행한다. GPU PC 2는 raw 스트림을 구독해 ROI/tracker, 후보
+프레임 수집, 대표 프레임 선택, 품질 추론과 사과 단위 결과 통합을 수행한다. 개인
 PC 1의 RGB-D 수확 인식과 target 발행은 이 문서의 품질 `apple_id` lifecycle과
 분리한다.
 
 ## 검사 흐름
 
-1. RGB 영상과 bounding box 검출을 상시 수행한다.
-2. tracker가 `apple_id`를 유지한다.
-3. ROI 진입 시 `inspection_id`를 생성하고 후보 프레임을 수집한다.
-4. 후보 프레임 중 대표 프레임을 선택한다.
-5. GPU PC 2가 프레임별 품질을 추론한다.
-6. 프레임 결과를 사과 단위로 통합한다.
-7. ROI 이탈 시 `QualityResult`를 확정한다.
-8. ID가 유실·변경되거나 관측이 부족하면 `RECHECK`로 처리한다.
+1. GPU PC 2가 raw RGB/depth/CameraInfo를 수신하고 RGB 영상과 bounding box 검출을 상시 수행한다.
+2. GPU PC 2의 tracker가 `apple_id`를 유지한다.
+3. GPU PC 2가 ROI 진입 시 `inspection_id`를 생성하고 후보 프레임을 수집한다.
+4. GPU PC 2가 후보 프레임 중 대표 프레임을 선택한다.
+5. GPU PC 2가 대표 프레임별 품질을 추론한다.
+6. GPU PC 2가 프레임 결과를 사과 단위로 통합한다.
+7. GPU PC 2가 ROI 이탈 시 `QualityResult`를 확정한다.
+8. ID가 유실·변경되거나 관측이 부족하면 GPU PC 2가 `RECHECK`로 처리한다.
 
-ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고, 흔들림·blur·중복 시점을 제외한 대표 프레임 4~6장을 추론에 사용한다. 결과에는 실제 사용한 `frame_index`를 기록한다.
+GPU PC 2는 ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고,
+흔들림·blur·중복 시점을 제외한 대표 프레임 4~6장을 추론에 사용한다. 결과에는
+실제 사용한 `frame_index`를 기록한다.
 
 ## 대표 프레임 선택
 
@@ -34,7 +37,9 @@ ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고
 
 90%, 80%, 100, 45°는 초기 시험값이며 시험 결과에 따라 조정한다.
 
-카메라 ROI는 수집의 시작과 종료를 판단한다. trigger collider는 컨베이어 진입·이탈 시각, 점유시간과 공정 상태 전환을 측정하며 대표 프레임 선택에는 직접 사용하지 않는다.
+GPU PC 2의 카메라 ROI는 영상 수집의 시작과 종료를 판단한다. GPU PC 1의 trigger
+collider/checkpoint event는 컨베이어 진입·이탈 시각, 점유시간 및 공정 상태 전환을
+제공하며 대표 프레임 선택 자체에는 직접 사용하지 않는다.
 
 ## 등급 규칙
 
@@ -99,11 +104,12 @@ ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고
 
 ```text
 GPU PC 1
-후보 프레임 수집 및 대표 프레임 선택
-  → inspection_id + apple_id + frame_index + compressed image
+컨베이어 raw RGB/depth/CameraInfo + checkpoint event
+  → GPU PC 2
 
 GPU PC 2
-이미지별 품질 추론 및 사과 단위 통합
+ROI/tracker + 후보 프레임 수집 및 대표 프레임 선택
+  → 이미지별 품질 추론 및 사과 단위 통합
   → QualityResult
 
 MVP

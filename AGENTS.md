@@ -24,7 +24,7 @@ executes and maintains the function, not the PC that happens to discover a bug.
 | Owner | Responsibilities | Current owned source examples |
 |---|---|---|
 | GPU PC 1 | Isaac Sim, physics, RGB-D/CameraInfo/TF sensors, planning-scene publication, Lula RRT/trajectory/RMPflow planning and execution, robot Action execution, motion visualization, and runtime safety monitoring | `apple_pick.py`, `vision_apple_pick.py`, `base_camera_publish.py`, `harvest_coordinator.py`, `harvest_route_planner.py` (v2.0 execution ownership), Isaac Sim robot/gripper assets and runtime configuration |
-| GPU PC 2 | Quality-image inference and apple-level quality-result integration | Quality inference and result-integration source; current path is `TBD` |
+| GPU PC 2 | Conveyor-camera subscription, ROI/tracker, candidate-frame collection and representative-frame selection, quality-image inference, and apple-level quality-result integration | Quality capture/inference and result-integration source; current path is `TBD` |
 | Personal PC 1 | RGB-D video subscription, apple detection, depth projection, world-coordinate target publication, and remote RViz display | PC1 perception node and RViz configuration; current path is `TBD` |
 | Personal PC 2 | Monitoring, result display, retry requests, and phase-2 pusher selection | Monitoring and pusher-selection source; current path is `TBD` |
 
