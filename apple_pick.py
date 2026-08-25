@@ -3658,9 +3658,22 @@ class CollisionAwareMotion:
                 f"{maximum_per_joint_step[index]:.3f}rad"
                 for index in excessive_indices
             )
-            raise ApproachUnreachableError(
-                f"RRT 경로가 2π 등가 관절의 짧은 회전을 사용하지 않았습니다: {detail}"
-            )
+            if explicit_cspace_goal:
+                # _unwrap_periodic_path는 각 waypoint에서 관절 limit 안의 모든
+                # q±2π 표현 중 직전 값과 가장 가까운 것을 이미 선택했다. 그
+                # 결과도 π보다 크다면 limit 안에 더 짧은 등가 표현이 없는
+                # 경우다. RETURN_INITIAL처럼 목표 관절값이 명시된 경로는 아래
+                # 60 Hz trajectory limit·전체 링크 충돌 검증을 조건으로 이
+                # 연속 장거리 회전을 허용한다.
+                print(
+                    f"   [RRT LIMIT-CONSTRAINED ROTATION] {segment_name}: "
+                    f"short q±2π equivalent unavailable within limits; {detail}"
+                )
+            else:
+                raise ApproachUnreachableError(
+                    "RRT 경로가 2π 등가 관절의 짧은 회전을 사용하지 "
+                    f"않았습니다: {detail}"
+                )
         maximum_joint_step = float(
             np.max(np.linalg.norm(joint_differences, axis=1))
         )
