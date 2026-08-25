@@ -2032,9 +2032,14 @@ class MotionEngine:
                     f"tree={self.tree_contact.tree_path}",
                 )
 
-        # 시간 궤적 끝의 작은 추종 오차를 저장된 c-space 목표로 정착시킨다.
+        # RRT는 현재 자세에서 가까운 q±2π 등가 초기 자세를 선택할 수 있다.
+        # 정착 단계에서 원본 [0, 0, -π/2, 0, π/2, 0]을 다시 명령하면
+        # joint_4/joint_6이 불필요하게 한 바퀴 재회전하므로, 궤적의 마지막
+        # 등가 목표를 그대로 유지한다. 완료 여부는 아래에서 초기 TCP pose로
+        # 판정하므로 공간상의 초기 자세 기준은 바뀌지 않는다.
+        settle_joint_target = harvest.np.asarray(joint_target, dtype=float).copy()
         self.collision_motion.set_trajectory_cspace_target(
-            self.initial_arm_positions
+            settle_joint_target
         )
         for settle_index in range(harvest.MAX_TARGET_SETTLE_STEPS):
             self._check_execution_guard()

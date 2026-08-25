@@ -134,9 +134,9 @@ SCENE_01_ROOT_PATH = f"{TREE_ROOT_PATH}/scene_01"
 PLANNING_OBSTACLE_ROOT_PATH = "/World/RuntimeHarvestPlanningObstacles"
 RUNTIME_TREE_COLLIDER_ROOT_PATH = "/World/RuntimeHarvestTreeColliders"
 COLLISION_DEBUG_ROOT_PATH = "/World/RuntimeHarvestCollisionDebug"
-CONVEYOR_PATH = "/World/ConveyorBelt_A08_PR_NVD_01"
+CONVEYOR_PATH = "/World/ConveyorTrack"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
-FIXED_CAMERA_ROOT_PATHS = ["/World/base_rsd455", "/conv_rsd455"]
+FIXED_CAMERA_ROOT_PATHS = ["/World/base_rsd455"]
 
 EE_FRAME_NAME = "link_6"
 _LINK6_TO_PALM_TRANSLATION = None
