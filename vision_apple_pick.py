@@ -599,6 +599,18 @@ class MotionEngine:
         self.entry_preshape = harvest.GRIPPER_OPEN.copy()
         # swept clearance를 측정한 시점의 기준 자세와 여유이다.
         self.entry_reference = None
+        self.initial_arm_positions = harvest.INITIAL_ARM_JOINTS_RAD.copy()
+        self.initial_gripper_positions = (
+            self._require_gripper_joint_positions().copy()
+        )
+        (
+            self.initial_tcp_position,
+            self.initial_tcp_rotation,
+        ) = (value.copy() for value in self._current_tcp_pose())
+        print(
+            f"   Initial state arm={harvest.vec(self.initial_arm_positions)}, "
+            f"TCP={harvest.vec(self.initial_tcp_position)}"
+        )
 
     def close(self):
         self.joint_break.close()
@@ -1076,6 +1088,8 @@ class MotionEngine:
                             "않았습니다.",
                         )
                     self._verify_apple_follows_gripper("PULL")
+                if request.motion_type == RobotMotion.Goal.RETRACT:
+                    self._return_to_initial(handle)
         except MotionExecutionError as error:
             self._hold_robot()
             self._reset_action_sequence(error.error_code)
@@ -1933,6 +1947,156 @@ class MotionEngine:
                 "304:MOTION_TIMEOUT",
                 f"{motion_state} RRT 상태 완료 판정에 실패했습니다: {advance_result}",
             )
+
+    def _return_to_initial(self, handle):
+        """컨베이어 이탈 후 저장된 초기 관절 자세로 안전하게 복귀한다."""
+        if self.collision_motion is None:
+            raise MotionExecutionError(
+                "306:GOAL_REJECTED",
+                "초기 자세 복귀에 사용할 planning world가 없습니다.",
+            )
+        self.tree_contact.reset()
+        self.tree_contact.set_state("RETURN_INITIAL")
+        self.feedback(handle, "RETURN_INITIAL_RRT_PLANNING", 0.0)
+        print("   [RETURN INITIAL] saved c-space goal planning", flush=True)
+        trajectory = self.collision_motion.plan_rrt_cspace_trajectory(
+            self.robot,
+            self.initial_arm_positions,
+            "RETURN_INITIAL",
+        )
+        if trajectory is None:
+            raise harvest.ApproachUnreachableError(
+                "초기 관절 자세로 돌아가는 Lula RRT/trajectory 생성에 실패했습니다."
+            )
+
+        duration = float(trajectory.end_time - trajectory.start_time)
+        sample_count = max(
+            2,
+            int(
+                harvest.np.ceil(
+                    duration / harvest.RRT_TRAJECTORY_SAMPLE_DT_S
+                )
+            )
+            + 1,
+        )
+        self._set_gripper_drive_max_force(
+            harvest.GRIPPER_GRASP_MAX_FORCE,
+            "RETURN_INITIAL",
+            report=True,
+        )
+        for sample_index, sample_time in enumerate(
+            harvest.np.linspace(
+                trajectory.start_time,
+                trajectory.end_time,
+                sample_count,
+            )
+        ):
+            self._check_execution_guard()
+            pause_reported = False
+            while not self.world.is_playing():
+                self._check_execution_guard()
+                if not pause_reported:
+                    self._publish_pause()
+                    pause_reported = True
+                harvest.simulation_app.update()
+            if pause_reported:
+                self._publish_resume()
+            joint_target, _joint_velocity = trajectory.get_joint_targets(sample_time)
+            self.collision_motion.set_trajectory_cspace_target(joint_target)
+            action = self.collision_motion.next_action()
+            if action.joint_positions is None or not harvest.np.all(
+                harvest.np.isfinite(action.joint_positions)
+            ):
+                raise MotionExecutionError(
+                    "300:IK_FAILED",
+                    "RETURN_INITIAL trajectory 추종 목표가 유효하지 않습니다.",
+                )
+            self.robot.apply_action(action)
+            harvest.apply_gripper_target(
+                self.robot,
+                self.gripper_indices,
+                0.0,
+                open_positions=self.initial_gripper_positions,
+            )
+            self.feedback(
+                handle,
+                "RETURN_INITIAL",
+                0.9 * (sample_index + 1) / float(sample_count),
+            )
+            self.world.step(render=not harvest.args.headless)
+            if self.tree_contact.detected:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    "RETURN_INITIAL 중 실제 로봇 collider가 나무와 접촉했습니다: "
+                    f"robot={self.tree_contact.robot_path}, "
+                    f"tree={self.tree_contact.tree_path}",
+                )
+
+        # 시간 궤적 끝의 작은 추종 오차를 저장된 c-space 목표로 정착시킨다.
+        self.collision_motion.set_trajectory_cspace_target(
+            self.initial_arm_positions
+        )
+        for settle_index in range(harvest.MAX_TARGET_SETTLE_STEPS):
+            self._check_execution_guard()
+            pause_reported = False
+            while not self.world.is_playing():
+                self._check_execution_guard()
+                if not pause_reported:
+                    self._publish_pause()
+                    pause_reported = True
+                harvest.simulation_app.update()
+            if pause_reported:
+                self._publish_resume()
+            action = self.collision_motion.next_action()
+            if action.joint_positions is None or not harvest.np.all(
+                harvest.np.isfinite(action.joint_positions)
+            ):
+                raise MotionExecutionError(
+                    "300:IK_FAILED",
+                    "RETURN_INITIAL 최종 정착 목표가 유효하지 않습니다.",
+                )
+            self.robot.apply_action(action)
+            harvest.apply_gripper_target(
+                self.robot,
+                self.gripper_indices,
+                0.0,
+                open_positions=self.initial_gripper_positions,
+            )
+            self.world.step(render=not harvest.args.headless)
+            if self.tree_contact.detected:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    "RETURN_INITIAL 정착 중 실제 로봇 collider가 나무와 접촉했습니다.",
+                )
+            actual_tcp, actual_rotation = self._current_tcp_pose()
+            position_error = float(
+                harvest.np.linalg.norm(
+                    actual_tcp - self.initial_tcp_position
+                )
+            )
+            orientation_error = harvest.rotation_error_deg(
+                actual_rotation,
+                self.initial_tcp_rotation,
+            )
+            if (
+                position_error <= harvest.TARGET_POSITION_TOLERANCE_M
+                and orientation_error
+                <= harvest.TARGET_ORIENTATION_TOLERANCE_DEG
+            ):
+                self.feedback(handle, "RETURN_INITIAL", 1.0)
+                print(
+                    "   [RETURN INITIAL] complete: "
+                    f"position {position_error:.4f} m, "
+                    f"rotation {orientation_error:.2f} deg, "
+                    f"settle {settle_index + 1} steps"
+                )
+                return
+        raise MotionExecutionError(
+            "304:MOTION_TIMEOUT",
+            "초기 자세에 정착하지 못했습니다: "
+            f"position={position_error:.4f} m, "
+            f"rotation={orientation_error:.2f} deg",
+        )
 
 
 def main():
