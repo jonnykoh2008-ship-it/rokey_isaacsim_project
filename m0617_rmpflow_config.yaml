@@ -83,9 +83,19 @@ body_cylinders:
       radius: 0.11
 
 body_collision_controllers:
+    # m0617_robot_description.yaml의 링크별 collision sphere 최대
+    # 반경과 맞춰 상위 팔 링크도 나무 장애물 반발에 포함한다.
+    - name: link_1
+      radius: 0.10
+    - name: link_2
+      radius: 0.09
+    - name: link_3
+      radius: 0.10
+    - name: link_4
+      radius: 0.10
     - name: link_5
-      radius: 0.07
+      radius: 0.10
     - name: link_6
-      radius: 0.07
+      radius: 0.06
     - name: gripper_frame
       radius: 0.09
