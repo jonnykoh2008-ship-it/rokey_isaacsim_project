@@ -56,9 +56,12 @@ Action과 Service 표에서 서버는 요청을 실행하는 쪽이고 클라이
 타입: appleproj_interfaces/msg/HarvestTarget
 송신: 개인 PC 1
 수신: GPU PC 1
-QoS: Reliable, Volatile, Keep Last 1
+QoS: Reliable, Volatile, Keep Last 10
 frame_id: world
 ```
+
+동일 토픽에 여러 `target_id`가 연속 발행되므로 publisher와 subscriber 모두
+위 QoS를 사용한다.
 
 필드:
 
@@ -85,6 +88,12 @@ pre-grasp pose를 발행하지 않으며, GPU PC 1이 현재 로봇 상태와 pl
 Action 실행이 시작된 target의 후속 갱신은 새 Goal로 실행하지 않는다. 실패한 target은
 `/harvest/motion_status`로 거부 사유를 반환한다. `/harvest/target`에는 Transient
 Local을 사용하지 않는다.
+
+GPU PC 1은 아직 시작하지 않은 target을 ID별 대기열에 보관하고 robot base에서
+가까운 순서로 실행한다. 접촉 전 첫 실패는 일반 대기열 뒤의 재시도 대기열로
+이동하며 다른 target을 모두 처리한 뒤 1회만 재시도한다. 접촉 이후 실패는 다음
+Goal을 보내지 않고 안전 정지한다. 이 정책은 메시지 필드를 추가하지 않으며 모든
+lifecycle key는 `(reset_id, target_id)`를 사용한다.
 
 ## HarvestPerceptionStatus
 

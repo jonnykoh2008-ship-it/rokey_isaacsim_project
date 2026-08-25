@@ -64,8 +64,18 @@ proxy를 사용하고, D455 obstacle point cloud 전환 시에도 동일한 안�
 
 ## 다중 사과
 
-- 사과별 target과 ID를 연결한다.
-- ID 메시지 규격, tracker 연동, 여러 target의 우선순위 및 중복 제거는 `TBD`다.
+- 같은 `reset_id`에서 최초로 모든 유효 후보가 확보된 프레임의 world 위치를
+  기준으로 `apple_001`, `apple_002`, ... ID를 부여한다. ID 부여 순서는 world
+  XYZ 오름차순으로 고정한다.
+- 이후 프레임은 기존 track의 마지막 world 위치에서 100mm 이내인 최근접 후보만
+  같은 ID로 연결한다. 이 100mm는 명목 지름 80mm 사과의 시뮬레이션용 임시값이다.
+- 최초 ID 집합이 만들어진 뒤 같은 `reset_id`에서는 새 ID를 추가하지 않는다.
+  따라서 수확되어 컨베이어로 이동한 사과가 새 target으로 재등록되지 않는다.
+- 개인 PC 1은 한 프레임의 유효 track을 모두 `/harvest/target`으로 발행한다.
+  GPU PC 1은 ID별 최신 표본을 보관하므로 발행 순서는 수확 우선순위를 결정하지
+  않는다.
+- GPU PC 1은 로봇 base에서 가까운 target부터 실행하고, 실행 중 수신한 다른
+  target은 대기열에 저장한다.
 - 같은 `reset_id`에서 target timestamp가 오래되거나 ID가 재사용되면 GPU PC 1은
   해당 target을 거부하고 개인 PC 1에 상태를 반환한다.
 
