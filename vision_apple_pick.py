@@ -59,6 +59,7 @@ from appleproj_interfaces.msg import (
 from appleproj_interfaces.srv import GetPlanningScene
 from geometry_msgs.msg import PoseStamped
 from isaacsim.core.utils.extensions import enable_extension
+from isaacsim.core.prims import SingleArticulation
 from pxr import Usd, UsdGeom
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
@@ -130,6 +131,197 @@ ERROR_CODES = {
 CAMERA_PATH = "/World/base_rsd455/RSD455/Camera_OmniVision_OV9782_Color"
 CAMERA_GRAPH_PATH = "/BaseCameraRosGraph"
 ROBOT_TF_GRAPH_PATH = "/RobotTfRosGraph"
+
+
+@dataclass(frozen=True)
+class PusherJointConfig:
+    pusher_id: int
+    articulation_prim_path: str
+    joint_name: str
+    home_position_m: float
+    extended_position_m: float
+    position_tolerance_m: float
+    jam_effort_threshold_n: float
+
+
+def _required_environment(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"필수 푸셔 런타임 설정이 없습니다: {name}")
+    return value
+
+
+def pushers_enabled():
+    """Keep harvesting runnable when the optional phase-2 pusher is absent."""
+    value = os.environ.get("APPLEPROJ_ENABLE_PUSHERS", "0").strip().lower()
+    if value in ("0", "false", "no", "off", ""):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise RuntimeError(
+        "APPLEPROJ_ENABLE_PUSHERS는 1/true/on 또는 0/false/off여야 합니다"
+    )
+
+
+def load_pusher_configuration(timing_config_type):
+    """Load physical values without inventing defaults for still-TBD requirements."""
+    configs = []
+    for pusher_id in (1, 2, 3):
+        prefix = f"APPLEPROJ_PUSHER_{pusher_id}"
+        try:
+            home = float(_required_environment(f"{prefix}_HOME_M"))
+            extended = float(_required_environment(f"{prefix}_EXTENDED_M"))
+            tolerance = float(_required_environment(f"{prefix}_POSITION_TOLERANCE_M"))
+            jam_effort = float(_required_environment(f"{prefix}_JAM_EFFORT_N"))
+        except ValueError as exc:
+            raise RuntimeError(f"{prefix} 수치 설정이 실수가 아닙니다") from exc
+        if home == extended or tolerance <= 0.0 or jam_effort <= 0.0:
+            raise RuntimeError(
+                f"{prefix}: home/extended는 달라야 하고 tolerance/effort는 양수여야 합니다"
+            )
+        configs.append(
+            PusherJointConfig(
+                pusher_id=pusher_id,
+                articulation_prim_path=_required_environment(f"{prefix}_PRIM_PATH"),
+                joint_name=_required_environment(f"{prefix}_JOINT_NAME"),
+                home_position_m=home,
+                extended_position_m=extended,
+                position_tolerance_m=tolerance,
+                jam_effort_threshold_n=jam_effort,
+            )
+        )
+    try:
+        timing = timing_config_type(
+            trigger_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_TRIGGER_TIMEOUT_S")),
+            push_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_PUSH_TIMEOUT_S")),
+            home_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_HOME_TIMEOUT_S")),
+        )
+    except ValueError as exc:
+        raise RuntimeError("푸셔 timeout 설정이 유효한 양수가 아닙니다") from exc
+    return configs, timing
+
+
+class IsaacPrismaticPusherActuator:
+    """Position-drive adapter for three configured Isaac Sim articulations."""
+
+    def __init__(self, world, configs):
+        self.configs = {config.pusher_id: config for config in configs}
+        self.articulations = {}
+        self.joint_indices = {}
+        prim_paths = [config.articulation_prim_path for config in configs]
+        if len(set(prim_paths)) != len(prim_paths):
+            raise RuntimeError("각 푸셔는 서로 다른 articulation prim path를 사용해야 합니다")
+        for config in configs:
+            articulation = world.scene.add(
+                SingleArticulation(
+                    prim_path=config.articulation_prim_path,
+                    name=f"conveyor_pusher_{config.pusher_id}",
+                )
+            )
+            self.articulations[config.pusher_id] = articulation
+
+    @property
+    def available(self):
+        return True
+
+    def validate_initialized(self):
+        for pusher_id, articulation in self.articulations.items():
+            config = self.configs[pusher_id]
+            if not articulation.handles_initialized:
+                raise RuntimeError(
+                    f"PUSHER_{pusher_id} articulation handle 초기화 실패: "
+                    f"{config.articulation_prim_path}"
+                )
+            if config.joint_name not in articulation.dof_names:
+                raise RuntimeError(
+                    f"PUSHER_{pusher_id} joint를 찾을 수 없습니다: {config.joint_name}"
+                )
+            index = articulation.get_dof_index(config.joint_name)
+            properties = articulation.dof_properties[index]
+            if int(properties["type"]) != 2:
+                raise RuntimeError(
+                    f"PUSHER_{pusher_id} joint가 prismatic DOF가 아닙니다: {config.joint_name}"
+                )
+            if not bool(properties["hasLimits"]):
+                raise RuntimeError(f"PUSHER_{pusher_id} prismatic joint limit이 없습니다")
+            lower = float(properties["lower"])
+            upper = float(properties["upper"])
+            for label, target in (
+                ("home", config.home_position_m),
+                ("extended", config.extended_position_m),
+            ):
+                if target < lower or target > upper:
+                    raise RuntimeError(
+                        f"PUSHER_{pusher_id} {label} target {target}가 "
+                        f"joint limit [{lower}, {upper}] 밖입니다"
+                    )
+            if float(properties["maxVelocity"]) <= 0.0 or float(properties["maxEffort"]) <= 0.0:
+                raise RuntimeError(
+                    f"PUSHER_{pusher_id} joint maxVelocity/maxEffort가 유효하지 않습니다"
+                )
+            self.joint_indices[pusher_id] = int(index)
+
+    def _position(self, pusher_id):
+        articulation = self.articulations[pusher_id]
+        index = self.joint_indices[pusher_id]
+        value = articulation.get_joint_positions(
+            joint_indices=harvest.np.asarray([index], dtype=harvest.np.int32)
+        )
+        if value is None or len(value) != 1 or not harvest.np.isfinite(value[0]):
+            raise RuntimeError(f"PUSHER_{pusher_id} joint position을 읽을 수 없습니다")
+        return float(value[0])
+
+    def _command(self, pusher_id, target):
+        articulation = self.articulations[pusher_id]
+        index = self.joint_indices[pusher_id]
+        articulation.apply_action(
+            harvest.ArticulationAction(
+                joint_positions=harvest.np.asarray([target], dtype=float),
+                joint_indices=harvest.np.asarray([index], dtype=harvest.np.int32),
+            )
+        )
+
+    def is_home(self, pusher_id):
+        config = self.configs[pusher_id]
+        return abs(self._position(pusher_id) - config.home_position_m) <= config.position_tolerance_m
+
+    def begin_extend(self, pusher_id):
+        self._command(pusher_id, self.configs[pusher_id].extended_position_m)
+
+    def is_extended(self, pusher_id):
+        config = self.configs[pusher_id]
+        return (
+            abs(self._position(pusher_id) - config.extended_position_m)
+            <= config.position_tolerance_m
+        )
+
+    def begin_retract(self, pusher_id):
+        self._command(pusher_id, self.configs[pusher_id].home_position_m)
+
+    def is_jammed(self, pusher_id):
+        articulation = self.articulations[pusher_id]
+        index = self.joint_indices[pusher_id]
+        effort = articulation.get_measured_joint_efforts(
+            joint_indices=harvest.np.asarray([index], dtype=harvest.np.int32)
+        )
+        if effort is None or len(effort) != 1 or not harvest.np.isfinite(effort[0]):
+            raise RuntimeError(f"PUSHER_{pusher_id} joint effort를 읽을 수 없습니다")
+        return abs(float(effort[0])) >= self.configs[pusher_id].jam_effort_threshold_n
+
+    def progress(self, pusher_id, extending):
+        config = self.configs[pusher_id]
+        span = config.extended_position_m - config.home_position_m
+        extension = (self._position(pusher_id) - config.home_position_m) / span
+        extension = max(0.0, min(1.0, extension))
+        return extension if extending else 1.0 - extension
+
+    def stop_all(self):
+        for pusher_id in self.configs:
+            self._command(pusher_id, self._position(pusher_id))
+
+    def try_home_all(self):
+        for pusher_id, config in self.configs.items():
+            self._command(pusher_id, config.home_position_m)
 
 
 def _multiply_xyzw(a, b):
@@ -2179,13 +2371,40 @@ def main():
         stage_units_in_meters=1.0, physics_prim_path="/physicsScene",
         physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0,
     )
+    pusher_actuator = None
+    pusher_timing = None
+    sort_runtime_type = None
+    if pushers_enabled():
+        try:
+            from conveyor_sort_controller import SortRuntime, TimingConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                "푸셔 기능을 활성화하려면 APPLEPROJ_INTERFACES_PREFIX에 "
+                "SortCommand와 SortStatus가 빌드되어 있어야 합니다"
+            ) from exc
+        pusher_configs, pusher_timing = load_pusher_configuration(TimingConfig)
+        pusher_actuator = IsaacPrismaticPusherActuator(world, pusher_configs)
+        sort_runtime_type = SortRuntime
+    else:
+        print(
+            "   [PUSHER] 비활성화: APPLEPROJ_ENABLE_PUSHERS=1일 때만 "
+            "SortCommand/SortStatus와 푸셔 articulation을 초기화합니다."
+        )
     robot = harvest.create_robot(world)
+    if pusher_actuator is not None:
+        pusher_actuator.validate_initialized()
+        pusher_actuator.try_home_all()
     # create_robot 안의 world.reset()이 articulation과 PhysX view를 초기화한
     # 뒤라야 TF/JointState 노드가 articulation을 찾을 수 있다. 그 전에 그래프를
     # 만들면 "did not match any articulations"로 빈 TF만 발행된다.
     create_robot_tf_graph(stage)
     rclpy.init()
     node = RobotMotionNode()
+    sort_runtime = (
+        sort_runtime_type(node, pusher_actuator, pusher_timing)
+        if sort_runtime_type is not None
+        else None
+    )
     engine = MotionEngine(
         world,
         robot,
@@ -2227,6 +2446,8 @@ def main():
         while harvest.simulation_app.is_running():
             if world.is_stopped():
                 if published_state != SimulationState.STOPPED:
+                    if sort_runtime is not None:
+                        sort_runtime.reset()
                     node.publish_state(
                         SimulationState.STOPPED,
                         "Timeline Stop: 실행 중 Goal과 이전 계획을 폐기합니다.",
@@ -2251,6 +2472,9 @@ def main():
                 )
                 engine.close()
                 world.reset()
+                if pusher_actuator is not None:
+                    pusher_actuator.validate_initialized()
+                    pusher_actuator.try_home_all()
                 engine = MotionEngine(
                     world,
                     robot,
@@ -2295,6 +2519,8 @@ def main():
                     "새 scene_version으로 실행 중입니다.",
                 )
                 continue
+            if sort_runtime is not None:
+                sort_runtime.process(float(world.current_time), simulation_ready=True)
             try:
                 pending = node.requests.get_nowait()
             except queue.Empty:
@@ -2310,6 +2536,9 @@ def main():
                 )
                 engine.close()
                 world.reset()
+                if pusher_actuator is not None:
+                    pusher_actuator.validate_initialized()
+                    pusher_actuator.try_home_all()
                 engine = MotionEngine(
                     world,
                     robot,
@@ -2334,6 +2563,8 @@ def main():
             )
             pending.finished.set()
     finally:
+        if sort_runtime is not None:
+            sort_runtime.reset()
         engine.close()
         executor.shutdown()
         node.destroy_node()
