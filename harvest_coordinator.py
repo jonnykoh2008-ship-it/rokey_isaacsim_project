@@ -2,6 +2,7 @@
 
 import argparse
 from collections import deque
+from dataclasses import dataclass
 import math
 
 import numpy as np
@@ -57,6 +58,14 @@ TARGET_TOPIC = "/harvest/target"
 PERCEPTION_STATUS_TOPIC = "/harvest/perception_status"
 
 
+@dataclass
+class PendingTarget:
+    key: tuple
+    message: HarvestTarget
+    center: np.ndarray
+    stamp_ns: int
+
+
 class HarvestCoordinator(Node):
     def __init__(self, execute, sample_count, maximum_spread):
         if int(sample_count) <= 0:
@@ -68,7 +77,15 @@ class HarvestCoordinator(Node):
             parameter_overrides=[Parameter("use_sim_time", value=True)],
         )
         self.execute_enabled = execute
+        self.sample_count = int(sample_count)
         self.samples = deque(maxlen=sample_count)
+        self.target_samples = {}
+        self.pending_targets = {}
+        self.retry_targets = {}
+        self.completed_target_keys = set()
+        self.failed_once_target_keys = set()
+        self.final_failed_target_keys = set()
+        self._active_candidate = None
         self.maximum_spread = maximum_spread
         self.target = None
         self.failed_target = None
@@ -127,7 +144,7 @@ class HarvestCoordinator(Node):
         )
         target_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=10,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
@@ -147,6 +164,9 @@ class HarvestCoordinator(Node):
             perception_status_qos,
         )
         self.snapshot_retry_timer = self.create_timer(0.5, self._retry_snapshot)
+        # 같은 RGB-D timestamp의 여러 target callback이 모두 대기열에 들어온
+        # 뒤 거리 우선순위를 계산하도록 짧게 모아서 dispatch한다.
+        self.queue_dispatch_timer = self.create_timer(0.05, self._start_next_target)
 
     @staticmethod
     def _optional_threshold(value):
@@ -319,6 +339,7 @@ class HarvestCoordinator(Node):
         self.goal_handle = None
         self._active_target_key = None
         self.target = None
+        self._active_candidate = None
         self.approach_orientation = None
         self.samples.clear()
         self._sample_target_key = None
@@ -493,14 +514,21 @@ class HarvestCoordinator(Node):
             self.target = None
             self.approach_orientation = None
             self.samples.clear()
+            self.target_samples.clear()
+            self.pending_targets.clear()
+            self.retry_targets.clear()
             self._sample_target_key = None
             self._active_target_key = None
+            self._active_candidate = None
             if version_changed:
                 self.failed_target = None
                 self.planning_scene = None
                 self._latest_target_stamps.clear()
                 if previous.reset_id != message.reset_id:
                     self._started_target_keys.clear()
+                    self.completed_target_keys.clear()
+                    self.failed_once_target_keys.clear()
+                    self.final_failed_target_keys.clear()
         if message.state in (SimulationState.READY, SimulationState.PLAYING):
             if (
                 self.planning_scene is None
@@ -615,13 +643,107 @@ class HarvestCoordinator(Node):
             approach_orientation,
         )
 
-    def on_target(self, message):
-        """Receive and validate the v2 HarvestTarget contract."""
-        if self.running:
-            self.get_logger().debug(
-                f"실행 중 target 갱신 무시 target_id={message.target_id}"
+    def _candidate_distance_from_robot(self, candidate):
+        if self.planning_scene is None:
+            return float("inf")
+        robot_base = self._xyz(
+            self.planning_scene.robot_base_pose.pose.position
+        )
+        return float(np.linalg.norm(candidate.center - robot_base))
+
+    def _defer_or_finish_failed_candidate(self, candidate, reason):
+        """접촉 전 첫 실패만 후순위 큐로 보내고 두 번째 실패는 종료한다."""
+        if candidate is None:
+            return
+        key = candidate.key
+        if key not in self.failed_once_target_keys:
+            self.failed_once_target_keys.add(key)
+            self.retry_targets[key] = candidate
+            self.get_logger().warning(
+                f"target_id={key[1]} 첫 실패; 다른 사과 처리 후 1회 재시도: "
+                f"{reason}"
             )
             return
+        self.retry_targets.pop(key, None)
+        self.final_failed_target_keys.add(key)
+        self.get_logger().error(
+            f"target_id={key[1]} 재시도 실패; 최종 실패 처리: {reason}"
+        )
+
+    def _handle_active_failure(self, reason, allow_deferred_retry):
+        candidate = self._active_candidate
+        self._clear_run(remember_target=True)
+        if allow_deferred_retry:
+            self._defer_or_finish_failed_candidate(candidate, reason)
+            self._start_next_target()
+            return
+        if candidate is not None:
+            self.final_failed_target_keys.add(candidate.key)
+        self.get_logger().error(
+            "접촉 이후 실패이므로 연속 수확을 안전 정지합니다: "
+            f"{reason}"
+        )
+
+    def _start_next_target(self):
+        """일반 대기열을 모두 처리한 뒤 후순위 재시도 대기열을 실행한다."""
+        if self.running:
+            return
+        while self.pending_targets or self.retry_targets:
+            queue = self.pending_targets if self.pending_targets else self.retry_targets
+            candidate = min(
+                queue.values(),
+                key=self._candidate_distance_from_robot,
+            )
+            queue.pop(candidate.key, None)
+            try:
+                reset_id, scene_version, approach_orientation = (
+                    self._prepare_approach_goal(candidate.center)
+                )
+            except (RoutePlanningError, ValueError) as error:
+                self._report_plan_failure(candidate.center, error)
+                self._defer_or_finish_failed_candidate(candidate, error)
+                continue
+
+            if not self.execute_enabled:
+                self._publish_status(
+                    "PRE_GRASP_PLANNING",
+                    True,
+                    1.0,
+                    "",
+                    f"target_id={candidate.key[1]} target·scene·접근 자세 검증 완료; "
+                    "경로 실행은 비활성화됨",
+                )
+                self.completed_target_keys.add(candidate.key)
+                continue
+
+            self.target = PoseStamped()
+            self.target.header = candidate.message.header
+            self.target.pose.position.x = float(candidate.center[0])
+            self.target.pose.position.y = float(candidate.center[1])
+            self.target.pose.position.z = float(candidate.center[2])
+            if approach_orientation is None:
+                self.target.pose.orientation.w = 1.0
+            else:
+                self.target.pose.orientation.x = float(approach_orientation[0])
+                self.target.pose.orientation.y = float(approach_orientation[1])
+                self.target.pose.orientation.z = float(approach_orientation[2])
+                self.target.pose.orientation.w = float(approach_orientation[3])
+            self.failed_target = None
+            self.plan_reset_id = int(reset_id)
+            self.plan_scene_version = int(scene_version)
+            self.approach_orientation = approach_orientation
+            self._active_target_key = candidate.key
+            self._active_candidate = candidate
+            self.running, self.index = True, 0
+            self.get_logger().info(
+                f"연속 수확 시작 target_id={candidate.key[1]}, "
+                f"pending={len(self.pending_targets)}, retry={len(self.retry_targets)}"
+            )
+            self.send_next()
+            return
+
+    def on_target(self, message):
+        """Receive and validate the v2 HarvestTarget contract."""
         validation_error = self._validate_target(message)
         if validation_error is not None:
             self._reject_target(message, validation_error)
@@ -657,9 +779,15 @@ class HarvestCoordinator(Node):
             return
 
         target_key = (int(message.reset_id), str(message.target_id))
-        if target_key in self._started_target_keys:
+        if (
+            target_key in self._started_target_keys
+            or target_key in self.completed_target_keys
+            or target_key in self.failed_once_target_keys
+            or target_key in self.final_failed_target_keys
+            or target_key == self._active_target_key
+        ):
             self.get_logger().debug(
-                "이미 Action이 시작된 HarvestTarget 갱신 무시: "
+                "이미 시작·완료·최종 실패한 HarvestTarget 갱신 무시: "
                 f"target_id={message.target_id}, reset_id={message.reset_id}"
             )
             return
@@ -675,81 +803,50 @@ class HarvestCoordinator(Node):
         self._latest_target_stamps[target_key] = stamp_ns
 
         sample = self._xyz(message.position)
-        if self._sample_target_key != target_key:
-            self.samples.clear()
-            self._sample_target_key = target_key
-        self.samples.append(sample)
-        if len(self.samples) < self.samples.maxlen:
+        samples = self.target_samples.get(target_key)
+        if samples is None:
+            samples = deque(maxlen=self.sample_count)
+            self.target_samples[target_key] = samples
+        samples.append(sample)
+        if len(samples) < samples.maxlen:
             return
-        values = np.asarray(self.samples)
+        values = np.asarray(samples)
         center = np.median(values, axis=0)
         spread = float(np.max(np.linalg.norm(values - center, axis=1)))
-        self.get_logger().info(f"target median={center}, spread={spread:.4f} m")
+        self.get_logger().info(
+            f"target_id={message.target_id} median={center}, "
+            f"spread={spread:.4f} m"
+        )
         if spread > self.maximum_spread:
             return
-        if (
-            self.failed_target is not None
-            and np.linalg.norm(center - self.failed_target) <= self.maximum_spread
-        ):
-            self.get_logger().warning(
-                "직전 실패 사과와 같은 위치이므로 자동 재시도하지 않습니다. "
-                "재시도하려면 coordinator를 다시 시작하세요."
-            )
-            self._reject_target(
-                message,
-                "직전 실패 target과 같은 위치라 자동 재시도하지 않습니다.",
-                "301:APPROACH_UNREACHABLE",
-            )
-            return
-        try:
-            reset_id, scene_version, approach_orientation = (
-                self._prepare_approach_goal(center)
-            )
-        except (RoutePlanningError, ValueError) as error:
-            self._report_plan_failure(center, error)
-            self.samples.clear()
-            return
-        if not self.execute_enabled:
-            self._publish_status(
-                "PRE_GRASP_PLANNING",
-                True,
-                1.0,
-                "",
-                "target·scene·접근 자세 검증 완료; 경로 실행은 비활성화됨",
-            )
-            self.samples.clear()
-            self._sample_target_key = None
-            return
-        self.target = PoseStamped()
-        self.target.header = message.header
-        self.target.pose.position.x = float(center[0])
-        self.target.pose.position.y = float(center[1])
-        self.target.pose.position.z = float(center[2])
-        if approach_orientation is None:
-            self.target.pose.orientation.w = 1.0
-        else:
-            self.target.pose.orientation.x = float(approach_orientation[0])
-            self.target.pose.orientation.y = float(approach_orientation[1])
-            self.target.pose.orientation.z = float(approach_orientation[2])
-            self.target.pose.orientation.w = float(approach_orientation[3])
-        self.failed_target = None
-        self.samples.clear()
-        self.plan_reset_id = int(reset_id)
-        self.plan_scene_version = int(scene_version)
-        self.approach_orientation = approach_orientation
-        self._active_target_key = target_key
-        self._sample_target_key = None
-        self.running, self.index = True, 0
-        self.send_next()
+        candidate = PendingTarget(
+            key=target_key,
+            message=message,
+            center=np.asarray(center, dtype=float).copy(),
+            stamp_ns=stamp_ns,
+        )
+        self.pending_targets[target_key] = candidate
+        self.get_logger().info(
+            f"target_id={message.target_id} 연속 수확 대기열 등록; "
+            f"pending={len(self.pending_targets)}"
+        )
 
     def send_next(self):
         if self.index >= len(SEQUENCE):
-            self.get_logger().info("수확 Action 시퀀스 완료")
-            self.running = False
-            self.target = None
-            self.samples.clear()
-            self._sample_target_key = None
-            self._active_target_key = None
+            completed_key = self._active_target_key
+            if completed_key is not None:
+                self.completed_target_keys.add(completed_key)
+                self.retry_targets.pop(completed_key, None)
+            self.get_logger().info(
+                "수확 Action 시퀀스 완료"
+                + (
+                    ""
+                    if completed_key is None
+                    else f" target_id={completed_key[1]}"
+                )
+            )
+            self._clear_run(remember_target=False)
+            self._start_next_target()
             return
         generation = self.generation
         motion_type = SEQUENCE[self.index]
@@ -758,7 +855,10 @@ class HarvestCoordinator(Node):
                 target_pose = self._current_tcp_pose()
             except RoutePlanningError as error:
                 self._report_plan_failure(self._xyz(self.target.pose.position), error)
-                self._clear_run(remember_target=True)
+                self._handle_active_failure(
+                    error,
+                    allow_deferred_retry=(self.index == 0),
+                )
                 return
         else:
             target_pose = self.target
@@ -767,7 +867,10 @@ class HarvestCoordinator(Node):
             self._publish_status(
                 "ACTION_WAIT", False, 0.0, "306:GOAL_REJECTED", "RobotMotion 서버를 찾을 수 없습니다."
             )
-            self._clear_run(remember_target=True)
+            self._handle_active_failure(
+                "RobotMotion 서버를 찾을 수 없습니다.",
+                allow_deferred_retry=(self.index == 0),
+            )
             return
         goal = RobotMotion.Goal()
         goal.motion_type = motion_type
@@ -784,7 +887,10 @@ class HarvestCoordinator(Node):
             handle = future.result()
         except Exception as error:
             self._publish_status("ACTION_WAIT", False, 0.0, "312:INTERNAL_ERROR", str(error))
-            self._clear_run(remember_target=True)
+            self._handle_active_failure(
+                error,
+                allow_deferred_retry=(self.index == 0),
+            )
             return
         if generation != self.generation or not self.running:
             if handle.accepted:
@@ -798,7 +904,10 @@ class HarvestCoordinator(Node):
                 "306:GOAL_REJECTED",
                 "simulation/scene 버전 또는 Action 상태로 Goal이 거부되었습니다.",
             )
-            self._clear_run(remember_target=True)
+            self._handle_active_failure(
+                "RobotMotion Goal이 거부되었습니다.",
+                allow_deferred_retry=(self.index == 0),
+            )
             return
         if self.index == 0 and self._active_target_key is not None:
             self._started_target_keys.add(self._active_target_key)
@@ -821,7 +930,10 @@ class HarvestCoordinator(Node):
             result = future.result().result
         except Exception as error:
             self._publish_status("ACTION_RESULT", False, 0.0, "312:INTERNAL_ERROR", str(error))
-            self._clear_run(remember_target=True)
+            self._handle_active_failure(
+                error,
+                allow_deferred_retry=(self.index == 0),
+            )
             return
         if not result.success:
             self.get_logger().error(f"{result.error_code}: {result.message}")
@@ -829,7 +941,10 @@ class HarvestCoordinator(Node):
             self._publish_status(
                 "ACTION_RESULT", False, 0.0, error_code, result.message
             )
-            self._clear_run(remember_target=True)
+            self._handle_active_failure(
+                result.message,
+                allow_deferred_retry=(self.index == 0),
+            )
             return
         self.index += 1
         self.send_next()

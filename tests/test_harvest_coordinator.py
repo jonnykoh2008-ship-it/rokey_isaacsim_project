@@ -5,9 +5,9 @@ from unittest.mock import Mock
 
 import numpy as np
 
-from appleproj_interfaces.msg import PlanningScene, SimulationState
+from appleproj_interfaces.msg import HarvestTarget, PlanningScene, SimulationState
 from geometry_msgs.msg import PoseStamped
-from harvest_coordinator import HarvestCoordinator
+from harvest_coordinator import HarvestCoordinator, PendingTarget
 from harvest_route_planner import RoutePlanningError
 
 
@@ -19,11 +19,21 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator.planning_scene = None
         coordinator.failed_target = None
         coordinator.execute_enabled = True
+        coordinator.sample_count = 1
+        coordinator.maximum_spread = 0.04
         coordinator.running = False
+        coordinator.index = 0
         coordinator._sample_target_key = None
         coordinator._active_target_key = None
+        coordinator._active_candidate = None
         coordinator._latest_target_stamps = {}
         coordinator._started_target_keys = set()
+        coordinator.target_samples = {}
+        coordinator.pending_targets = {}
+        coordinator.retry_targets = {}
+        coordinator.completed_target_keys = set()
+        coordinator.failed_once_target_keys = set()
+        coordinator.final_failed_target_keys = set()
         coordinator.target_max_age_sec = None
         coordinator.minimum_target_confidence = None
         coordinator.minimum_valid_depth_ratio = None
@@ -52,6 +62,21 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator._publish_status = Mock()
         coordinator.get_logger = Mock(return_value=Mock())
         return coordinator
+
+    @staticmethod
+    def candidate(target_id, center):
+        message = HarvestTarget()
+        message.header.frame_id = "world"
+        message.header.stamp.sec = 10
+        message.target_id = target_id
+        message.reset_id = 2
+        message.scene_version = 3
+        return PendingTarget(
+            key=(2, target_id),
+            message=message,
+            center=np.asarray(center, dtype=float),
+            stamp_ns=10_000_000_000,
+        )
 
     @staticmethod
     def target_message(
@@ -357,6 +382,91 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
             "302:COLLISION_RISK",
             "접근 경로 충돌",
         )
+
+    def test_target_received_while_running_is_queued(self):
+        coordinator = self.make_coordinator()
+        coordinator.running = True
+        coordinator.simulation_state = self.state(SimulationState.PLAYING)
+        coordinator.planning_scene = self.scene()
+        coordinator._planning_inputs_synchronized = Mock(return_value=True)
+
+        coordinator.on_target(self.target_message(target_id="apple-2"))
+
+        self.assertIn((2, "apple-2"), coordinator.pending_targets)
+        self.assertTrue(coordinator.running)
+
+    def test_first_precontact_failure_moves_target_to_retry_queue(self):
+        coordinator = self.make_coordinator()
+        candidate = self.candidate("apple-1", [0.8, 0.1, 1.2])
+
+        coordinator._defer_or_finish_failed_candidate(candidate, "RRT 실패")
+
+        self.assertIn(candidate.key, coordinator.retry_targets)
+        self.assertIn(candidate.key, coordinator.failed_once_target_keys)
+        self.assertNotIn(candidate.key, coordinator.final_failed_target_keys)
+
+    def test_second_precontact_failure_is_final(self):
+        coordinator = self.make_coordinator()
+        candidate = self.candidate("apple-1", [0.8, 0.1, 1.2])
+        coordinator.failed_once_target_keys.add(candidate.key)
+
+        coordinator._defer_or_finish_failed_candidate(candidate, "재시도 실패")
+
+        self.assertNotIn(candidate.key, coordinator.retry_targets)
+        self.assertIn(candidate.key, coordinator.final_failed_target_keys)
+
+    def test_normal_queue_runs_before_retry_queue(self):
+        coordinator = self.make_coordinator()
+        coordinator.planning_scene = PlanningScene()
+        normal = self.candidate("apple-2", [0.8, 0.1, 1.2])
+        retry = self.candidate("apple-1", [0.7, 0.1, 1.2])
+        coordinator.pending_targets[normal.key] = normal
+        coordinator.retry_targets[retry.key] = retry
+        coordinator._prepare_approach_goal = Mock(
+            return_value=(2, 3, np.array([0.0, 0.0, 0.0, 1.0]))
+        )
+        coordinator.send_next = Mock()
+
+        coordinator._start_next_target()
+
+        self.assertEqual(coordinator._active_target_key, normal.key)
+        self.assertIn(retry.key, coordinator.retry_targets)
+        coordinator.send_next.assert_called_once_with()
+
+    def test_normal_queue_selects_target_nearest_robot_base(self):
+        coordinator = self.make_coordinator()
+        coordinator.planning_scene = PlanningScene()
+        far = self.candidate("apple-1", [1.5, 0.0, 0.0])
+        near = self.candidate("apple-2", [0.6, 0.0, 0.0])
+        coordinator.pending_targets[far.key] = far
+        coordinator.pending_targets[near.key] = near
+        coordinator._prepare_approach_goal = Mock(
+            return_value=(2, 3, np.array([0.0, 0.0, 0.0, 1.0]))
+        )
+        coordinator.send_next = Mock()
+
+        coordinator._start_next_target()
+
+        self.assertEqual(coordinator._active_target_key, near.key)
+        self.assertIn(far.key, coordinator.pending_targets)
+
+    def test_postcontact_failure_stops_without_starting_next(self):
+        coordinator = self.make_coordinator()
+        candidate = self.candidate("apple-1", [0.8, 0.1, 1.2])
+        coordinator.running = True
+        coordinator.target = PoseStamped()
+        coordinator._active_candidate = candidate
+        coordinator._active_target_key = candidate.key
+        coordinator._start_next_target = Mock()
+
+        coordinator._handle_active_failure(
+            "GRASP 이후 실패",
+            allow_deferred_retry=False,
+        )
+
+        self.assertFalse(coordinator.running)
+        self.assertIn(candidate.key, coordinator.final_failed_target_keys)
+        coordinator._start_next_target.assert_not_called()
 
 
 if __name__ == "__main__":

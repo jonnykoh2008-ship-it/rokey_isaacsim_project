@@ -2038,9 +2038,6 @@ class MotionEngine:
         # 등가 목표를 그대로 유지한다. 완료 여부는 아래에서 초기 TCP pose로
         # 판정하므로 공간상의 초기 자세 기준은 바뀌지 않는다.
         settle_joint_target = harvest.np.asarray(joint_target, dtype=float).copy()
-        self.collision_motion.set_trajectory_cspace_target(
-            settle_joint_target
-        )
         for settle_index in range(harvest.MAX_TARGET_SETTLE_STEPS):
             self._check_execution_guard()
             pause_reported = False
@@ -2052,15 +2049,15 @@ class MotionEngine:
                 harvest.simulation_app.update()
             if pause_reported:
                 self._publish_resume()
-            action = self.collision_motion.next_action()
-            if action.joint_positions is None or not harvest.np.all(
-                harvest.np.isfinite(action.joint_positions)
-            ):
-                raise MotionExecutionError(
-                    "300:IK_FAILED",
-                    "RETURN_INITIAL 최종 정착 목표가 유효하지 않습니다.",
+            # 충돌 검증을 마친 RRT 종점 근처의 잔여 오차만 줄이는 구간이다.
+            # RMPflow의 c-space 감쇠를 다시 거치지 않고 강한 팔 위치 Drive에
+            # 동일한 최종 목표를 직접 유지해 제한된 정착 시간 안에 수렴한다.
+            self.robot.apply_action(
+                harvest.ArticulationAction(
+                    joint_positions=settle_joint_target,
+                    joint_indices=self.arm_indices,
                 )
-            self.robot.apply_action(action)
+            )
             harvest.apply_gripper_target(
                 self.robot,
                 self.gripper_indices,

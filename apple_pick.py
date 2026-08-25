@@ -216,7 +216,6 @@ MAX_MOVE_STEPS = 900
 # 천천히 내려 충격을 줄인다. RELEASE_CLEARANCE_M는 사과 바닥과 상판 사이의
 # 작은 여유이며, 실제 접촉 후 그리퍼를 서서히 여는 동안 중력으로 안착한다.
 CONVEYOR_END_INSET_M = 0.45
-CONVEYOR_SIDE_INSET_M = 0.15
 CONVEYOR_OUTSIDE_OFFSET_M = 0.30
 SAFE_CARRY_CLEARANCE_M = 0.15
 # 이 로봇 배치에서는 하향 그리퍼 자세로 상판 25 cm 위를 요구하면 손목이
@@ -1596,18 +1595,20 @@ def compute_conveyor_start(stage, robot_position, apple_size):
     positive_end[travel_axis] = maximum[travel_axis] - inset
     robot_xy = np.asarray(robot_position[:2], dtype=float)
     candidates = (negative_end, positive_end)
-    start = min(
+    near_end = min(
         candidates,
         key=lambda point: np.linalg.norm(point[:2] - robot_xy),
     ).copy()
+    # 진행축 위치는 이동 거리를 줄이기 위해 로봇과 가까운 끝단 쪽을 쓴다.
+    start = near_end.copy()
 
-    # 폭 중앙은 로봇에서 불필요하게 멀 수 있다. 사과가 가장자리에서 떨어지지
-    # 않을 만큼만 안쪽으로 들어간, 로봇과 가까운 폭 좌표를 사용한다.
-    side_inset = min(CONVEYOR_SIDE_INSET_M, 0.25 * size[side_axis])
+    # 폭 방향은 정확한 중심선을 강제하지 않고 전체 폭의 중심 ±20% 구간을
+    # 허용한다. 그 구간 안에서 로봇과 가장 가까운 좌표를 선택한다.
+    center_band_half_width = 0.20 * size[side_axis]
     start[side_axis] = np.clip(
         robot_xy[side_axis],
-        minimum[side_axis] + side_inset,
-        maximum[side_axis] - side_inset,
+        center[side_axis] - center_band_half_width,
+        center[side_axis] + center_band_half_width,
     )
 
     # 경유점은 벨트 진행축 끝 너머가 아니라 로봇과 가까운 측면 바깥에 둔다.
@@ -1627,10 +1628,10 @@ def compute_conveyor_start(stage, robot_position, apple_size):
         else maximum[side_axis] + CONVEYOR_OUTSIDE_OFFSET_M
     )
 
-    # 배치 자세의 수평축은 선택한 시작 끝에서 벨트 중심으로 향하게 한다.
+    # 배치 자세의 수평축은 선택한 진행축 끝에서 벨트 중심으로 향한다.
     conveyor_direction = np.zeros(3, dtype=float)
     conveyor_direction[travel_axis] = -np.sign(
-        start[travel_axis] - center[travel_axis]
+        near_end[travel_axis] - center[travel_axis]
     )
 
     surface_z = float(maximum[2])
