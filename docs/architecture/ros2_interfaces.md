@@ -31,8 +31,9 @@
 | Service | `/planning_scene/get_snapshot` | `appleproj_interfaces/srv/GetPlanningScene` | GPU PC 1 | 개인 PC 1 (debug/RViz) |
 | Action | `/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | GPU PC 1 내부 supervisor |
 | Topic | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | GPU PC 1 | 개인 PC 1·개인 PC 2 |
-| Topic | `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` (`TBD`) | GPU PC 1 | 개인 PC 1 RViz |
-| Topic | `/harvest/planned_path` | `nav_msgs/msg/Path` (`TBD`) | GPU PC 1 | 개인 PC 1 RViz |
+| Topic | `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` | GPU PC 1 | 개인 PC 1 RViz |
+| Topic | `/harvest/planned_path` | `nav_msgs/msg/Path` | GPU PC 1 | 개인 PC 1 RViz |
+| Topic | `/harvest/planned_joint_trajectory` | `trajectory_msgs/msg/JointTrajectory` | GPU PC 1 | 개인 PC 1 RViz/debug tool |
 | Topic | 컨베이어 raw RGB/depth/CameraInfo 토픽 (`TBD`) | `sensor_msgs/msg/Image`, `sensor_msgs/msg/CameraInfo` | GPU PC 1 | GPU PC 2 |
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
 | Service | `/quality/retry_inspection` | `appleproj_interfaces/srv/RetryInspection` | GPU PC 1 | 개인 PC 2 |
@@ -357,15 +358,37 @@ unexpected contact의 숫자 코드 배정은 기존 300번대 체계와 조정 
 
 ## Motion planning 시각화
 
-GPU PC 1은 실행과 독립된 시각화 publisher를 제공한다. 후보 인터페이스는 다음과
-같으며 최종 토픽 이름과 QoS는 `TBD`다.
+GPU PC 1의 실제 planner는 실행과 독립된 시각화 publisher를 제공한다. 세 시각화
+토픽은 모두 `Reliable + Transient Local + Keep Last 1`을 사용한다. 최신 검증 계획
+한 개만 보존해 늦게 시작한 RViz도 현재 snapshot을 받을 수 있게 하며, publish
+실패나 구독자 부재는 Goal 승인·collision 검사·로봇 실행 결과에 영향을 주지 않는다.
 
 | 토픽 | 타입 | 의미 |
 |---|---|---|
-| `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` | target, pre-grasp, obstacle, clearance, RRT node/path, 실패 지점 |
-| `/harvest/planned_path` | `nav_msgs/msg/Path` | world 기준 TCP 경로 |
-| `/harvest/planned_joint_trajectory` | `trajectory_msgs/msg/JointTrajectory` | 시간 매개화된 RRT 결과 미리보기 |
+| `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` | target, pre-grasp, raw/safety obstacle, 선택된 RRT 해, full-link 최소 clearance, 실패 지점 |
+| `/harvest/planned_path` | `nav_msgs/msg/Path` | 검증된 시간 궤적을 FK한 world 기준 물리 TCP 경로 |
+| `/harvest/planned_joint_trajectory` | `trajectory_msgs/msg/JointTrajectory` | 시간 매개화된 팔 6축 RRT 결과 미리보기 |
 | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | planning/execution 상태와 오류 |
+
+모든 시각화 header는 `/clock`과 `frame_id=world`를 사용한다. `planned_path`는
+trajectory 검증에 사용한 60Hz 표본의 `palm` 기반 물리 TCP pose를 담는다.
+`planned_joint_trajectory`의 `joint_names`는 `joint_1`부터 `joint_6`까지이며,
+각 point에는 position, velocity 및 상대 `time_from_start`를 넣는다. 그리퍼 관절은
+RRT c-space가 아니므로 이 토픽에 넣지 않고 실제 자세는 `/joint_states`와 TF로
+표시한다.
+
+`planning_markers`의 RRT 표시는 Lula가 반환한 선택 경로를 FK한 선이며, Lula
+내부 전체 탐색 tree를 의미하지 않는다. clearance는 TCP 점 거리 근사가 아니라
+trajectory 표본마다 robot description의 전체 collision sphere와 planning proxy를
+검사한 최소값이다. obstacle marker는 원본 proxy와 `safety_margin`이 적용된 영역을
+구분해 표시한다.
+
+GPU PC 1은 새 검증 계획을 발행할 때 이전 Marker를 `DELETEALL`로 교체한다.
+`STOPPED`, `INITIALIZING`, reset 또는 planning scene 무효화 시 Marker를 삭제하고
+빈 `Path`와 `JointTrajectory`를 발행한다. 실패 시 마지막 유효 경로는 유지하고
+실패 당시 TCP 위치에 진단 marker를 추가한다. 현재 Action Server는 한 번에 하나의
+Goal만 실행하므로 표준 시각화 메시지에 별도 target ID 필드를 추가하지 않는다.
+marker text에는 현재 `reset_id`, `scene_version`, segment와 최소 clearance를 넣는다.
 
 개인 PC 1은 위 토픽을 원격으로 구독해 RViz에서 표시한다. RViz가 종료되거나
 네트워크에서 시각화 토픽이 유실되어도 GPU PC 1의 planner와 safety monitor는
