@@ -40,7 +40,12 @@ TARGET_RECEIVED
 - 급격한 joint angle 변화와 singularity에 가까운 해를 제외한다.
 - 굵은 가지와 로봇 전체 링크의 충돌을 방지한다.
 - 기본 접근이 불가능하면 MVP에서는 `APPROACH_UNREACHABLE`로 실패한다.
-- 2차부터 가지와 충돌하지 않는 다른 접근 각도를 탐색한다.
+- 2차에서는 나무 중심 방향을 수평 방위각 0°로 두고 수직 90°, 고도
+  60°·30°·0°의 정면 및 좌우 ±45°, 측면 ±90°의 고도 45°·0°를 합친
+  14개 접근축을 탐색한다. 각 후보는 실제 이동 전에 마지막 0.15m 진입 구간을
+  10mm 간격의 순차 IK와 전체 링크 collision sphere로 검사한다. 충돌 없는
+  후보는 최소 proxy 여유가 큰 순서, 같은 여유에서는 joint 변화량이 작은
+  순서로 RRT를 시도한다. 이 각도와 표본 간격은 시뮬레이션 시험용 임시값이다.
 
 singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한다. 안전거리는
 아래 수확 경로 및 충돌 회피 규약을 따른다.
@@ -83,14 +88,15 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
   `0.03 m`는 더 낮은 속도로 접근한다. 두 구간의 360 simulation step과
   `0.03 m` 전환 거리는
   실제 collider 접촉 시험 후 조정할 임시값이다.
-- 진입 중 두 측면 palm joint는 URDF의 바깥쪽 limit인 각각 `+0.25 rad`,
-  `-0.25 rad`로 벌린다. 세 distal joint는 `-1.20 rad`로 접어 손가락 끝을
-  접근축에서 사과 통로 바깥으로 빼며, 이 값은 collider 시험용 임시값이다.
-- 가운데 손가락 proximal joint 후보 `0.00`, `0.10`, `0.35`, `0.60 rad`를
-  pre-grasp에서 시험하고, 현재 authored collision mesh를 TCP→사과 중심
-  선분으로 sweep했을 때 최소 clearance가 가장 큰 자세를 선택한다. 후보값은
-  시뮬레이션 시험 후 조정할 임시값이다.
-- swept clearance는 사과 반지름을 제외하고 최소 `5 mm`를 확보해야 한다.
+- 진입 중 두 측면 palm joint는 대칭으로 `±0.10`, `±0.15`, `±0.20`,
+  `±0.25 rad`를 시험한다. 세 distal joint는 `-1.20 rad`와 URDF 음의 limit
+  여유값을 시험해 손가락 끝을 접근축에서 사과 통로 바깥으로 뺀다. 이 값은
+  collider 시험용 임시값이다.
+- 각 후보의 authored collision mesh를 TCP→사과 중심 선분으로 sweep해 실제
+  clearance를 측정한다. 명목 지름 80mm 사과에서는 손가락 안쪽 면이 중심에서
+  양쪽 `50mm`, 총 개구 약 `100mm`가 되도록 면당 `10mm` clearance에 가장
+  가까운 안전 후보를 선택한다. 관절각과 개구폭을 선형으로 환산하지 않는다.
+- swept clearance는 사과 반지름을 제외하고 최소 `10 mm`를 확보해야 한다.
   확보하지 못하면 실제 ENTER를 시작하지 않고 `COLLISION_RISK`를 반환한다.
 - gripper 물리 표현은 각 링크의 authored collision mesh 하나만 사용한다.
   동일 형상의 runtime 복제 collider를 동시에 활성화하지 않는다.
@@ -104,6 +110,11 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
 - 경로 corridor 내부 proxy는 경로와 가까운 순서로 선별하되, 시작 TCP와 이미
   겹치는 proxy는 초기 자세를 가두지 않도록 제외한다. 현재 시뮬레이션 튜닝
   임시값은 corridor `0.25 m`, 시작점 제외 반경 `0.18 m`, 가지 최대 48개이다.
+- 작은 가지 형상 proxy의 현재 임시 voxel 크기는 `40mm`이며 기본 sphere
+  반경은 `20mm`다. 작은 가지 안전거리 `20mm`를 별도로 유지해 Lula에 전달되는
+  최종 sphere 반경은 `40mm`다. 이전 60mm voxel/50mm 최종 반경에서 형상
+  과대 근사를 줄인 값이며, 실제 PhysX collider와 몸통 50mm 안전거리는
+  변경하지 않는다.
 - transit은 로봇 쪽 몸통 전체 bounding box 바깥 `0.45 m`의 안전 waypoint에
   먼저 도달해 자세를 정렬한 다음 staging으로 진입한다. 좌우 재계획 방향은
   로봇-사과 방사축이 아니라 그에 수직인 수평 lateral 축을 사용한다. `0.45 m`는
@@ -196,3 +207,18 @@ Stem joint:
 - stem 미분리: timeout 후 실패
 - Action cancel: 즉시 정지 후 cancel 결과 보고
 - 사과가 작업영역 밖으로 이탈: 비활성화
+
+## 연속 다중 사과 실행
+
+- GPU PC 1은 `target_id`별 안정 좌표를 대기열에 저장하고 로봇 base에서 가까운
+  사과부터 수확한다. 현재 사과의 수확·컨베이어 배치·초기 자세 복귀가 모두
+  완료된 뒤 다음 사과를 시작한다.
+- 실행 중 들어온 현재 target의 갱신은 실행 목표를 바꾸지 않는다. 아직 시작하지
+  않은 target은 같은 ID의 최신 안정 좌표로 갱신한다.
+- 접촉 전 `APPROACH` 계획 또는 실행이 처음 실패한 target은 일반 대기열이 모두
+  끝난 뒤 실행하는 재시도 대기열로 이동한다. 다른 사과를 모두 처리한 뒤 1회만
+  재시도하고, 두 번째 실패는 최종 실패로 기록한다.
+- `GRASP` 이후의 접촉·파지·운반 구간에서 실패하면 사과를 들었거나 로봇이 나무
+  내부에 있을 수 있으므로 다음 target을 실행하지 않고 즉시 안전 정지한다.
+- 성공한 target과 재시도까지 실패한 target은 같은 `reset_id`에서 다시 실행하지
+  않는다. Timeline reset 시 대기열과 완료·실패·재시도 기록을 모두 폐기한다.

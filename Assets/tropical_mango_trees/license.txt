@@ -1,0 +1,11 @@
+Model Information:
+* title:	Tropical Mango Trees
+* source:	https://sketchfab.com/3d-models/tropical-mango-trees-6997814540f14929bf13cf3828b5dc90
+* author:	Jagobo (https://sketchfab.com/Jagobo)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Tropical Mango Trees" (https://sketchfab.com/3d-models/tropical-mango-trees-6997814540f14929bf13cf3828b5dc90) by Jagobo (https://sketchfab.com/Jagobo) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
