@@ -143,6 +143,11 @@ _LINK6_TO_PALM_TRANSLATION = None
 _LINK6_TO_PALM_ROTATION = None
 RAIL_JOINT = "rail_joint"
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
+INITIAL_ARM_JOINTS_DEG = np.array(
+    [0.0, 0.0, -90.0, 0.0, 90.0, 0.0],
+    dtype=float,
+)
+INITIAL_ARM_JOINTS_RAD = np.deg2rad(INITIAL_ARM_JOINTS_DEG)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1039,6 +1044,13 @@ def configure_joint_drives(stage):
             continue
 
         if name in ARM_JOINTS:
+            arm_index = ARM_JOINTS.index(name)
+            initial_degrees = float(INITIAL_ARM_JOINTS_DEG[arm_index])
+            state_position = prim.GetAttribute("state:angular:physics:position")
+            if not state_position.IsValid():
+                raise RuntimeError(f"팔 초기 state 속성이 없습니다: {prim.GetPath()}")
+            state_position.Set(initial_degrees)
+            drive.GetTargetPositionAttr().Set(initial_degrees)
             drive.GetStiffnessAttr().Set(ARM_DRIVE_STIFFNESS)
             drive.GetDampingAttr().Set(ARM_DRIVE_DAMPING)
             drive.GetMaxForceAttr().Set(ARM_DRIVE_MAX_FORCE)
@@ -1057,6 +1069,10 @@ def configure_joint_drives(stage):
     print(
         f"   Drives       rail hold {float(initial_rail_position):.3f} m, "
         f"arm {arm_count}, gripper {gripper_count}"
+    )
+    print(
+        f"   Initial arm  degrees {vec(INITIAL_ARM_JOINTS_DEG)}, "
+        f"radians {vec(INITIAL_ARM_JOINTS_RAD)}"
     )
     print(
         f"   Gripper drive stiffness {GRIPPER_DRIVE_STIFFNESS:.1f}, "
@@ -3442,24 +3458,70 @@ class CollisionAwareMotion:
                 applied_turns[waypoint_index, joint_index] = turn
         return unwrapped, applied_turns
 
-    def plan_rrt_trajectory(self, robot, target_tcp, target_rotation, segment_name):
-        """현재 관절에서 TCP 목표까지 RRT 경로와 시간 궤적을 만든다."""
+    def plan_rrt_trajectory(
+        self,
+        robot,
+        target_tcp,
+        target_rotation,
+        segment_name,
+        target_joint_positions=None,
+    ):
+        """현재 관절에서 TCP 또는 명시적 c-space 목표까지 궤적을 만든다."""
         self.assert_tree_scene_unchanged()
-        target_tcp = np.asarray(target_tcp, dtype=float)
-        target_rotation = np.asarray(target_rotation, dtype=float)
-        link_position, link_rotation = tcp_target_to_link6(
-            target_tcp,
-            target_rotation,
-            self.link6_to_palm_translation,
-            self.link6_to_palm_rotation,
-        )
         active_positions = self._joint_positions(robot, self.rrt_active_joints)
         watched_positions = self._joint_positions(robot, self.rrt_watched_joints)
-        self.rrt.update_world()
-        self.rrt.set_end_effector_target(
-            link_position,
-            rot_matrix_to_quat(link_rotation),
+        lower_limits, upper_limits = (
+            self.trajectory_generator.get_c_space_position_limits()
         )
+        lower_limits = np.asarray(lower_limits, dtype=float)
+        upper_limits = np.asarray(upper_limits, dtype=float)
+        self.rrt.update_world()
+        explicit_cspace_goal = target_joint_positions is not None
+        requested_cspace_goal = None
+        if explicit_cspace_goal:
+            target_joint_positions = np.asarray(target_joint_positions, dtype=float)
+            if (
+                target_joint_positions.shape != active_positions.shape
+                or not np.all(np.isfinite(target_joint_positions))
+            ):
+                raise ApproachUnreachableError(
+                    "명시적 RRT c-space 목표가 유효하지 않습니다: "
+                    f"{target_joint_positions}"
+                )
+            if np.any(target_joint_positions < lower_limits - 1.0e-6) or np.any(
+                target_joint_positions > upper_limits + 1.0e-6
+            ):
+                raise ApproachUnreachableError(
+                    "명시적 RRT c-space 목표가 관절 limit을 벗어났습니다: "
+                    f"{target_joint_positions}"
+                )
+            requested_cspace_goal, requested_turns, periodic_joints = (
+                self._nearest_periodic_goal(
+                    active_positions,
+                    target_joint_positions,
+                    lower_limits,
+                    upper_limits,
+                )
+            )
+            print(
+                f"   [RRT CSPACE] {segment_name} requested "
+                f"{vec(target_joint_positions)}, turns {requested_turns.tolist()}, "
+                f"goal {vec(requested_cspace_goal)}"
+            )
+            self.rrt.set_cspace_target(requested_cspace_goal)
+        else:
+            target_tcp = np.asarray(target_tcp, dtype=float)
+            target_rotation = np.asarray(target_rotation, dtype=float)
+            link_position, link_rotation = tcp_target_to_link6(
+                target_tcp,
+                target_rotation,
+                self.link6_to_palm_translation,
+                self.link6_to_palm_rotation,
+            )
+            self.rrt.set_end_effector_target(
+                link_position,
+                rot_matrix_to_quat(link_rotation),
+            )
         started_at = time.perf_counter()
         path = self.rrt.compute_path(active_positions, watched_positions)
         planning_time = time.perf_counter() - started_at
@@ -3485,25 +3547,26 @@ class CollisionAwareMotion:
                 f"RRT 경로 시작점이 현재 관절과 다릅니다: {raw_start_error:.6f} rad"
             )
 
-        lower_limits, upper_limits = (
-            self.trajectory_generator.get_c_space_position_limits()
-        )
-        lower_limits = np.asarray(lower_limits, dtype=float)
-        upper_limits = np.asarray(upper_limits, dtype=float)
         raw_goal = path[-1].copy()
-        nearest_goal, equivalent_turns, periodic_joints = (
-            self._nearest_periodic_goal(
-                active_positions,
-                raw_goal,
-                lower_limits,
-                upper_limits,
+        if explicit_cspace_goal:
+            nearest_goal = requested_cspace_goal
+            equivalent_turns = np.zeros(raw_goal.shape, dtype=np.int32)
+        else:
+            nearest_goal, equivalent_turns, periodic_joints = (
+                self._nearest_periodic_goal(
+                    active_positions,
+                    raw_goal,
+                    lower_limits,
+                    upper_limits,
+                )
             )
-        )
         raw_joint_steps = np.max(np.abs(np.diff(path, axis=0)), axis=0)
         wrap_detected = bool(
             np.any(periodic_joints & (raw_joint_steps > np.pi + 1.0e-3))
         )
-        equivalent_changed = bool(np.any(equivalent_turns != 0))
+        equivalent_changed = bool(
+            not explicit_cspace_goal and np.any(equivalent_turns != 0)
+        )
         print(
             f"   [RRT JOINTS] {segment_name} current {vec(active_positions)}"
         )
@@ -3577,7 +3640,9 @@ class CollisionAwareMotion:
             raise ApproachUnreachableError(
                 f"RRT 경로 시작점이 현재 관절과 다릅니다: {start_error:.6f} rad"
             )
-        if (equivalent_changed or wrap_detected) and goal_error > 1.0e-3:
+        if (explicit_cspace_goal or equivalent_changed or wrap_detected) and (
+            goal_error > 1.0e-3
+        ):
             raise ApproachUnreachableError(
                 f"RRT 경로 끝점이 등가 관절 목표와 다릅니다: {goal_error:.6f} rad"
             )
@@ -3677,6 +3742,7 @@ class CollisionAwareMotion:
                     target_tcp,
                     target_rotation,
                     segment_name,
+                    target_joint_positions=target_joint_positions,
                 )
             raise ApproachUnreachableError(
                 f"{segment_name} RRT trajectory가 이미 반영된 나무 proxy와 "
@@ -3691,6 +3757,21 @@ class CollisionAwareMotion:
             f"samples={sample_count}"
         )
         return trajectory
+
+    def plan_rrt_cspace_trajectory(
+        self,
+        robot,
+        target_joint_positions,
+        segment_name,
+    ):
+        """저장된 관절 자세처럼 해가 고정된 목표까지 RRT 궤적을 만든다."""
+        return self.plan_rrt_trajectory(
+            robot,
+            None,
+            None,
+            segment_name,
+            target_joint_positions=target_joint_positions,
+        )
 
     def set_trajectory_cspace_target(self, joint_positions):
         """시간 궤적 표본을 RMPflow c-space 추종 목표로 설정한다."""
