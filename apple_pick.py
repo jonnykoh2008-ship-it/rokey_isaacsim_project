@@ -3522,6 +3522,47 @@ class CollisionAwareMotion:
                 applied_turns[waypoint_index, joint_index] = turn
         return unwrapped, applied_turns
 
+    def _nearest_equivalent_transfer_path(
+        self,
+        active_positions,
+        nearest_goal,
+        lower_limits,
+        upper_limits,
+        periodic_joints,
+    ):
+        """NEUTRAL_TRANSFER의 짧은 등가 c-space 직결 경로를 검증한다.
+
+        Task-space RRT가 관절 limit 경계 양쪽 표현을 섞어 장회전 경로를 반환한
+        경우에만 사용하는 제한적 fallback이다. 짧은 등가 종점이 limit 안에 있고
+        전체 링크가 나무 proxy와 겹치지 않을 때만 경로를 반환한다.
+        """
+        active_positions = np.asarray(active_positions, dtype=np.float64)
+        nearest_goal = np.asarray(nearest_goal, dtype=np.float64)
+        lower_limits = np.asarray(lower_limits, dtype=np.float64)
+        upper_limits = np.asarray(upper_limits, dtype=np.float64)
+        periodic_joints = np.asarray(periodic_joints, dtype=bool)
+        delta = nearest_goal - active_positions
+        if np.any(np.abs(delta[periodic_joints]) > np.pi + 1.0e-3):
+            return None, "관절 limit 안에 π 이하의 짧은 등가 종점이 없습니다."
+        if np.any(nearest_goal < lower_limits - 1.0e-6) or np.any(
+            nearest_goal > upper_limits + 1.0e-6
+        ):
+            return None, "nearest-equivalent 종점이 관절 limit을 벗어났습니다."
+
+        maximum_delta = float(np.max(np.abs(delta)))
+        waypoint_count = max(2, int(np.ceil(maximum_delta / 0.20)) + 1)
+        path = np.linspace(active_positions, nearest_goal, waypoint_count)
+        for waypoint_index, joint_positions in enumerate(path):
+            report = self.configuration_tree_clearance(joint_positions)
+            if report["branch_indices"] or report["trunk_indices"]:
+                return (
+                    None,
+                    "짧은 nearest-equivalent 직결 경로가 나무 proxy와 충돌합니다: "
+                    f"waypoint={waypoint_index}/{waypoint_count - 1}, "
+                    f"{self.collision_text(report)}",
+                )
+        return path, "OK"
+
     def plan_rrt_trajectory(
         self,
         robot,
@@ -3732,6 +3773,31 @@ class CollisionAwareMotion:
                 print(
                     f"   [RRT LIMIT-CONSTRAINED ROTATION] {segment_name}: "
                     f"short q±2π equivalent unavailable within limits; {detail}"
+                )
+            elif segment_name == "NEUTRAL_TRANSFER":
+                fallback_path, fallback_reason = (
+                    self._nearest_equivalent_transfer_path(
+                        active_positions,
+                        nearest_goal,
+                        lower_limits,
+                        upper_limits,
+                        periodic_joints,
+                    )
+                )
+                if fallback_path is None:
+                    raise ApproachUnreachableError(
+                        "NEUTRAL_TRANSFER nearest-equivalent 경로를 안전하게 "
+                        f"생성하지 못했습니다: {detail}; {fallback_reason}"
+                    )
+                path = fallback_path
+                joint_differences = np.diff(path, axis=0)
+                maximum_per_joint_step = np.max(
+                    np.abs(joint_differences), axis=0
+                )
+                print(
+                    "   [NEAREST-EQUIVALENT TRANSFER] "
+                    f"{segment_name}: unsafe RRT rotation {detail} 대신 "
+                    f"collision-free c-space waypoints {len(path)}개 사용"
                 )
             else:
                 raise ApproachUnreachableError(

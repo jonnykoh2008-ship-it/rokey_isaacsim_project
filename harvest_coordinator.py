@@ -104,6 +104,8 @@ class HarvestCoordinator(Node):
         self._active_target_key = None
         self._latest_target_stamps = {}
         self._started_target_keys = set()
+        self.safety_stopped = False
+        self.safety_stop_reason = None
         self.target_max_age_sec = self._optional_threshold(TARGET_MAX_AGE_SEC)
         self.minimum_target_confidence = self._optional_threshold(
             MIN_TARGET_CONFIDENCE
@@ -498,6 +500,15 @@ class HarvestCoordinator(Node):
             previous.reset_id != message.reset_id
             or previous.scene_version != message.scene_version
         )
+        reset_changed = previous is not None and (
+            previous.reset_id != message.reset_id
+        )
+        if reset_changed and self.safety_stopped:
+            self.safety_stopped = False
+            self.safety_stop_reason = None
+            self.get_logger().info(
+                "reset_id 변경으로 연속 수확 SAFETY_STOPPED 상태를 해제합니다."
+            )
         invalidating = message.state in (
             SimulationState.STOPPED,
             SimulationState.INITIALIZING,
@@ -679,14 +690,27 @@ class HarvestCoordinator(Node):
             return
         if candidate is not None:
             self.final_failed_target_keys.add(candidate.key)
+        self.safety_stopped = True
+        self.safety_stop_reason = str(reason)
+        self.pending_targets.clear()
+        self.retry_targets.clear()
+        self._publish_status(
+            "SAFETY_STOPPED",
+            False,
+            0.0,
+            "302:COLLISION_RISK",
+            "접촉 이후 실패로 reset 전까지 연속 수확을 중단합니다: "
+            f"{reason}",
+        )
         self.get_logger().error(
-            "접촉 이후 실패이므로 연속 수확을 안전 정지합니다: "
+            "접촉 이후 실패로 SAFETY_STOPPED 상태에 진입했습니다. "
+            "reset_id가 변경될 때까지 다음 target을 실행하지 않습니다: "
             f"{reason}"
         )
 
     def _start_next_target(self):
         """일반 대기열을 모두 처리한 뒤 후순위 재시도 대기열을 실행한다."""
-        if self.running:
+        if self.running or self.safety_stopped:
             return
         while self.pending_targets or self.retry_targets:
             queue = self.pending_targets if self.pending_targets else self.retry_targets
@@ -747,6 +771,19 @@ class HarvestCoordinator(Node):
         validation_error = self._validate_target(message)
         if validation_error is not None:
             self._reject_target(message, validation_error)
+            return
+        if self.safety_stopped:
+            self._reject_target(
+                message,
+                "접촉 이후 실패로 SAFETY_STOPPED 상태입니다. "
+                "Timeline reset 후 다시 시도해야 합니다."
+                + (
+                    ""
+                    if not self.safety_stop_reason
+                    else f" 원인: {self.safety_stop_reason}"
+                ),
+                "302:COLLISION_RISK",
+            )
             return
 
         state = self.simulation_state
