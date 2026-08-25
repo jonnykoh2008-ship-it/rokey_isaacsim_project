@@ -56,6 +56,7 @@ MAX_TF_TIME_ERROR_SEC = -1.0
 
 TARGET_TOPIC = "/harvest/target"
 PERCEPTION_STATUS_TOPIC = "/harvest/perception_status"
+TARGET_BATCH_DEBOUNCE_SEC = 0.05
 
 
 @dataclass
@@ -166,9 +167,14 @@ class HarvestCoordinator(Node):
             perception_status_qos,
         )
         self.snapshot_retry_timer = self.create_timer(0.5, self._retry_snapshot)
-        # 같은 RGB-D timestamp의 여러 target callback이 모두 대기열에 들어온
-        # 뒤 거리 우선순위를 계산하도록 짧게 모아서 dispatch한다.
-        self.queue_dispatch_timer = self.create_timer(0.05, self._start_next_target)
+        # 최초 후보 하나가 periodic timer 직전에 들어오면 나머지 후보보다 먼저
+        # 실행되는 race가 생긴다. 신규 target ID가 들어올 때마다 one-shot처럼
+        # deadline을 다시 시작해 마지막 신규 ID 이후에 전체 대기열을 dispatch한다.
+        self.queue_dispatch_timer = self.create_timer(
+            TARGET_BATCH_DEBOUNCE_SEC,
+            self._dispatch_pending_targets,
+        )
+        self.queue_dispatch_timer.cancel()
 
     @staticmethod
     def _optional_threshold(value):
@@ -514,6 +520,7 @@ class HarvestCoordinator(Node):
             SimulationState.INITIALIZING,
         )
         if version_changed or invalidating:
+            self.queue_dispatch_timer.cancel()
             self.generation += 1
             if self.running and self.goal_handle is not None:
                 self.get_logger().warning(
@@ -694,6 +701,7 @@ class HarvestCoordinator(Node):
         self.safety_stop_reason = str(reason)
         self.pending_targets.clear()
         self.retry_targets.clear()
+        self.queue_dispatch_timer.cancel()
         self._publish_status(
             "SAFETY_STOPPED",
             False,
@@ -710,6 +718,7 @@ class HarvestCoordinator(Node):
 
     def _start_next_target(self):
         """일반 대기열을 모두 처리한 뒤 후순위 재시도 대기열을 실행한다."""
+        self.queue_dispatch_timer.cancel()
         if self.running or self.safety_stopped:
             return
         while self.pending_targets or self.retry_targets:
@@ -765,6 +774,11 @@ class HarvestCoordinator(Node):
             )
             self.send_next()
             return
+
+    def _dispatch_pending_targets(self):
+        """마지막 신규 target ID 이후 모인 전체 후보를 한 번만 dispatch한다."""
+        self.queue_dispatch_timer.cancel()
+        self._start_next_target()
 
     def on_target(self, message):
         """Receive and validate the v2 HarvestTarget contract."""
@@ -856,6 +870,7 @@ class HarvestCoordinator(Node):
         )
         if spread > self.maximum_spread:
             return
+        is_new_candidate = target_key not in self.pending_targets
         candidate = PendingTarget(
             key=target_key,
             message=message,
@@ -867,6 +882,8 @@ class HarvestCoordinator(Node):
             f"target_id={message.target_id} 연속 수확 대기열 등록; "
             f"pending={len(self.pending_targets)}"
         )
+        if is_new_candidate and not self.running and not self.safety_stopped:
+            self.queue_dispatch_timer.reset()
 
     def send_next(self):
         if self.index >= len(SEQUENCE):

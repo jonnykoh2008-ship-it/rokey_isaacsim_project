@@ -63,6 +63,7 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator.request_snapshot = Mock()
         coordinator._publish_status = Mock()
         coordinator.get_logger = Mock(return_value=Mock())
+        coordinator.queue_dispatch_timer = Mock()
         return coordinator
 
     @staticmethod
@@ -396,6 +397,44 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
 
         self.assertIn((2, "apple-2"), coordinator.pending_targets)
         self.assertTrue(coordinator.running)
+        coordinator.queue_dispatch_timer.reset.assert_not_called()
+
+    def test_new_target_ids_restart_batch_debounce(self):
+        coordinator = self.make_coordinator()
+        coordinator.simulation_state = self.state(SimulationState.PLAYING)
+        coordinator.planning_scene = self.scene()
+        coordinator._planning_inputs_synchronized = Mock(return_value=True)
+
+        coordinator.on_target(self.target_message(target_id="apple-3"))
+        coordinator.on_target(self.target_message(target_id="apple-1"))
+        coordinator.on_target(self.target_message(target_id="apple-2"))
+
+        self.assertEqual(coordinator.queue_dispatch_timer.reset.call_count, 3)
+        self.assertFalse(coordinator.running)
+        self.assertEqual(len(coordinator.pending_targets), 3)
+
+    def test_batch_dispatch_selects_nearest_after_all_ids_arrive(self):
+        coordinator = self.make_coordinator()
+        coordinator.planning_scene = PlanningScene()
+        far = self.candidate("apple-3", [1.5, 0.0, 0.0])
+        near = self.candidate("apple-1", [0.6, 0.0, 0.0])
+        middle = self.candidate("apple-2", [1.0, 0.0, 0.0])
+        coordinator.pending_targets = {
+            far.key: far,
+            near.key: near,
+            middle.key: middle,
+        }
+        coordinator._prepare_approach_goal = Mock(
+            return_value=(2, 3, np.array([0.0, 0.0, 0.0, 1.0]))
+        )
+        coordinator.send_next = Mock()
+
+        coordinator._dispatch_pending_targets()
+
+        self.assertEqual(coordinator._active_target_key, near.key)
+        self.assertIn(far.key, coordinator.pending_targets)
+        self.assertIn(middle.key, coordinator.pending_targets)
+        coordinator.queue_dispatch_timer.cancel.assert_called()
 
     def test_first_precontact_failure_moves_target_to_retry_queue(self):
         coordinator = self.make_coordinator()
