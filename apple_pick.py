@@ -23,6 +23,7 @@ M0617 + Robotiq 3F 그리퍼 사과 수확 동작
 import argparse
 import time
 import traceback
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -284,6 +285,26 @@ RRT_TRAJECTORY_JERK_LIMITS = np.array(
     [20.0, 20.0, 25.0, 40.0, 40.0, 40.0], dtype=float
 )
 RRT_TRAJECTORY_SAMPLE_DT_S = 1.0 / 60.0
+
+
+@dataclass(frozen=True)
+class MotionPlanSnapshot:
+    """Collision-validated arm plan handed to optional diagnostics only."""
+
+    segment_name: str
+    joint_names: tuple
+    rrt_joint_path: np.ndarray
+    rrt_tcp_positions: np.ndarray
+    sample_times: np.ndarray
+    joint_positions: np.ndarray
+    joint_velocities: np.ndarray
+    tcp_positions: np.ndarray
+    tcp_orientations_xyzw: np.ndarray
+    target_position: np.ndarray
+    pregrasp_position: np.ndarray
+    minimum_clearance: float
+    closest_robot_center: object
+    closest_obstacle_center: object
 
 # 충돌 시 1e8 수준의 강한 Drive가 컨베이어를 억지로 뚫지 않도록 제한한다.
 # M0617이 느린 보간 목표를 추종할 수 있는 범위에서 보수적으로 낮춘 값이다.
@@ -2666,6 +2687,7 @@ class CollisionAwareMotion:
         pregrasp_tcp,
         link6_to_palm_translation=None,
         link6_to_palm_rotation=None,
+        plan_callback=None,
     ):
         self.stage = stage
         self.tree_signature = tree_scene_signature(stage)
@@ -2775,8 +2797,10 @@ class CollisionAwareMotion:
         self.lateral = np.array([-outward[1], outward[0], 0.0], dtype=float)
         self.path_start = np.asarray(path_start, dtype=float)
         self.apple_center = np.asarray(apple_center, dtype=float)
+        self.pregrasp_tcp = np.asarray(pregrasp_tcp, dtype=float)
+        self.plan_callback = plan_callback
         self.approach_direction = normalized(
-            self.apple_center - np.asarray(pregrasp_tcp, dtype=float)
+            self.apple_center - self.pregrasp_tcp
         )
         staging_tcp = np.asarray(pregrasp_tcp, dtype=float) - (
             self.approach_direction
@@ -2901,6 +2925,45 @@ class CollisionAwareMotion:
             np.asarray(radii, dtype=float),
             tuple(frames),
         )
+
+    def planned_tcp_pose(self, joint_positions):
+        """Validated arm configuration의 물리 palm TCP world pose를 반환한다."""
+        link_position, link_rotation = (
+            self.validation_kinematics.compute_forward_kinematics(
+                EE_FRAME_NAME,
+                np.asarray(joint_positions, dtype=float),
+            )
+        )
+        link_position = np.asarray(link_position, dtype=float)
+        link_rotation = np.asarray(link_rotation, dtype=float)
+        palm_rotation = link_rotation @ self.link6_to_palm_rotation
+        palm_position = (
+            link_position + link_rotation @ self.link6_to_palm_translation
+        )
+        tcp_position = palm_position + palm_rotation @ PALM_TO_TCP
+        quaternion_wxyz = rot_matrix_to_quat(palm_rotation)
+        quaternion_xyzw = np.asarray(
+            [
+                quaternion_wxyz[1],
+                quaternion_wxyz[2],
+                quaternion_wxyz[3],
+                quaternion_wxyz[0],
+            ],
+            dtype=float,
+        )
+        return np.asarray(tcp_position, dtype=float), quaternion_xyzw
+
+    def notify_plan(self, snapshot):
+        """시각화 오류가 planner 또는 executor로 전파되지 않게 격리한다."""
+        if self.plan_callback is None:
+            return
+        try:
+            self.plan_callback(snapshot)
+        except Exception as error:
+            print(
+                f"   [VISUALIZATION WARNING] {snapshot.segment_name}: {error}",
+                flush=True,
+            )
 
     def configuration_tree_clearance(self, joint_positions):
         """전체 로봇 sphere와 전체 나무 proxy의 최소 여유를 반환한다."""
@@ -3695,15 +3758,23 @@ class CollisionAwareMotion:
                 f"Lula trajectory duration이 유효하지 않습니다: {duration}"
             )
         # Spline이 관절 limit을 벗어나거나 NaN을 만들지 않는지 60 Hz로
-        # 선검증한다. 동일 표본에서 robot description의 전체
-        # collision sphere와 reset snapshot의 전체 나무 proxy도 검사한다.
+        # 선검증한다. 동일 표본에서 robot description의 전체 collision sphere와
+        # reset snapshot의 전체 나무 proxy를 검사하고, 이 검증에 사용한 동일
+        # 표본만 선택적 시각화 callback으로 전달한다.
         sample_count = max(2, int(np.ceil(duration / RRT_TRAJECTORY_SAMPLE_DT_S)) + 1)
-        trajectory_collision = None
-        for sample_time in np.linspace(
+        trajectory_sample_times = np.linspace(
             trajectory.start_time,
             trajectory.end_time,
             sample_count,
-        ):
+        )
+        trajectory_collision = None
+        minimum_clearance_report = None
+        sampled_joint_positions = []
+        sampled_joint_velocities = []
+        sampled_tcp_positions = []
+        sampled_tcp_orientations = []
+        collect_visualization = self.plan_callback is not None
+        for sample_time in trajectory_sample_times:
             joint_target, joint_velocity = trajectory.get_joint_targets(sample_time)
             joint_target = np.asarray(joint_target, dtype=float)
             joint_velocity = np.asarray(joint_velocity, dtype=float)
@@ -3722,7 +3793,19 @@ class CollisionAwareMotion:
                 raise ApproachUnreachableError(
                     f"Lula trajectory가 관절 limit을 벗어났습니다: t={sample_time:.3f}"
                 )
-            collision = self.configuration_tree_collision(joint_target)
+            clearance_report = self.configuration_tree_clearance(joint_target)
+            if (
+                minimum_clearance_report is None
+                or clearance_report["minimum_clearance"]
+                < minimum_clearance_report["minimum_clearance"]
+            ):
+                minimum_clearance_report = clearance_report
+            collision = (
+                clearance_report
+                if clearance_report["branch_indices"]
+                or clearance_report["trunk_indices"]
+                else None
+            )
             if collision is not None:
                 if trajectory_collision is None:
                     trajectory_collision = collision
@@ -3741,6 +3824,12 @@ class CollisionAwareMotion:
                             "minimum_clearance"
                         ]
                         trajectory_collision["closest"] = collision["closest"]
+            if collect_visualization:
+                tcp_position, tcp_orientation = self.planned_tcp_pose(joint_target)
+                sampled_joint_positions.append(joint_target.copy())
+                sampled_joint_velocities.append(joint_velocity.copy())
+                sampled_tcp_positions.append(tcp_position)
+                sampled_tcp_orientations.append(tcp_orientation)
 
         if trajectory_collision is not None:
             added = self.add_full_branch_obstacles(
@@ -3761,6 +3850,55 @@ class CollisionAwareMotion:
             raise ApproachUnreachableError(
                 f"{segment_name} RRT trajectory가 이미 반영된 나무 proxy와 "
                 f"충돌합니다: {self.collision_text(trajectory_collision)}"
+            )
+        if minimum_clearance_report is None:
+            raise ApproachUnreachableError(
+                f"{segment_name} trajectory clearance 표본을 생성하지 못했습니다."
+            )
+        if collect_visualization:
+            rrt_tcp_positions = np.asarray(
+                [self.planned_tcp_pose(joint_positions)[0] for joint_positions in path],
+                dtype=float,
+            )
+            self.notify_plan(
+                MotionPlanSnapshot(
+                    segment_name=str(segment_name),
+                    joint_names=tuple(self.rrt_active_joints),
+                    rrt_joint_path=np.asarray(path, dtype=float).copy(),
+                    rrt_tcp_positions=rrt_tcp_positions,
+                    sample_times=np.asarray(
+                        trajectory_sample_times - trajectory.start_time,
+                        dtype=float,
+                    ),
+                    joint_positions=np.asarray(sampled_joint_positions, dtype=float),
+                    joint_velocities=np.asarray(sampled_joint_velocities, dtype=float),
+                    tcp_positions=np.asarray(sampled_tcp_positions, dtype=float),
+                    tcp_orientations_xyzw=np.asarray(
+                        sampled_tcp_orientations,
+                        dtype=float,
+                    ),
+                    target_position=self.apple_center.copy(),
+                    pregrasp_position=self.pregrasp_tcp.copy(),
+                    minimum_clearance=float(
+                        minimum_clearance_report["minimum_clearance"]
+                    ),
+                    closest_robot_center=(
+                        None
+                        if minimum_clearance_report["closest_robot_center"] is None
+                        else np.asarray(
+                            minimum_clearance_report["closest_robot_center"],
+                            dtype=float,
+                        ).copy()
+                    ),
+                    closest_obstacle_center=(
+                        None
+                        if minimum_clearance_report["closest_obstacle_center"] is None
+                        else np.asarray(
+                            minimum_clearance_report["closest_obstacle_center"],
+                            dtype=float,
+                        ).copy()
+                    ),
+                )
             )
         print(
             f"   [RRT PLAN] {segment_name}: points={len(path)}, "
