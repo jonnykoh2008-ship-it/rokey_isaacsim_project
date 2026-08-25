@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from inspection_session import InspectionContractError, InspectionFrame
+from inspection_session import (
+    InspectionContractError,
+    InspectionFrame,
+    InspectionIdentityMismatch,
+)
 from quality_inspection_node import (
     COMPLETION_QOS_DEPTH,
     COMPLETION_TOPIC,
@@ -216,6 +220,29 @@ class CoordinatorLifecycleTest(unittest.TestCase):
         coordinator.finalize(frame.inspection_id)
         duplicate = coordinator.handle_frame(frame, 1)
         self.assertEqual(duplicate.state, ProcessingState.FINALIZED)
+
+    def test_identity_change_is_turned_into_recheck_for_original_apple(self) -> None:
+        coordinator = InspectionCoordinator(lambda frame: frame.frame_index)
+        original = inspection_frame_from_message(
+            make_message(0, total_frames=2, apple_id="apple-original")
+        )
+        coordinator.handle_frame(original, 1)
+        conflicting = inspection_frame_from_message(
+            make_message(1, total_frames=2, apple_id="apple-conflict")
+        )
+        with self.assertRaises(InspectionIdentityMismatch):
+            coordinator.handle_frame(conflicting, 2)
+
+        event = coordinator.identity_mismatch_event(
+            original.inspection_id,
+            conflicting.apple_id,
+            conflicting.total_frames,
+        )
+        self.assertEqual(event.state, ProcessingState.RECHECK)
+        self.assertEqual(event.apple_id, "apple-original")
+        self.assertEqual(event.received_count, 1)
+        coordinator.finalize(event.inspection_id)
+        self.assertEqual(len(coordinator.store), 0)
 
 
 class RosContractTest(unittest.TestCase):

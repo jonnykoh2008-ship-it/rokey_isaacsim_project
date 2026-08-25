@@ -1,5 +1,12 @@
 # GPU PC 2 구현 논의사항
 
+> 상태 안내 (2026-08-25): 현재 선행 MVP는 OpenCV 사과 검출과 크기 단일
+> 등급 판정이다. 이 문서의 착색률·손상 면적·ONNX segmentation·대표 프레임
+> 4~6장 관련 결정은 크기 단일 검증 이후의 후속 확장안으로 유지한다. 현재 구현
+> 범위와 인터페이스의 기준은 `docs/features/quality_grading.md`,
+> `docs/features/conveyor.md`, `docs/architecture/ros2_interfaces.md`가
+> 우선한다.
+
 ## 목적
 
 GPU PC 2의 품질 영상 추론과 사과 단위 결과 통합을 구현하기 전에 결정해야 할 사항을 관리한다. 이 문서는 미확정 값을 임의로 확정하지 않으며, 합의가 끝난 내용은 관련 기능 또는 아키텍처 문서에 반영한다.

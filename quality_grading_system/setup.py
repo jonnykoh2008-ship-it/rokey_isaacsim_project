@@ -11,6 +11,7 @@ setup(
         "apple_quality_dataset",
         "depth_geometry",
         "inspection_session",
+        "opencv_size_grader",
         "predictor",
         "quality_inspection_node",
         "quality_rules",
@@ -29,6 +30,7 @@ setup(
     entry_points={
         "console_scripts": [
             "inspect_apple_dataset = apple_quality_dataset:main",
+            "inspect_apple_size = opencv_size_grader:main",
             "quality_inspection_node = quality_inspection_node:main",
             "train_quality_model = train_quality_model:main",
         ],

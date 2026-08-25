@@ -10,6 +10,7 @@
 
   <exec_depend>appleproj_interfaces</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-pil</exec_depend>
   <exec_depend>rclpy</exec_depend>
 

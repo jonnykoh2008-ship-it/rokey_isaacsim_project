@@ -166,10 +166,11 @@ admission에 영향을 주지 않는다.
 
 ## InspectionImage
 
-GPU PC 2가 컨베이어 raw 스트림에서 후보 프레임을 수집하고 대표 프레임을 선택한
-뒤 품질 추론에 전달한다. `InspectionImage` 메시지는 GPU PC 2 내부 캡처→추론
-단계의 후보 계약으로 사용할 수 있으며, 별도 cross-PC 토픽으로 발행할지와 토픽
-이름/QoS는 `TBD`다.
+현재 OpenCV 크기 단일 단계 A는 저장된 RGB 파일을 직접 처리하므로
+`InspectionImage`를 사용하지 않는다. 단계 A 합격 후 GPU PC 2가 컨베이어 raw
+스트림에서 후보 프레임을 수집하고 대표 프레임을 선택해 RGB-D 직경 측정에
+전달할 때 이 메시지를 사용한다. GPU PC 2 내부 토픽 이름/QoS와 별도 cross-PC
+발행 여부는 `TBD`다.
 
 필드:
 
@@ -179,12 +180,18 @@ GPU PC 2가 컨베이어 raw 스트림에서 후보 프레임을 수집하고 �
 - `frame_index`: 해당 검사에서의 프레임 번호
 - `total_frames`: 해당 검사에서 전송할 전체 대표 프레임 수
 - `image`: 압축 RGB 이미지
+- `apple_mask`: lossless mono8 PNG 사과 mask
+- `ignore_mask`: lossless mono8 PNG 평가 제외 mask. 크기 단일 MVP에서는
+  직경 계산에 사용하지 않지만 후속 착색·손상 확장을 위해 유지한다.
+- `aligned_depth`: RGB에 정렬된 16UC1 millimetre compressedDepth PNG
+- `camera_info`: 해당 raw 프레임과 동일한 CameraInfo
 
-depth 및 `CameraInfo` 전달 여부는 TBD다.
+모든 구성요소의 timestamp와 frame_id는 동일해야 한다.
 
 ## QualityResult
 
-GPU PC 2가 이미지별 품질 추론과 사과 단위 통합을 완료한 뒤 개인 PC 2로 전달한다.
+GPU PC 2가 이미지별 크기 측정과 사과 단위 통합을 완료한 뒤 개인 PC 2로
+전달한다. 현재 MVP 등급은 `diameter_mm`만 사용한다.
 
 ```text
 토픽: /quality/results
@@ -205,6 +212,10 @@ GPU PC 2가 이미지별 품질 추론과 사과 단위 통합을 완료한 뒤 
 - `frame_indices`
 - `result_timestamp`
 - `status`: `VALID`, `RECHECK`, `UNCLASSIFIED`, `TIMEOUT`, `LATE_RESULT`, `ID_MISMATCH`, `INSUFFICIENT_VIEWS`
+
+현재 크기 단일 MVP에서 `color_ratio`와 `damage_area_cm2`는 NaN이다.
+화면 검증용 픽셀 직경은 `diameter_mm`에 넣지 않는다. 단계 A의 파일 기반
+OpenCV 도구는 ROS 결과를 발행하지 않고 오버레이 이미지와 CSV만 생성한다.
 
 카메라 ROI 이탈 후 simulation time 0.5초를 결과 deadline으로 사용한다. deadline까지 결과가 없으면 `TIMEOUT`, 이후 도착한 결과는 `LATE_RESULT`로 기록한다. 컨베이어 2의 tracker ID와 컨베이어 3 checkpoint의 rigid body prim이 일치하지 않으면 `ID_MISMATCH`로 처리한다.
 

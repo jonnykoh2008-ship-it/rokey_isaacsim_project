@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from enum import Enum
+from statistics import median
 from typing import Iterable
 
 
@@ -30,10 +31,10 @@ class ResultStatus(str, Enum):
 
 @dataclass(frozen=True)
 class AppleMeasurements:
-    color_ratio: float
-    diameter_mm: float
-    damage_area_cm2: float
-    severe_defect: bool = False
+    color_ratio: float | None = None
+    diameter_mm: float | None = None
+    damage_area_cm2: float | None = None
+    severe_defect: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -83,38 +84,32 @@ class FrameMeasurements:
         return sum(values) / len(values) if values else None
 
 
-def grade_measurements(measurements: AppleMeasurements) -> Grade:
-    """Apply the documented HIGH / MEDIUM / LOW product rules."""
-    if (
-        measurements.color_ratio < 0.60
-        or measurements.diameter_mm < 60.0
-        or measurements.damage_area_cm2 > 2.5
-        or measurements.severe_defect
-    ):
+def grade_diameter_mm(diameter_mm: float) -> Grade:
+    """Apply the approved size-only MVP boundaries."""
+    if diameter_mm < 0.0:
+        raise ValueError("diameter_mm must be non-negative")
+    if diameter_mm < 60.0:
         return Grade.LOW
-    if (
-        measurements.color_ratio >= 0.80
-        and measurements.diameter_mm >= 75.0
-        and measurements.damage_area_cm2 <= 1.0
-        and not measurements.severe_defect
-    ):
+    if diameter_mm >= 75.0:
         return Grade.HIGH
     return Grade.MEDIUM
+
+
+def grade_measurements(measurements: AppleMeasurements) -> Grade:
+    """Grade only by diameter during the current OpenCV MVP."""
+    if measurements.diameter_mm is None:
+        raise ValueError("diameter_mm is required for size-only grading")
+    return grade_diameter_mm(measurements.diameter_mm)
 
 
 def aggregate_frames(
     frame_measurements: Iterable[AppleMeasurements],
     frame_indices: Iterable[int],
     *,
-    min_valid_views: int = 4,
+    min_valid_views: int = 1,
     confidence: float | None = None,
 ) -> QualityResult:
-    """Aggregate representative views conservatively for a single apple.
-
-    Color uses the mean, diameter the median, damage the maximum computable
-    view, and severe defect a conservative ``any`` rule.  Callers provide the
-    representative frame indices selected by GPU PC 1.
-    """
+    """Aggregate size measurements for one apple using the diameter median."""
     values = list(frame_measurements)
     indices = tuple(frame_indices)
     if len(values) != len(indices):
@@ -123,13 +118,19 @@ def aggregate_frames(
         fallback = values[0] if values else None
         return QualityResult(None, ResultStatus.INSUFFICIENT_VIEWS, confidence, fallback, indices)
 
-    ordered_diameter = sorted(item.diameter_mm for item in values)
-    middle = len(values) // 2
+    diameters = [item.diameter_mm for item in values]
+    if any(value is None for value in diameters):
+        return QualityResult(
+            None,
+            ResultStatus.UNCLASSIFIED,
+            confidence,
+            None,
+            indices,
+        )
     measurements = AppleMeasurements(
-        color_ratio=sum(item.color_ratio for item in values) / len(values),
-        diameter_mm=ordered_diameter[middle],
-        damage_area_cm2=max(item.damage_area_cm2 for item in values),
-        severe_defect=any(item.severe_defect for item in values),
+        diameter_mm=float(
+            median(float(value) for value in diameters if value is not None)
+        ),
     )
     return QualityResult(grade_measurements(measurements), ResultStatus.VALID, confidence, measurements, indices)
 
@@ -143,8 +144,8 @@ def aggregate_measurement_frames(
     frame_indices: Iterable[int],
     *,
     confidence_threshold: float = 0.5,
-    min_valid_views: int = 4,
-    min_damage_views: int = 2,
+    min_valid_views: int = 1,
+    min_damage_views: int = 0,
 ) -> QualityResult:
     """Aggregate model measurements using the decided GPU PC 2 policy."""
 
@@ -155,22 +156,24 @@ def aggregate_measurement_frames(
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError("confidence_threshold must be between 0 and 1")
 
-    required_fields = ("color_ratio", "diameter_mm", "damage_area_cm2", "severe_defect")
-    if values and any(all(getattr(item, field) is None for item in values) for field in required_fields):
+    del min_damage_views
+    if values and all(item.diameter_mm is None for item in values):
         return QualityResult(None, ResultStatus.UNCLASSIFIED, None, None, indices)
 
     valid_pairs = [
         (index, item)
         for index, item in zip(indices, values)
-        if _is_valid(item.color_ratio, item.color_confidence, confidence_threshold)
-        and _is_valid(item.diameter_mm, item.diameter_confidence, confidence_threshold)
-        and _is_valid(item.severe_defect, item.severe_confidence, confidence_threshold)
+        if _is_valid(
+            item.diameter_mm,
+            item.diameter_confidence,
+            confidence_threshold,
+        )
     ]
     used_indices = tuple(index for index, _ in valid_pairs)
     valid_confidences = [
-        item.confidence
+        item.diameter_confidence
         for _, item in valid_pairs
-        if item.confidence is not None
+        if item.diameter_confidence is not None
     ]
     final_confidence = (
         sum(valid_confidences) / len(valid_confidences)
@@ -187,29 +190,12 @@ def aggregate_measurement_frames(
             used_indices,
         )
 
-    damage_values = [
-        item.damage_area_cm2
-        for _, item in valid_pairs
-        if _is_valid(item.damage_area_cm2, item.damage_confidence, confidence_threshold)
-    ]
-    if len(damage_values) < min_damage_views:
-        return QualityResult(
-            None,
-            ResultStatus.RECHECK,
-            final_confidence,
-            None,
-            used_indices,
-        )
-
-    colors = [item.color_ratio for _, item in valid_pairs]
-    diameters = sorted(item.diameter_mm for _, item in valid_pairs)
-    assert all(value is not None for value in colors)
+    diameters = [item.diameter_mm for _, item in valid_pairs]
     assert all(value is not None for value in diameters)
     measurements = AppleMeasurements(
-        color_ratio=sum(float(value) for value in colors) / len(colors),
-        diameter_mm=float(diameters[len(diameters) // 2]),
-        damage_area_cm2=max(float(value) for value in damage_values if value is not None),
-        severe_defect=any(bool(item.severe_defect) for _, item in valid_pairs),
+        diameter_mm=float(
+            median(float(value) for value in diameters if value is not None)
+        ),
     )
     return QualityResult(
         grade_measurements(measurements),

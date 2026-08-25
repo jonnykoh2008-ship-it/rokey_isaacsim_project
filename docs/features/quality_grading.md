@@ -1,187 +1,213 @@
 # 품질 분류
 
-## 범위
+## 현재 구현 범위
 
-컨베이어 2 상단 D455 카메라 한 대로 사과 영상을 수집하고 상·중·하 등급을 산출한다. 수확용 사과 위치 인식과는 별도 기능이다.
+현재 GPU PC 2 MVP는 사과 검출과 크기 단일 분류가 끝까지 연결되는지 확인하는
+단계다. 고정된 컨베이어 카메라 영상에서 한 번에 사과 한 개를 OpenCV로 검출하고,
+검출 윤곽의 픽셀 직경을 카메라 보정값으로 mm 단위에 대응시킨 뒤 크기만으로
+HIGH, MEDIUM, LOW를 판정한다.
 
-v2.0에서 GPU PC 1은 컨베이어 물리·checkpoint와 컨베이어 카메라 raw RGB/depth/
-CameraInfo 스트림을 발행한다. GPU PC 2는 raw 스트림을 구독해 ROI/tracker, 후보
-프레임 수집, 대표 프레임 선택, 품질 추론과 사과 단위 결과 통합을 수행한다. 개인
-PC 1의 RGB-D 수확 인식과 target 발행은 이 문서의 품질 `apple_id` lifecycle과
-분리한다.
+착색률, 손상 면적, 심각 결함, 신경망 segmentation 학습은 현재 등급 판정에 사용하지
+않으며 후속 확장 범위로 둔다. 이 결정은 합성데이터의 착색·손상 표현을 먼저
+완성하려다 전체 감지·분류 흐름 검증이 지연되는 문제를 줄이기 위한 것이다.
 
-## 검사 흐름
+v2.0 소유권은 다음과 같다.
 
-1. GPU PC 2가 raw RGB/depth/CameraInfo를 수신하고 RGB 영상과 bounding box 검출을 상시 수행한다.
-2. GPU PC 2의 tracker가 `apple_id`를 유지한다.
-3. GPU PC 2가 ROI 진입 시 `inspection_id`를 생성하고 후보 프레임을 수집한다.
-4. GPU PC 2가 후보 프레임 중 대표 프레임을 선택한다.
-5. GPU PC 2가 대표 프레임별 품질을 추론한다.
-6. GPU PC 2가 프레임 결과를 사과 단위로 통합한다.
-7. GPU PC 2가 ROI 이탈 시 `QualityResult`를 확정한다.
-8. ID가 유실·변경되거나 관측이 부족하면 GPU PC 2가 `RECHECK`로 처리한다.
+- GPU PC 1: Isaac Sim 컨베이어 물리와 raw RGB/depth/CameraInfo 발행
+- GPU PC 2: 컨베이어 영상 수신, 사과 검출, 크기 측정·분류, 결과 통합
+- 개인 PC 2: 품질 결과 표시와 후속 푸셔 선택
 
-GPU PC 2는 ROI 통과 중 후보 프레임을 0.1초 간격으로 최대 12장 수집하고,
-흔들림·blur·중복 시점을 제외한 대표 프레임 4~6장을 추론에 사용한다. 결과에는
-실제 사용한 `frame_index`를 기록한다.
+개인 PC 1의 수확용 사과 인식과 harvest target 발행은 이 품질검사 흐름과 분리한다.
 
-## GPU PC 2 입력 및 모델
+## 단계 A: 이미지 기반 OpenCV 확인
 
-- GPU PC 2는 GPU PC 1이 발행한 raw RGB/depth/CameraInfo를 동기화하고, tracker가
-  관리하는 사과별 표면 mask와 평가 제외 ignore mask를 생성한다.
-- GPU PC 2가 RGB/depth 기반 품질 추론과 직경·손상 면적 기하 측정을 담당한다.
-- RGB 모델 입력은 640×640으로 resize/letterbox하고 학습과 추론에 동일한
-  정규화를 적용한다.
-- depth는 신경망 입력에 직접 사용하지 않고 직경과 손상 면적 계산에 사용한다.
-- 모델은 등급을 직접 출력하지 않고 목표 착색 mask, 손상 mask, 심각 결함 여부와
-  각 출력의 confidence를 생성한다.
-- 착색률은 유효 사과 표면 중 목표 착색 mask의 비율로 계산하고, 손상 면적은 손상
-  mask와 depth로 계산한다.
-- 직경은 정렬된 depth와 해당 raw 프레임의 camera intrinsics로 계산한다.
-  intrinsics를 코드 상수로 고정하지 않는다.
-- 프레임 confidence는 유효한 모델 출력 confidence의 평균이다. 초기 유효
-  threshold는 0.5이며 핵심 측정의 confidence가 0.5 미만이면 해당 측정값을 무효
-  처리한다.
-- 모델 배포 형식은 ONNX를 기본으로 하고 GPU PC 2의 MVP 실행 백엔드는 ONNX
-  Runtime CUDA를 사용한다. 성능이 부족하면 TensorRT 변환을 검토한다.
-- annotation 최소 단위는 사과 표면, 목표 착색 영역, 손상 영역, 무시 영역 mask와
-  심각 결함 여부다. MVP는 동일 적색 사과 품종군을 대상으로 하며 정상적인 과피
-  거침은 손상에서 제외하고 검은별무늬병(scab)은 손상에 포함한다.
+첫 합격 단계는 ROS 2나 tracker에 앞서 저장된 합성 RGB 이미지로 확인한다.
 
-`InspectionImage`는 GPU PC 2 내부의 캡처→추론 후보 계약으로만 사용할 수 있다.
-별도 cross-PC 토픽과 구체 필드 및 QoS는 `docs/architecture/ros2_interfaces.md`에
-따라 `TBD`로 유지한다.
+1. 배경과 사과가 함께 있는 RGB 이미지를 읽는다.
+2. HSV saturation/value 범위로 전경 후보를 만든다.
+3. morphology open/close 후 가장 큰 유효 contour를 사과로 선택한다.
+4. contour, bounding box와 최소 외접원의 픽셀 직경을 계산한다.
+5. 실제 렌더 직경을 아는 여러 size 시나리오로 픽셀-mm 선형 보정을 계산한다.
+6. 픽셀 직경을 mm로 변환하고 크기 등급을 적용한다.
+7. 원본 영상에 contour, bounding box, 픽셀 직경, mm 직경과 등급을 표시한다.
 
-## 대표 프레임 선택
+이 단계의 입력 제약은 다음과 같다.
 
-- 사과 mask가 영상 경계에 닿지 않아야 한다.
-- 사과 mask의 90% 이상이 검사 ROI 안에 있어야 한다.
-- 유효 depth 픽셀 비율이 80% 이상이어야 한다.
-- Laplacian variance가 100 이상이어야 한다.
-- 이전 대표 프레임과 추정 회전 차이가 45° 미만이면 제외한다.
-- 최대 6장, 최소 4장을 선택한다.
-- 대표 프레임이 4장 미만이면 `INSUFFICIENT_VIEWS`로 처리한다.
+- 고정 카메라와 고정 해상도
+- 한 영상에 사과 한 개
+- 사과와 saturation이 명확히 다른 배경
+- 사과 전체가 영상 안에 들어옴
+- 기준 이미지와 검사 이미지가 같은 카메라 pose와 렌더 설정을 사용함
 
-90%, 80%, 100, 45°는 초기 시험값이며 시험 결과에 따라 조정한다.
+OpenCV HSV 기본값은 초기 합성환경 시험값이며 실제 데이터 확인 후 조정한다.
+픽셀값을 diameter_mm 필드에 직접 넣지 않는다.
 
-GPU PC 2의 카메라 ROI는 영상 수집의 시작과 종료를 판단한다. GPU PC 1의 trigger
-collider/checkpoint event는 컨베이어 진입·이탈 시각, 점유시간 및 공정 상태 전환을
-제공하며 대표 프레임 선택 자체에는 직접 사용하지 않는다.
+## OpenCV와 YOLO 적용 기준
 
-## 등급 규칙
+YOLO는 OpenCV에 포함된 사전학습 모델이 아니라 별도의 딥러닝 객체 검출·분할
+모델 계열이다. YOLO 결과를 OpenCV로 후처리하거나 표시할 수 있지만 두 기술의
+책임은 구분한다.
 
-### 상 (`HIGH`)
+현재 단계 A는 다음 조건이므로 YOLO를 요구하지 않는다.
 
-다음을 모두 만족해야 한다.
+- 고정 카메라와 단순한 배경
+- 한 화면에 사과 한 개
+- 합성환경에서 사과와 배경의 saturation 차이가 분명함
+- HSV mask, morphology와 contour만으로 사과가 안정적으로 검출됨
 
-- 착색률 80% 이상
-- 적도부 최대 직경 75mm 이상
-- 손상 면적 1.0cm² 이하
-- 부패나 심각한 형상 이상 없음
+현재 OpenCV 책임:
 
-### 하 (`LOW`)
+- RGB/HSV 변환과 전경 mask 생성
+- morphology 노이즈 제거
+- contour, bounding box와 외접원 계산
+- 픽셀 직경 측정
+- 크기 보정, 등급 오버레이와 CSV 생성
 
-다음 상품성 상실 조건 중 하나라도 만족하면 적용한다.
+다음 현상이 실제 Isaac Sim 또는 카메라 시험에서 반복되면 YOLO 도입을 검토한다.
 
-- 착색률 60% 미만
-- 적도부 최대 직경 60mm 미만
-- 손상 면적 2.5cm² 초과
-- 부패, 큰 멍 또는 심각한 형상 이상
+- 배경이나 컨베이어 부품을 사과로 반복 오검출
+- 조명·그림자·반사 변화에서 사과 검출 누락
+- 붉은색 외 품종마다 HSV 규칙을 계속 수정해야 함
+- 잎·가이드·다른 사과에 가려진 사과를 contour로 찾기 어려움
+- 한 화면의 여러 사과를 각각 분리하고 apple_id에 연결해야 함
 
-### 중 (`MEDIUM`)
+도입 시 일반 bounding box detection보다 사과별 외곽 mask를 제공하는 instance
+segmentation을 우선 검토한다. YOLO mask는 사과 위치와 표면 범위를 제공하며,
+OpenCV는 mask 후처리·blur 검사·시각화를 계속 담당한다.
 
-- 하에 해당하지 않으며 상의 모든 조건을 만족하지 않는 판매 가능한 사과
+YOLO만으로 실제 직경 mm가 계산되는 것은 아니다. YOLO 또는 OpenCV가 만든
+사과 mask에 정렬된 depth와 CameraInfo를 적용해 3D 직경을 계산해야 한다.
 
-예: 착색률 90%, 직경 80mm, 손상 1.5cm²인 사과는 `MEDIUM`이다.
+    현재 단계
+    OpenCV 검출 → 픽셀-mm 보정 → 크기 등급
 
-경계값은 다음과 같이 처리한다.
+    환경이 복잡해진 후속 단계
+    YOLO instance segmentation → OpenCV 후처리
+      → depth + CameraInfo 직경 계산 → 크기 등급
 
-- 착색률 60%는 `LOW` 조건이 아니며 80%는 `HIGH` 조건을 만족한다.
-- 직경 60mm는 `LOW` 조건이 아니며 75mm는 `HIGH` 조건을 만족한다.
-- 손상 면적 1.0cm²는 `HIGH` 조건을 만족한다.
-- 손상 면적 2.5cm²는 `LOW` 조건이 아니며 2.5cm²를 초과할 때 `LOW`다.
+YOLO 학습을 시작하기 전 bounding box/mask annotation, 합성·실제 데이터 분리,
+목표 검출률과 오검출 허용 기준을 확정해야 하며 해당 값은 현재 TBD다.
 
-## 측정 정의
+## 단계 B: RGB-D 및 ROS 2 통합
 
-- 착색률: `target_color_mask / (apple_surface_mask - ignore_mask)`의 픽셀 비율
-- 크기: 사과 표면 mask의 유효 depth 픽셀을 3D로 역투영한 뒤 영상 수평·수직 방향
-  범위 중 큰 값으로 근사한 가시 최대 직경
-- MVP 손상 면적: RGB의 사과·손상 mask와 정렬된 depth 및 camera intrinsics로 손상 픽셀을 3D 점으로 역투영하고, mask 내부의 인접한 유효 3D 점으로 구성한 삼각형의 면적 합으로 국소 표면 면적을 근사한 뒤 대표 프레임별 값 중 최댓값을 사용
-- 확장: 다중 프레임 mask를 사과 표면 좌표계에 투영한 합집합 면적
-- 사과 경계, 반사광, 가림처럼 판정할 수 없는 픽셀은 ignore mask로 제외한다.
+단계 A가 합격하면 GPU PC 2가 GPU PC 1의 raw RGB/depth/CameraInfo 스트림을
+구독하도록 연결한다. 실제 운영 직경은 사과 mask의 유효 depth 픽셀을 CameraInfo로
+3D 역투영해 계산한다. camera intrinsics를 코드 상수로 고정하지 않는다.
+
+기존 InspectionImage와 quality inspection completed 경로는 이 RGB-D 통합을
+위한 스캐폴딩이다. 모델 경로를 지정하지 않은 기본 실행에서는 착색·손상 신경망을
+요구하지 않고 depth 기하 직경만 사용한다.
+
+ROI/tracker와 다중 사과 처리는 단계 A 이후 연결한다. 동일 inspection에서
+apple_id가 바뀌면 결과를 확정하지 않고 RECHECK를 발행한 뒤 세션을 정리한다.
+
+## 크기 등급 규칙
+
+현재 등급은 적도부 최대 직경 한 항목만 사용한다.
+
+| 직경 | 등급 |
+|---|---|
+| 75mm 이상 | HIGH |
+| 60mm 이상 75mm 미만 | MEDIUM |
+| 60mm 미만 | LOW |
+
+경계값 처리:
+
+- 정확히 60mm는 MEDIUM
+- 정확히 75mm는 HIGH
+
+착색률, 손상 면적 또는 심각 결함 값은 현재 크기 등급을 바꾸지 않는다.
+QualityResult의 color_ratio와 damage_area_cm2는 현재 MVP에서 NaN으로 발행한다.
+
+## 크기 측정과 보정
+
+### 단계 A 픽셀 보정
+
+같은 카메라 조건에서 실제 렌더 직경을 알고 있는 여러 기준 사과를 검출해 다음
+선형식을 구한다.
+
+    estimated_diameter_mm = mm_per_pixel * detected_diameter_px + intercept_mm
+
+한 장 기준의 pixels_per_mm 보정도 지원하지만 픽셀 양자화와 자세 변화에 민감하다.
+권장 보정에는
+58mm, 60mm, 62mm, 73mm, 75mm, 78mm처럼 두 경계의 아래·경계·위 데이터를
+포함하고 각 시나리오 여러 자세의 픽셀 직경 중앙값을 사용한다. case 0으로
+보정하고 case 1로 검증하며, 요청한 target 값이 아니라 metadata의
+aggregate_measured_diameter_mm를 정답으로 사용한다. 허용 오차와 경계 주변
+RECHECK 폭은 검증 후 확정하며 현재 TBD다.
+
+### 단계 B RGB-D 측정
+
+- 사과 mask와 정렬된 depth의 유효 픽셀을 사용한다.
+- CameraInfo로 3D 역투영한 수평·수직 범위 중 큰 값을 가시 최대 직경으로 사용한다.
 - depth가 0, NaN 또는 카메라 유효 범위 밖이면 계산에서 제외한다.
-- 유효한 손상 면적 측정 프레임이 2장 미만이면 `RECHECK`로 처리한다.
-- 사과 구면 모델 투영과 mask 비율·추정 표면적 방식은 대안으로 기록하며 MVP 기본 방식으로 사용하지 않는다.
+- 여러 유효 프레임을 사용할 때 직경은 통계적 중앙값을 사용한다.
+- 짝수 개 프레임의 중앙값은 가운데 두 값의 평균이다.
 
-## 다중 프레임 통합
+## 프레임 선택
 
-- 착색률은 유효 대표 프레임 측정값의 평균을 사용한다.
-- 직경은 유효 측정값의 중앙값을 사용한다.
-- 손상 면적 또는 손상률은 유효 대표 프레임 측정값 중 최댓값을 사용한다.
-- 심각 결함은 유효 프레임 한 장에서라도 검출되면 `true`로 통합한다.
-- 프레임별로 등급을 확정하거나 등급 투표를 하지 않는다. 측정값을 사과 단위로
-  통합한 뒤 등급 규칙을 한 번 적용한다.
-- 일부 프레임 처리가 실패해도 정상 처리된 대표 프레임이 4장 이상이면 통합한다.
-  4장 미만이면 `INSUFFICIENT_VIEWS`로 처리한다.
-- 최종 confidence는 유효 프레임별 confidence의 평균을 사용한다.
+단계 A는 저장 이미지 한 장으로 전체 흐름을 먼저 확인한다. 단계 B에서는 동일 사과의
+선명한 프레임을 최대 3장까지 사용할 수 있고 직경 중앙값을 사용한다.
 
-## ID 예외 처리
+프레임 선택 초기 조건:
 
-- ID가 변경되면 `RECHECK`로 처리한다.
-- 두 사과의 bounding box가 겹치거나 ID switch가 발생한 경우 `RECHECK`로 처리한다.
-- 한 사과가 여러 detection으로 분리된 경우 `RECHECK`로 처리한다.
-- 일시 누락 후 동일 ID로 복구된 경우에도 해당 inspection의 관측 연속성을 검증하며, 연속성을 보장할 수 없으면 `RECHECK`로 처리한다.
-- 컨베이어 2의 `apple_id`와 컨베이어 3 trigger의 rigid body prim이 일치하지 않으면 `ID_MISMATCH`로 처리한다.
+- 사과 contour/mask가 영상 경계에 닿지 않음
+- 사과의 90% 이상이 검사 ROI 안에 있음
+- RGB-D 측정 시 유효 depth 픽셀 비율 80% 이상
+- Laplacian variance 100 이상
 
-## 결과 시간 처리
+90%, 80%, 100은 초기 시험값이며 실제 검증 후 조정한다. 유효 프레임이 없으면
+UNCLASSIFIED, ID가 바뀌거나 다중 사과가 겹치면 RECHECK로 처리한다.
 
-- GPU PC 2는 사과가 카메라 ROI를 이탈한 simulation timestamp를 deadline
-  시작점으로 사용한다.
-- 결과 deadline은 카메라 ROI 이탈 후 simulation time 0.5초다.
-- deadline 안에 결과가 도착하면 정상 처리한다.
-- deadline까지 결과가 없으면 해당 검사에 대한 유일한 최종 결과로 `TIMEOUT`을
-  발행한다.
-- deadline 이후 끝난 추론은 `LATE_RESULT`로 내부 로그에만 기록한다.
-- deadline 이후 계산된 정상 등급 또는 별도 `LATE_RESULT` 메시지는 다시 발행하지
-  않는다.
-- `ID_MISMATCH`는 tracker ID와 rigid body prim 정보를 함께 가진 공정·추적 관리
-  노드가 판정하며 GPU PC 2는 입력 검사 내부의 `apple_id` 일치만 검증한다.
-- `TIMEOUT`, `RECHECK`, `UNCLASSIFIED`는 푸셔와 연결하지 않고 컨베이어 3 라인
-  끝으로 통과시킨다.
-- 공정 시간은 `/clock` 기준 simulation time을 사용한다.
-- ROI 이탈이 확인되지 않은 미완료 세션은 wall time 3초 후 폐기해 메모리 누적을
-  방지한다. 이 정리 timeout은 품질 결과 deadline이나 simulation 상태 판정에
-  사용하지 않는다.
+## 결과 및 예외 처리
+
+- 크기 측정과 confidence가 유효하면 VALID와 크기 등급을 발행한다.
+- OpenCV가 사과를 찾지 못하면 NO_DETECTION 디버그 상태로 기록하고 품질 결과를
+  확정하지 않는다.
+- apple_id 변경, 중복 detection 또는 두 사과 겹침은 RECHECK다.
+- 일부 프레임 측정이 실패해도 유효 직경 프레임이 하나 이상이면 현재 MVP는 통합할
+  수 있다.
+- ROI 이탈 후 simulation time 0.5초 deadline 정책은 ROS 2 통합 단계에서 유지한다.
+- deadline까지 결과가 없으면 유일한 최종 결과로 TIMEOUT을 발행한다.
+- deadline 이후 끝난 계산은 LATE_RESULT와 inspection/frame 정보를 내부 로그에만
+  남기며 중복 결과를 발행하지 않는다.
+- 모든 ROS 2 시간 판정은 /clock과 use_sim_time true를 사용한다.
 
 ## 통신
 
-```text
-GPU PC 1
-컨베이어 raw RGB/depth/CameraInfo + checkpoint event
-  → GPU PC 2
+    단계 A
+    합성 RGB 파일
+      → GPU PC 2 OpenCV 사과 검출
+      → 크기 보정·등급 판정
+      → contour/bounding box/직경/등급 오버레이 + CSV
 
-GPU PC 2
-ROI/tracker + 후보 프레임 수집 및 대표 프레임 선택
-  → 이미지별 품질 추론 및 사과 단위 통합
-  → QualityResult
+    단계 B
+    GPU PC 1 raw RGB/depth/CameraInfo
+      → GPU PC 2 ROI/tracker 및 대표 프레임 선택
+      → RGB-D 직경 측정과 크기 등급 통합
+      → /quality/results
 
-MVP
-QualityResult와 apple_id 연결 확인 후 컨베이어 3 라인 끝으로 배출
+컨베이어 raw 토픽 이름과 정확한 QoS는
+docs/architecture/ros2_interfaces.md에 따라 TBD로 유지한다.
 
-2차 개발
-개인 PC 2가 등급별 푸셔를 선택
-  → GPU PC 1의 컨베이어 4 실제 푸셔 작동
-```
+## 후속 확장
 
-## 참고
+크기 단일 분류가 합격한 뒤 다음 순서로 확장한다.
 
-- EU 공식 규격: <https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX%3A02023R2429-20251004>
-- 내부 참고: `TalkFile_apple_harvesting_quality_grading_design.md` (현재 저장소 존재 여부 확인 필요)
+1. raw RGB ROS 2 구독과 디버그 오버레이 발행
+2. ROI/tracker와 안정적인 apple_id
+3. RGB-D 실제 직경 측정
+4. 착색 mask와 착색률
+5. 손상 mask와 손상 면적
+6. 다중 프레임 표면 통합과 confidence 보정
+
+후속 착색·손상 annotation 최소 단위는 사과 표면, 목표 착색 영역, 손상 영역,
+무시 영역 mask와 심각 결함 여부다. 해당 항목이 실제 등급 규칙에 다시 포함될
+시점과 경계값은 검증 데이터와 사용자 승인을 거쳐 확정한다.
 
 ## 미확정 사항
 
-세부 모델 규모, 등급별 목표 정확도, 정규화 세부값과 confidence 보정 방식은 학습 및
-검증 후 확정한다. raw depth로 계산한 직경·손상 면적의 허용 오차와 무시 영역의 세부
-annotation 사례는 실제 데이터 검증 후 확정한다. 일시 누락 후 동일 ID 복구를 허용할
-구체적인 연속성 기준, 네트워크 장애 감지용 heartbeat 토픽과 다중 사과 ID 복구 규칙은
-통신 시험을 거쳐 확정한다.
+raw 컨베이어 카메라 토픽 이름과 QoS, OpenCV HSV 범위의 최종값, 픽셀 보정 허용
+오차, 경계 주변 RECHECK 폭, tracker 연속성 기준과 다중 사과 복구 규칙은 TBD다.
+실제 데이터로 크기 단일 분류가 합격하기 전에는 착색률·손상 면적을 현재 MVP 필수
+조건으로 다시 올리지 않는다.

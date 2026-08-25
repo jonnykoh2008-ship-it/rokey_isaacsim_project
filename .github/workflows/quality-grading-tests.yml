@@ -27,7 +27,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        run: python -m pip install --disable-pip-version-check numpy pillow
+        run: >-
+          python -m pip install --disable-pip-version-check
+          numpy pillow opencv-python-headless
       - name: Run quality grading tests
         env:
           PYTHONDONTWRITEBYTECODE: "1"
@@ -49,6 +51,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             python3-colcon-common-extensions \
             python3-numpy \
+            python3-opencv \
             python3-pil
       - name: Build ROS packages and verify generated messages
         run: |

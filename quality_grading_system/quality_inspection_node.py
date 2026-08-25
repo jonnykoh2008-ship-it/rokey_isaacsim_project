@@ -13,6 +13,7 @@ from inspection_session import (
     InspectionCompletion,
     InspectionContractError,
     InspectionFrame,
+    InspectionIdentityMismatch,
     InspectionSession,
     InspectionStore,
 )
@@ -20,7 +21,6 @@ from predictor import (
     FramePredictor,
     IndexedPrediction,
     PredictorNotConfigured,
-    UnconfiguredPredictor,
     load_measurement_predictor,
     predict_declared_frames,
 )
@@ -85,6 +85,7 @@ class ProcessingState(str, Enum):
     PREDICTOR_UNAVAILABLE = "PREDICTOR_UNAVAILABLE"
     TIMEOUT = "TIMEOUT"
     STALE = "STALE"
+    RECHECK = "RECHECK"
     FINALIZED = "FINALIZED"
 
 
@@ -97,6 +98,14 @@ class ProcessingEvent(Generic[PredictionT]):
     total_frames: int
     predictions: tuple[IndexedPrediction[PredictionT], ...] = ()
     deadline_time_ns: int | None = None
+
+
+class DiameterOnlyPredictor:
+    """No-model predictor used by the approved size-only MVP."""
+
+    def predict(self, frame: InspectionFrame) -> None:
+        del frame
+        return None
 
 
 def _header_signature(header: Any) -> tuple[int, int, str]:
@@ -291,6 +300,24 @@ class InspectionCoordinator(Generic[PredictionT]):
         self._recent_finalized.append(inspection_id)
         self._recent_finalized_set.add(inspection_id)
 
+    def identity_mismatch_event(
+        self,
+        inspection_id: str,
+        fallback_apple_id: str,
+        fallback_total_frames: int,
+    ) -> ProcessingEvent[PredictionT]:
+        """Describe an ID conflict using the original session identity."""
+        session = self._store.get(inspection_id)
+        if session is not None:
+            return self._event(ProcessingState.RECHECK, session)
+        return ProcessingEvent(
+            state=ProcessingState.RECHECK,
+            inspection_id=inspection_id,
+            apple_id=fallback_apple_id,
+            received_count=0,
+            total_frames=fallback_total_frames,
+        )
+
 
 def _reliable_qos(depth: int) -> Any:
     if QoSProfile is None:
@@ -344,7 +371,7 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
             configured_predictor = (
                 load_measurement_predictor(model_path, backend=backend)
                 if model_path
-                else UnconfiguredPredictor()
+                else DiameterOnlyPredictor()
             )
         self._confidence_threshold = float(self.get_parameter("confidence_threshold").value)
         self._stale_timeout_ns = int(
@@ -394,6 +421,9 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
                 frame,
                 self._simulation_time_ns(),
             )
+        except InspectionIdentityMismatch as exc:
+            self._handle_identity_mismatch(message, exc)
+            return
         except InspectionContractError as exc:
             self.get_logger().error(f"Rejected InspectionImage contract: {exc}")
             return
@@ -410,6 +440,9 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
                 completion,
                 self._simulation_time_ns(),
             )
+        except InspectionIdentityMismatch as exc:
+            self._handle_identity_mismatch(message, exc)
+            return
         except InspectionContractError as exc:
             self.get_logger().error(f"Rejected InspectionCompleted contract: {exc}")
             return
@@ -453,8 +486,32 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
             )
             self._coordinator.finalize(event.inspection_id)
             return
+        if event.state is ProcessingState.RECHECK:
+            result = CoreQualityResult(
+                None,
+                ResultStatus.RECHECK,
+                None,
+                None,
+                (),
+            )
+            self._publish_result(event, result)
+            self._coordinator.finalize(event.inspection_id)
+            return
         if event.state is ProcessingState.PREDICTED:
             self._finalize_predictions(event)
+
+    def _handle_identity_mismatch(self, message: Any, exc: Exception) -> None:
+        inspection_id = str(getattr(message, "inspection_id", ""))
+        event = self._coordinator.identity_mismatch_event(
+            inspection_id,
+            str(getattr(message, "apple_id", "")),
+            int(getattr(message, "total_frames", 0)),
+        )
+        self.get_logger().error(
+            f"INSPECTION_IDENTITY_MISMATCH inspection_id={inspection_id} "
+            f"received_apple_id={getattr(message, 'apple_id', '')} error={exc}"
+        )
+        self._handle_event(event)
 
     def _finalize_predictions(self, event: ProcessingEvent[Any]) -> None:
         session = self._coordinator.store.get(event.inspection_id)
@@ -547,13 +604,19 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
         )
         measurements = result.measurements
         message.color_ratio = (
-            float(measurements.color_ratio) if measurements else float("nan")
+            float(measurements.color_ratio)
+            if measurements is not None and measurements.color_ratio is not None
+            else float("nan")
         )
         message.diameter_mm = (
-            float(measurements.diameter_mm) if measurements else float("nan")
+            float(measurements.diameter_mm)
+            if measurements is not None and measurements.diameter_mm is not None
+            else float("nan")
         )
         message.damage_area_cm2 = (
-            float(measurements.damage_area_cm2) if measurements else float("nan")
+            float(measurements.damage_area_cm2)
+            if measurements is not None and measurements.damage_area_cm2 is not None
+            else float("nan")
         )
         message.frames_used = len(result.frames_used)
         message.frame_indices = list(result.frames_used)
