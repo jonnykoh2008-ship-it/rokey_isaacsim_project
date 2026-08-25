@@ -1,0 +1,21 @@
+std_msgs/Header header
+string command_id
+string apple_id
+string inspection_id
+
+uint8 HIGH=1
+uint8 MEDIUM=2
+uint8 LOW=3
+uint8 grade
+
+uint8 PUSHER_1=1
+uint8 PUSHER_2=2
+uint8 PUSHER_3=3
+uint8 pusher_id
+
+string trigger_checkpoint_id
+---
+bool accepted
+string command_id
+string error_code
+string message

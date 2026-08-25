@@ -19,8 +19,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PlanningScene.msg"
   "msg/QualityResult.msg"
   "msg/SimulationState.msg"
+  "msg/SortStatus.msg"
   "srv/GetPlanningScene.srv"
   "srv/RetryInspection.srv"
+  "srv/SortCommand.srv"
   "action/RobotMotion.action"
   DEPENDENCIES
     builtin_interfaces
