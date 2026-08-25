@@ -68,7 +68,6 @@ from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from motion_planning_visualization import MotionPlanningVisualizationPublisher
-from conveyor_sort_controller import SortRuntime, TimingConfig
 
 
 MOTION_SEQUENCE = [
@@ -152,7 +151,19 @@ def _required_environment(name):
     return value
 
 
-def load_pusher_configuration():
+def pushers_enabled():
+    """Keep harvesting runnable when the optional phase-2 pusher is absent."""
+    value = os.environ.get("APPLEPROJ_ENABLE_PUSHERS", "0").strip().lower()
+    if value in ("0", "false", "no", "off", ""):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise RuntimeError(
+        "APPLEPROJ_ENABLE_PUSHERS는 1/true/on 또는 0/false/off여야 합니다"
+    )
+
+
+def load_pusher_configuration(timing_config_type):
     """Load physical values without inventing defaults for still-TBD requirements."""
     configs = []
     for pusher_id in (1, 2, 3):
@@ -180,7 +191,7 @@ def load_pusher_configuration():
             )
         )
     try:
-        timing = TimingConfig(
+        timing = timing_config_type(
             trigger_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_TRIGGER_TIMEOUT_S")),
             push_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_PUSH_TIMEOUT_S")),
             home_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_HOME_TIMEOUT_S")),
@@ -2360,18 +2371,40 @@ def main():
         stage_units_in_meters=1.0, physics_prim_path="/physicsScene",
         physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0,
     )
-    pusher_configs, pusher_timing = load_pusher_configuration()
-    pusher_actuator = IsaacPrismaticPusherActuator(world, pusher_configs)
+    pusher_actuator = None
+    pusher_timing = None
+    sort_runtime_type = None
+    if pushers_enabled():
+        try:
+            from conveyor_sort_controller import SortRuntime, TimingConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                "푸셔 기능을 활성화하려면 APPLEPROJ_INTERFACES_PREFIX에 "
+                "SortCommand와 SortStatus가 빌드되어 있어야 합니다"
+            ) from exc
+        pusher_configs, pusher_timing = load_pusher_configuration(TimingConfig)
+        pusher_actuator = IsaacPrismaticPusherActuator(world, pusher_configs)
+        sort_runtime_type = SortRuntime
+    else:
+        print(
+            "   [PUSHER] 비활성화: APPLEPROJ_ENABLE_PUSHERS=1일 때만 "
+            "SortCommand/SortStatus와 푸셔 articulation을 초기화합니다."
+        )
     robot = harvest.create_robot(world)
-    pusher_actuator.validate_initialized()
-    pusher_actuator.try_home_all()
+    if pusher_actuator is not None:
+        pusher_actuator.validate_initialized()
+        pusher_actuator.try_home_all()
     # create_robot 안의 world.reset()이 articulation과 PhysX view를 초기화한
     # 뒤라야 TF/JointState 노드가 articulation을 찾을 수 있다. 그 전에 그래프를
     # 만들면 "did not match any articulations"로 빈 TF만 발행된다.
     create_robot_tf_graph(stage)
     rclpy.init()
     node = RobotMotionNode()
-    sort_runtime = SortRuntime(node, pusher_actuator, pusher_timing)
+    sort_runtime = (
+        sort_runtime_type(node, pusher_actuator, pusher_timing)
+        if sort_runtime_type is not None
+        else None
+    )
     engine = MotionEngine(
         world,
         robot,
@@ -2413,7 +2446,8 @@ def main():
         while harvest.simulation_app.is_running():
             if world.is_stopped():
                 if published_state != SimulationState.STOPPED:
-                    sort_runtime.reset()
+                    if sort_runtime is not None:
+                        sort_runtime.reset()
                     node.publish_state(
                         SimulationState.STOPPED,
                         "Timeline Stop: 실행 중 Goal과 이전 계획을 폐기합니다.",
@@ -2438,8 +2472,9 @@ def main():
                 )
                 engine.close()
                 world.reset()
-                pusher_actuator.validate_initialized()
-                pusher_actuator.try_home_all()
+                if pusher_actuator is not None:
+                    pusher_actuator.validate_initialized()
+                    pusher_actuator.try_home_all()
                 engine = MotionEngine(
                     world,
                     robot,
@@ -2484,7 +2519,8 @@ def main():
                     "새 scene_version으로 실행 중입니다.",
                 )
                 continue
-            sort_runtime.process(float(world.current_time), simulation_ready=True)
+            if sort_runtime is not None:
+                sort_runtime.process(float(world.current_time), simulation_ready=True)
             try:
                 pending = node.requests.get_nowait()
             except queue.Empty:
@@ -2500,8 +2536,9 @@ def main():
                 )
                 engine.close()
                 world.reset()
-                pusher_actuator.validate_initialized()
-                pusher_actuator.try_home_all()
+                if pusher_actuator is not None:
+                    pusher_actuator.validate_initialized()
+                    pusher_actuator.try_home_all()
                 engine = MotionEngine(
                     world,
                     robot,
@@ -2526,7 +2563,8 @@ def main():
             )
             pending.finished.set()
     finally:
-        sort_runtime.reset()
+        if sort_runtime is not None:
+            sort_runtime.reset()
         engine.close()
         executor.shutdown()
         node.destroy_node()
