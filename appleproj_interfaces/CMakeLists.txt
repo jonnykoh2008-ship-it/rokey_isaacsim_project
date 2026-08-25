@@ -12,6 +12,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CheckpointEvent.msg"
   "msg/HarvestPerceptionStatus.msg"
   "msg/HarvestTarget.msg"
+  "msg/InspectionCompleted.msg"
   "msg/InspectionImage.msg"
   "msg/MotionStatus.msg"
   "msg/ObstacleProxy.msg"
