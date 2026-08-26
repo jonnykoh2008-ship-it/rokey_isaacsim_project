@@ -225,7 +225,7 @@ COLLISION_DEBUG_ROOT_PATH = "/World/RuntimeHarvestCollisionDebug"
 COLLISION_SPHERE_VISUALIZATION_ROOT_PATH = (
     "/World/RuntimeHarvestCollisionSpheres"
 )
-CONVEYOR_PATH = "/World/ConveyorTrack_01"
+CONVEYOR_PATH = "/World/ConveyorTrack"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
 # 두 base D455는 고정 asset이므로 선택한 로봇과 관계없이 물리적으로 고정한다.
 FIXED_CAMERA_ROOT_PATHS = [
@@ -312,6 +312,10 @@ MAX_MOVE_STEPS = 900
 # 작은 여유이며, 실제 접촉 후 그리퍼를 서서히 여는 동안 중력으로 안착한다.
 CONVEYOR_END_INSET_M = 0.45
 CONVEYOR_OUTSIDE_OFFSET_M = 0.30
+# 사과 중심을 벨트 가장자리 쪽에 놓을 때 사과 외곽과 상판 끝 사이에 남길
+# 최소 여유다. 폭이 바뀌어도 중심선 근처로 강제하지 않고 로봇에 가까운 유효
+# 상판 위를 사용한다.
+CONVEYOR_EDGE_CLEARANCE_M = 0.03
 SAFE_CARRY_CLEARANCE_M = 0.15
 # 이 로봇 배치에서는 하향 그리퍼 자세로 상판 25 cm 위를 요구하면 손목이
 # 작업반경을 벗어난다. 실제 IK 결과에서 LOWER는 성공했으므로 12 cm 상공에서
@@ -1029,6 +1033,7 @@ class RobotAppleContactMonitor:
         self.state = "IDLE"
         self.palm_contacted = False
         self.finger_contacted = False
+        self.contacted_fingers = set()
         self.palm_path = None
         self.finger_path = None
         articulation = require_prim(stage, ARTICULATION_PRIM_PATH)
@@ -1060,9 +1065,21 @@ class RobotAppleContactMonitor:
 
     def reset(self):
         self.palm_contacted = False
-        self.finger_contacted = False
         self.palm_path = None
+        self.reset_finger_contacts()
+
+    def reset_finger_contacts(self):
+        """palm 접촉은 유지하고 GRASP용 손가락 접촉 기록만 비운다."""
+        self.finger_contacted = False
         self.finger_path = None
+        self.contacted_fingers.clear()
+
+    @staticmethod
+    def _finger_name(path):
+        for name in ("finger_1", "finger_2", "finger_middle"):
+            if f"/{name}_" in path or f"/{name}/" in path:
+                return name
+        return None
 
     def close(self):
         self._subscription = None
@@ -1090,12 +1107,22 @@ class RobotAppleContactMonitor:
                         f"   [APPLE CONTACT] state={self.state}, "
                         f"type=palm, robot={gripper_path}"
                     )
-            elif not self.finger_contacted:
+            else:
+                finger_name = self._finger_name(gripper_path)
+                if finger_name is None:
+                    continue
+                first_finger_contact = not self.finger_contacted
+                new_finger = finger_name not in self.contacted_fingers
                 self.finger_contacted = True
-                self.finger_path = gripper_path
+                self.contacted_fingers.add(finger_name)
+                if first_finger_contact:
+                    self.finger_path = gripper_path
+                if not new_finger:
+                    continue
                 print(
                     f"   [APPLE CONTACT] state={self.state}, "
-                    f"type=finger, robot={gripper_path}"
+                    f"type={finger_name}, contacts="
+                    f"{len(self.contacted_fingers)}/3, robot={gripper_path}"
                 )
 
 
@@ -1488,6 +1515,52 @@ def _component_capsule_spec(points):
     return center, axis, radius, height
 
 
+def _robust_local_cross_section(points, tangent):
+    """갈림점 outlier에 끌려가지 않는 로컬 단면 중심과 반경을 계산한다.
+
+    기존 radial RMS는 한 40 mm slab 안에 굽은 가지나 갈림점의 먼 점이 조금만
+    섞여도 그 거리를 capsule 반경으로 직접 반영했다. 로컬 축에 수직인 두 축의
+    좌표 중앙값으로 중심선을 잡고, 그 중심선까지 거리의 중앙값을 사용하면
+    정상 원통 표면의 반경은 유지하면서 한쪽으로 뻗은 갈림점의 영향은 제한된다.
+    """
+    points = np.asarray(points, dtype=float)
+    tangent = np.asarray(tangent, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3:
+        raise ValueError("로컬 단면에는 3개 이상의 3차원 점이 필요합니다.")
+    tangent_norm = float(np.linalg.norm(tangent))
+    if not np.isfinite(tangent_norm) or tangent_norm <= 1e-9:
+        raise ValueError("로컬 단면 축이 유효하지 않습니다.")
+    tangent = tangent / tangent_norm
+
+    reference = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(reference, tangent))) > 0.9:
+        reference = np.array([0.0, 1.0, 0.0], dtype=float)
+    radial_u = np.cross(tangent, reference)
+    radial_u /= np.linalg.norm(radial_u)
+    radial_v = np.cross(tangent, radial_u)
+    radial_v /= np.linalg.norm(radial_v)
+
+    axial_coordinates = points @ tangent
+    radial_u_coordinates = points @ radial_u
+    radial_v_coordinates = points @ radial_v
+    axial_center = float(np.median(axial_coordinates))
+    radial_u_center = float(np.median(radial_u_coordinates))
+    radial_v_center = float(np.median(radial_v_coordinates))
+    center = (
+        tangent * axial_center
+        + radial_u * radial_u_center
+        + radial_v * radial_v_center
+    )
+    radial_distances = np.hypot(
+        radial_u_coordinates - radial_u_center,
+        radial_v_coordinates - radial_v_center,
+    )
+    radius = float(np.median(radial_distances))
+    if not np.isfinite(radius):
+        raise ValueError("로컬 단면 반경이 유효하지 않습니다.")
+    return center, radius
+
+
 def _component_local_slices(points):
     """연결 성분을 장축 방향으로 나누고 구간별 중심선과 반경을 계산한다."""
     points = np.asarray(points, dtype=float)
@@ -1529,12 +1602,12 @@ def _component_local_slices(points):
         if float(np.linalg.norm(tangent)) < 1e-9:
             tangent = global_axis
         tangent = normalized(tangent)
-        centered = item["points"] - item["center"]
-        radial = centered - np.outer(centered @ tangent, tangent)
-        item["axis"] = tangent
-        item["radius"] = float(
-            np.sqrt(np.mean(np.sum(radial * radial, axis=1)))
+        robust_center, robust_radius = _robust_local_cross_section(
+            item["points"], tangent
         )
+        item["center"] = robust_center
+        item["axis"] = tangent
+        item["radius"] = robust_radius
         item["thick"] = item["radius"] >= TREE_PHYSX_MIN_BRANCH_RADIUS_M
     return slices
 
@@ -1619,10 +1692,11 @@ def configure_unified_tree_physx_colliders(stage):
             for segment_index, spec in enumerate(local_specs):
                 component_specs.append((component_index, segment_index, *spec))
 
-    for large_index, segment_index, center, axis, radius, height in component_specs:
+    segment_radii = []
+    for component_index, segment_index, center, axis, radius, height in component_specs:
         path = (
             f"{RUNTIME_TREE_COLLIDER_ROOT_PATH}/"
-            f"large_{large_index:03d}_segment_{segment_index:03d}"
+            f"thick_component_{component_index:03d}_segment_{segment_index:03d}"
         )
         capsule = UsdGeom.Capsule.Define(stage, path)
         capsule.CreateAxisAttr().Set(UsdGeom.Tokens.z)
@@ -1640,12 +1714,19 @@ def configure_unified_tree_physx_colliders(stage):
         )
         collision = UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
         collision.CreateCollisionEnabledAttr().Set(True)
+        segment_radii.append(float(radius))
+        print(
+            f"   Tree collider {path}: radius {radius:.4f} m, "
+            f"height {height:.4f} m, center {vec(center)}"
+        )
 
+    maximum_radius = max(segment_radii, default=0.0)
     print(
         f"   Tree collider local segments {len(component_specs)} from "
         f"{locally_thick_component_count} locally thick components, "
         f"slice {TREE_LOCAL_SEGMENT_LENGTH_M:.3f} m, "
-        f"local radius >= {TREE_PHYSX_MIN_BRANCH_RADIUS_M:.3f} m"
+        f"local radius >= {TREE_PHYSX_MIN_BRANCH_RADIUS_M:.3f} m, "
+        f"maximum radius {maximum_radius:.4f} m"
     )
     return component_count, len(component_specs), original_colliders_disabled
 
@@ -1920,6 +2001,75 @@ def compute_apple_center(stage):
     return center, size
 
 
+def compute_conveyor_target_geometry(minimum, maximum, robot_position, apple_size):
+    """상판 경계에서 로봇에 가까우면서 사과 전체가 올라가는 배치점을 계산한다."""
+    minimum = np.asarray(minimum, dtype=float)
+    maximum = np.asarray(maximum, dtype=float)
+    robot_position = np.asarray(robot_position, dtype=float)
+    apple_size = np.asarray(apple_size, dtype=float)
+    size = maximum - minimum
+    if minimum.shape != (3,) or maximum.shape != (3,) or np.any(size <= 1e-4):
+        raise ValueError("컨베이어 상판 경계가 유효하지 않습니다.")
+
+    center = 0.5 * (minimum + maximum)
+    travel_axis = int(np.argmax(size[:2]))
+    side_axis = 1 - travel_axis
+    inset = min(CONVEYOR_END_INSET_M, 0.25 * size[travel_axis])
+
+    negative_end = center.copy()
+    positive_end = center.copy()
+    negative_end[travel_axis] = minimum[travel_axis] + inset
+    positive_end[travel_axis] = maximum[travel_axis] - inset
+    robot_xy = robot_position[:2]
+    near_end = min(
+        (negative_end, positive_end),
+        key=lambda point: np.linalg.norm(point[:2] - robot_xy),
+    ).copy()
+    start = near_end.copy()
+
+    # 예전의 중심 ±20% 제한은 폭이 커지면 로봇에서 불필요하게 먼 점을 만든다.
+    # 사과 반폭과 가장자리 여유만 확보한 전체 유효 폭에서 가장 가까운 점을 쓴다.
+    side_inset = 0.5 * float(apple_size[side_axis]) + CONVEYOR_EDGE_CLEARANCE_M
+    usable_min = minimum[side_axis] + side_inset
+    usable_max = maximum[side_axis] - side_inset
+    if usable_min > usable_max:
+        raise RuntimeError(
+            "컨베이어 유효 폭이 사과와 가장자리 여유보다 좁습니다: "
+            f"width={size[side_axis]:.4f} m, required={2.0 * side_inset:.4f} m"
+        )
+    start[side_axis] = np.clip(robot_xy[side_axis], usable_min, usable_max)
+
+    outside_direction = np.zeros(3, dtype=float)
+    outside_direction[side_axis] = np.sign(robot_xy[side_axis] - center[side_axis])
+    if abs(outside_direction[side_axis]) < 0.5:
+        distance_to_min = abs(robot_xy[side_axis] - minimum[side_axis])
+        distance_to_max = abs(robot_xy[side_axis] - maximum[side_axis])
+        outside_direction[side_axis] = -1.0 if distance_to_min <= distance_to_max else 1.0
+    outside = start.copy()
+    outside[side_axis] = (
+        minimum[side_axis] - CONVEYOR_OUTSIDE_OFFSET_M
+        if outside_direction[side_axis] < 0.0
+        else maximum[side_axis] + CONVEYOR_OUTSIDE_OFFSET_M
+    )
+
+    conveyor_direction = np.zeros(3, dtype=float)
+    conveyor_direction[travel_axis] = -np.sign(
+        near_end[travel_axis] - center[travel_axis]
+    )
+    return start, outside, conveyor_direction, travel_axis, side_axis, side_inset
+
+
+def compute_direct_neutral_transfer(tree_clear_position, conveyor_outside_high):
+    """이미 나무 밖인 pose와 컨베이어 바깥 상공 사이의 중립점을 계산한다."""
+    tree_clear_position = np.asarray(tree_clear_position, dtype=float)
+    conveyor_outside_high = np.asarray(conveyor_outside_high, dtype=float)
+    if tree_clear_position.shape != (3,) or conveyor_outside_high.shape != (3,):
+        raise ValueError("중립 운반점 입력은 3차원 좌표여야 합니다.")
+    neutral = 0.5 * (tree_clear_position + conveyor_outside_high)
+    neutral[2] = max(tree_clear_position[2], conveyor_outside_high[2])
+    return neutral
+
+
 def compute_conveyor_start(stage, robot_position, apple_size):
     """컨베이어 시작점과 그 바깥쪽의 안전 접근점을 계산한다.
 
@@ -1958,68 +2108,46 @@ def compute_conveyor_start(stage, robot_position, apple_size):
         surface_candidates.append((score, prim, mesh_box, mesh_size))
 
     if surface_candidates:
-        _score, surface_prim, box, _surface_size = max(
-            surface_candidates,
-            key=lambda item: item[0],
-        )
-        surface_path = str(surface_prim.GetPath())
+        named_belts = [
+            item for item in surface_candidates
+            if "belt" in item[1].GetName().lower()
+        ]
+        if named_belts:
+            # 폭 변경 자산은 상판이 여러 belt Mesh로 나뉠 수 있다. 하나만 고르면
+            # 부분 폭을 전체 폭으로 오인하므로 모든 belt Mesh의 월드 경계를 합친다.
+            belt_minima = np.array(
+                [item[2].GetMin() for item in named_belts], dtype=float
+            )
+            belt_maxima = np.array(
+                [item[2].GetMax() for item in named_belts], dtype=float
+            )
+            minimum = np.min(belt_minima, axis=0)
+            maximum = np.max(belt_maxima, axis=0)
+            surface_path = ", ".join(str(item[1].GetPath()) for item in named_belts)
+        else:
+            _score, surface_prim, box, _surface_size = max(
+                surface_candidates,
+                key=lambda item: item[0],
+            )
+            minimum = np.array(box.GetMin(), dtype=float)
+            maximum = np.array(box.GetMax(), dtype=float)
+            surface_path = str(surface_prim.GetPath())
     else:
         # 자산이 하나의 결합 Mesh인 경우에만 전체 경계를 최후 수단으로 쓴다.
-        box = root_box
+        minimum = np.array(root_box.GetMin(), dtype=float)
+        maximum = np.array(root_box.GetMax(), dtype=float)
         surface_path = f"{CONVEYOR_PATH} (combined fallback)"
 
-    minimum = np.array(box.GetMin(), dtype=float)
-    maximum = np.array(box.GetMax(), dtype=float)
     size = maximum - minimum
-
-    center = 0.5 * (minimum + maximum)
-    travel_axis = int(np.argmax(size[:2]))
-    side_axis = 1 - travel_axis
-    inset = min(CONVEYOR_END_INSET_M, 0.25 * size[travel_axis])
-
-    negative_end = center.copy()
-    positive_end = center.copy()
-    negative_end[travel_axis] = minimum[travel_axis] + inset
-    positive_end[travel_axis] = maximum[travel_axis] - inset
-    robot_xy = np.asarray(robot_position[:2], dtype=float)
-    candidates = (negative_end, positive_end)
-    near_end = min(
-        candidates,
-        key=lambda point: np.linalg.norm(point[:2] - robot_xy),
-    ).copy()
-    # 진행축 위치는 이동 거리를 줄이기 위해 로봇과 가까운 끝단 쪽을 쓴다.
-    start = near_end.copy()
-
-    # 폭 방향은 정확한 중심선을 강제하지 않고 전체 폭의 중심 ±20% 구간을
-    # 허용한다. 그 구간 안에서 로봇과 가장 가까운 좌표를 선택한다.
-    center_band_half_width = 0.20 * size[side_axis]
-    start[side_axis] = np.clip(
-        robot_xy[side_axis],
-        center[side_axis] - center_band_half_width,
-        center[side_axis] + center_band_half_width,
-    )
-
-    # 경유점은 벨트 진행축 끝 너머가 아니라 로봇과 가까운 측면 바깥에 둔다.
-    # 이렇게 해야 팔이 먼 끝으로 우회하지 않고 컨베이어를 가로지르지도 않는다.
-    outside_direction = np.zeros(3, dtype=float)
-    outside_direction[side_axis] = np.sign(robot_xy[side_axis] - center[side_axis])
-    if abs(outside_direction[side_axis]) < 0.5:
-        distance_to_min = abs(robot_xy[side_axis] - minimum[side_axis])
-        distance_to_max = abs(robot_xy[side_axis] - maximum[side_axis])
-        outside_direction[side_axis] = -1.0 if distance_to_min <= distance_to_max else 1.0
-    if abs(outside_direction[side_axis]) < 0.5:
-        raise RuntimeError("컨베이어 바깥쪽 방향을 결정하지 못했습니다.")
-    outside = start.copy()
-    outside[side_axis] = (
-        minimum[side_axis] - CONVEYOR_OUTSIDE_OFFSET_M
-        if outside_direction[side_axis] < 0.0
-        else maximum[side_axis] + CONVEYOR_OUTSIDE_OFFSET_M
-    )
-
-    # 배치 자세의 수평축은 선택한 진행축 끝에서 벨트 중심으로 향한다.
-    conveyor_direction = np.zeros(3, dtype=float)
-    conveyor_direction[travel_axis] = -np.sign(
-        near_end[travel_axis] - center[travel_axis]
+    (
+        start,
+        outside,
+        conveyor_direction,
+        travel_axis,
+        side_axis,
+        side_inset,
+    ) = compute_conveyor_target_geometry(
+        minimum, maximum, robot_position, apple_size
     )
 
     surface_z = float(maximum[2])
@@ -2052,6 +2180,10 @@ def compute_conveyor_start(stage, robot_position, apple_size):
     axis_name = "X" if travel_axis == 0 else "Y"
     print(f"   Conveyor     surface mesh {surface_path}")
     print(f"   Conveyor     surface bbox min {vec(minimum)}, max {vec(maximum)}")
+    print(
+        f"   Conveyor     length {size[travel_axis]:.4f} m, "
+        f"width {size[side_axis]:.4f} m, edge inset {side_inset:.4f} m"
+    )
     print(
         f"   Conveyor     runtime collider {runtime_path}, "
         f"size {vec(collider_size)}"
@@ -2595,6 +2727,36 @@ class AppleHarvestFSM:
         self.frame = 0
         self.settle_frame = 0
         self._print_state()
+
+    def skip_tree_exit_from_clear_pose(self, actual_position, actual_rotation):
+        """이미 tree proxy 밖이면 고정 0.45 m 탈출점을 버리고 직접 운반한다."""
+        if self.done or self.NAMES[self.state] != "CLEAR_UP":
+            current = "DONE" if self.done else self.NAMES[self.state]
+            raise RuntimeError(
+                "TREE_EXIT 생략 요청 시 현재 FSM 상태가 다릅니다: "
+                f"{current}"
+            )
+        neutral_index = self.NAMES.index("NEUTRAL_TRANSFER")
+        conveyor_index = self.NAMES.index("CONVEYOR_OUTSIDE_HIGH")
+        conveyor_outside_high = np.asarray(
+            self.specs[conveyor_index][0], dtype=float
+        )
+        neutral = compute_direct_neutral_transfer(
+            actual_position, conveyor_outside_high
+        )
+        _old_target, rotation, _steps, grip0, grip1 = self.specs[neutral_index]
+        steps = max(
+            MIN_MOVE_STEPS,
+            int(
+                np.ceil(
+                    np.linalg.norm(neutral - np.asarray(actual_position, dtype=float))
+                    / PLACE_TRANSIT_STEP_M
+                )
+            ),
+        )
+        self.specs[neutral_index] = (neutral, rotation, steps, grip0, grip1)
+        self.skip_current_state("CLEAR_UP", actual_position, actual_rotation)
+        self.skip_current_state("TREE_EXIT", actual_position, actual_rotation)
 
     def complete_current_on_contact(self, actual_position, actual_rotation):
         """저속 진입 중 palm 접촉 위치를 GRASP 유지 pose로 확정한다."""
