@@ -135,6 +135,9 @@ SCENE_01_ROOT_PATH = f"{TREE_ROOT_PATH}/scene_01"
 PLANNING_OBSTACLE_ROOT_PATH = "/World/RuntimeHarvestPlanningObstacles"
 RUNTIME_TREE_COLLIDER_ROOT_PATH = "/World/RuntimeHarvestTreeColliders"
 COLLISION_DEBUG_ROOT_PATH = "/World/RuntimeHarvestCollisionDebug"
+COLLISION_SPHERE_VISUALIZATION_ROOT_PATH = (
+    "/World/RuntimeHarvestCollisionSpheres"
+)
 CONVEYOR_PATH = "/World/ConveyorTrack_01"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
 FIXED_CAMERA_ROOT_PATHS = ["/World/base_rsd455"]
@@ -249,15 +252,18 @@ APPLE_GRASP_MAX_DISTANCE_M = 0.14
 # obstacle 반경/크기에 더하며, 실제 시뮬레이션 충돌 시험 후 튜닝한다.
 THICK_BRANCH_CLEARANCE_M = 0.010
 SMALL_BRANCH_CLEARANCE_M = 0.000
-# 작은 가지는 40 mm voxel 형상 반경 20 mm만 사용하며 추가 clearance는 없다.
-# 몸통·큰 가지에는 10 mm planning clearance를 적용한다.
-BRANCH_PROXY_VOXEL_M = 0.040
+# PCA 반경 20 mm 이상인 구조 성분만 20 mm voxel proxy로 변환한다.
+# voxel sphere의 형상 반경 10 mm만 사용하며 추가 clearance는 없다.
+BRANCH_PROXY_VOXEL_M = 0.020
 UNIFIED_TREE_STRUCTURE_NAMES = ("structure_004_7", "summertree")
-# 단일 구조 mesh 시험용 임시 분류값. 연결 성분의 PCA 추정 반경이 이 값
-# 이상이면 몸통/큰 가지 PhysX proxy를 만들고, 더 가는 가지는 planning-only로
-# 유지한다. 실제 접촉 시험 후 asset requirement의 TBD 값으로 확정해야 한다.
-TREE_PHYSX_MIN_BRANCH_RADIUS_M = 0.010
+# 새 summerTree 자산의 굵기 분포를 기준으로 승인된 시뮬레이션 임시값이다.
+# 이 값 이상인 성분에만 PhysX와 RRT/RMPflow proxy를 모두 적용한다.
+TREE_PHYSX_MIN_BRANCH_RADIUS_M = 0.020
 TREE_PHYSX_MIN_CAPSULE_HEIGHT_M = 0.001
+# summerTree의 large_030은 휘어진 줄기 연결 성분을 단일 PCA capsule로
+# 근사하면서 반경이 221 mm로 과대 계산된다. 최소 PCA 횡축 반경이자 인접
+# large_031과 같은 수준인 63.5 mm로 PhysX 표시/충돌 capsule만 제한한다.
+TREE_PHYSX_CAPSULE_RADIUS_OVERRIDES_M = {30: 0.0635}
 # RMPflow local-minimum을 피하기 위한 시뮬레이션 튜닝 임시값이다. 실제
 # 안전거리는 각 proxy 반경에 별도로 포함되므로 아래 값은 후보의 범위와 수만
 # 제한한다.
@@ -267,6 +273,7 @@ MAX_BRANCH_PROXIES = 48
 TARGET_APPLE_OBSTACLE_RADIUS_M = 0.060
 RMPFLOW_MAXIMUM_SUBSTEP_S = 1.0 / 300.0
 RMPFLOW_SEGMENT_STEPS = 360
+COLLISION_VISUALIZATION_UPDATE_STEPS = 4
 RMPFLOW_REPLAN_OFFSET_M = 0.20
 TREE_OUTSIDE_WAYPOINT_OFFSET_M = 0.45
 RMPFLOW_STALL_STEPS = 120
@@ -1128,11 +1135,13 @@ def set_gripper_drive_max_force(stage, max_force):
 def _is_unified_tree_structure_path(path):
     """지원하는 기존/신규 단일 나무 구조 mesh인지 판별한다."""
     normalized = str(path).lower().replace(".", "_")
-    prim_name = normalized.rsplit("/", 1)[-1]
     return (
         UNIFIED_TREE_STRUCTURE_NAMES[0] in normalized
-        or prim_name == UNIFIED_TREE_STRUCTURE_NAMES[1]
-        or prim_name.startswith(f"{UNIFIED_TREE_STRUCTURE_NAMES[1]}_")
+        or (
+            UNIFIED_TREE_STRUCTURE_NAMES[1] in normalized
+            and "summertreecrown" not in normalized
+            and "summerground" not in normalized
+        )
     )
 
 
@@ -1291,6 +1300,22 @@ def configure_unified_tree_physx_colliders(stage):
                 component_specs.append(spec)
 
     for index, (center, axis, radius, height) in enumerate(component_specs):
+        original_radius = float(radius)
+        radius = TREE_PHYSX_CAPSULE_RADIUS_OVERRIDES_M.get(
+            index,
+            original_radius,
+        )
+        if radius != original_radius:
+            # 반경만 줄여 성분 장축 끝이 비지 않도록 기존 capsule의 전체
+            # tip-to-tip 길이는 유지한다.
+            height = max(
+                TREE_PHYSX_MIN_CAPSULE_HEIGHT_M,
+                float(height) + 2.0 * (original_radius - radius),
+            )
+            print(
+                f"   Tree collider large_{index:03d} radius override "
+                f"{original_radius:.4f} -> {radius:.4f} m"
+            )
         path = f"{RUNTIME_TREE_COLLIDER_ROOT_PATH}/large_{index:03d}"
         capsule = UsdGeom.Capsule.Define(stage, path)
         capsule.CreateAxisAttr().Set(UsdGeom.Tokens.z)
@@ -2500,7 +2525,15 @@ def _collect_tree_planning_geometry(stage, xform_cache):
             if _is_scene_01_path(prim.GetPath()):
                 continue
             if _is_unified_tree_structure_path(prim.GetPath()):
-                branch_points.append(_mesh_world_points(prim, xform_cache))
+                branch_points.extend(
+                    points
+                    for points in _mesh_connected_components_world(
+                        prim,
+                        xform_cache,
+                    )
+                    if _component_capsule_spec(points)[2]
+                    >= TREE_PHYSX_MIN_BRANCH_RADIUS_M
+                )
                 unified_meshes.append(prim)
             elif _is_tree_visual_only_path(prim.GetPath()):
                 continue
@@ -2721,6 +2754,9 @@ class CollisionAwareMotion:
         plan_callback=None,
     ):
         self.stage = stage
+        self.robot = robot
+        self._collision_visualization_step = 0
+        self._robot_collision_instancer = None
         self.tree_signature = tree_scene_signature(stage)
         if link6_to_palm_translation is None or link6_to_palm_rotation is None:
             (
@@ -2884,6 +2920,24 @@ class CollisionAwareMotion:
                 f"{direct_clearance:.3f} m to {direct_obstacle}; "
                 "OUTSIDE waypoint bypass"
             )
+        self.rrt_active_joints = tuple(self.rrt.get_active_joints())
+        self.rrt_watched_joints = tuple(self.rrt.get_watched_joints())
+        if self.rrt_active_joints != tuple(ARM_JOINTS):
+            raise RuntimeError(
+                "M0617 RRT active joint 순서가 실행 관절과 다릅니다: "
+                f"rrt={self.rrt_active_joints}, expected={tuple(ARM_JOINTS)}"
+            )
+        arm_indices = [robot.get_dof_index(name) for name in self.rrt_active_joints]
+        self.arm_indices = np.asarray(arm_indices, dtype=np.int32)
+        current_arm = robot.get_joint_positions(
+            joint_indices=self.arm_indices
+        )
+        self.start_collision = None
+        if current_arm is not None:
+            current_arm = np.asarray(current_arm, dtype=float)
+            self.rmpflow.set_cspace_target(current_arm)
+            self.start_collision = self.configuration_tree_collision(current_arm)
+        self._initialize_collision_sphere_visualization(current_arm)
         for obstacle in self.obstacles:
             if not self.rmpflow.add_obstacle(obstacle, static=True):
                 raise RuntimeError(
@@ -2895,22 +2949,6 @@ class CollisionAwareMotion:
                     f"RRT planning obstacle을 추가하지 못했습니다: "
                     f"{obstacle.prim_path}"
                 )
-        self.rrt_active_joints = tuple(self.rrt.get_active_joints())
-        self.rrt_watched_joints = tuple(self.rrt.get_watched_joints())
-        if self.rrt_active_joints != tuple(ARM_JOINTS):
-            raise RuntimeError(
-                "M0617 RRT active joint 순서가 실행 관절과 다릅니다: "
-                f"rrt={self.rrt_active_joints}, expected={tuple(ARM_JOINTS)}"
-            )
-        arm_indices = [robot.get_dof_index(name) for name in self.rrt_active_joints]
-        current_arm = robot.get_joint_positions(
-            joint_indices=np.asarray(arm_indices, dtype=np.int32)
-        )
-        self.start_collision = None
-        if current_arm is not None:
-            current_arm = np.asarray(current_arm, dtype=float)
-            self.rmpflow.set_cspace_target(current_arm)
-            self.start_collision = self.configuration_tree_collision(current_arm)
         self.rmpflow.update_world()
         self.rrt.update_world()
         self.apple_obstacle_enabled = True
@@ -2955,6 +2993,123 @@ class CollisionAwareMotion:
             np.asarray(centers, dtype=float),
             np.asarray(radii, dtype=float),
             tuple(frames),
+        )
+
+    def _create_collision_sphere_instancer(
+        self,
+        name,
+        centers,
+        radii,
+        color,
+        opacity,
+    ):
+        """동일 prototype을 쓰는 표시 전용 sphere instancer를 만든다."""
+        centers = np.asarray(centers, dtype=float)
+        radii = np.asarray(radii, dtype=float)
+        if centers.ndim != 2 or centers.shape[1] != 3:
+            raise RuntimeError(
+                f"{name} collision sphere 중심 배열이 잘못되었습니다: "
+                f"{centers.shape}"
+            )
+        if radii.shape != (len(centers),):
+            raise RuntimeError(
+                f"{name} collision sphere 반경 배열이 잘못되었습니다: "
+                f"{radii.shape}"
+            )
+        instancer_path = f"{COLLISION_SPHERE_VISUALIZATION_ROOT_PATH}/{name}"
+        prototype_path = f"{instancer_path}/prototype"
+        instancer = UsdGeom.PointInstancer.Define(self.stage, instancer_path)
+        prototype = UsdGeom.Sphere.Define(self.stage, prototype_path)
+        prototype.CreateRadiusAttr().Set(1.0)
+        prototype.CreateDisplayColorAttr().Set([color])
+        prototype.CreateDisplayOpacityAttr().Set([float(opacity)])
+        prototype.CreateVisibilityAttr().Set(UsdGeom.Tokens.inherited)
+        instancer.CreatePrototypesRel().SetTargets([prototype.GetPath()])
+        instancer.CreateProtoIndicesAttr().Set([0] * len(centers))
+        instancer.CreatePositionsAttr().Set(
+            [Gf.Vec3f(*(float(value) for value in center)) for center in centers]
+        )
+        instancer.CreateScalesAttr().Set(
+            [
+                Gf.Vec3f(float(radius), float(radius), float(radius))
+                for radius in radii
+            ]
+        )
+        return instancer
+
+    def _initialize_collision_sphere_visualization(self, joint_positions):
+        """나무와 현재 로봇 collision sphere를 Stage에 지속 표시한다."""
+        root = self.stage.GetPrimAtPath(
+            COLLISION_SPHERE_VISUALIZATION_ROOT_PATH
+        )
+        if root.IsValid():
+            self.stage.RemovePrim(COLLISION_SPHERE_VISUALIZATION_ROOT_PATH)
+        UsdGeom.Xform.Define(
+            self.stage,
+            COLLISION_SPHERE_VISUALIZATION_ROOT_PATH,
+        )
+
+        tree_radii = np.full(
+            len(self.full_branch_centers),
+            self.branch_radius,
+            dtype=float,
+        )
+        self._create_collision_sphere_instancer(
+            "tree_proxy",
+            self.full_branch_centers,
+            tree_radii,
+            Gf.Vec3f(1.0, 0.65, 0.0),
+            0.30,
+        )
+
+        robot_count = 0
+        if joint_positions is not None:
+            centers, radii, _frames = self.robot_collision_spheres_world(
+                joint_positions
+            )
+            self._robot_collision_instancer = (
+                self._create_collision_sphere_instancer(
+                    "robot",
+                    centers,
+                    radii,
+                    Gf.Vec3f(0.0, 0.65, 1.0),
+                    0.24,
+                )
+            )
+            robot_count = len(centers)
+        print(
+            "   Collision spheres visible: "
+            f"robot {robot_count}, tree {len(self.full_branch_centers)}, "
+            f"root={COLLISION_SPHERE_VISUALIZATION_ROOT_PATH}"
+        )
+
+    def update_collision_sphere_visualization(self, force=False):
+        """실제 관절 상태를 따라 로봇 표시 sphere를 최대 15 Hz로 갱신한다."""
+        self._collision_visualization_step += 1
+        if (
+            not force
+            and self._collision_visualization_step
+            % COLLISION_VISUALIZATION_UPDATE_STEPS
+        ):
+            return
+        if self._robot_collision_instancer is None:
+            return
+        joint_positions = self.robot.get_joint_positions(
+            joint_indices=self.arm_indices
+        )
+        if joint_positions is None:
+            return
+        joint_positions = np.asarray(joint_positions, dtype=float)
+        if (
+            joint_positions.shape != (len(self.rrt_active_joints),)
+            or not np.all(np.isfinite(joint_positions))
+        ):
+            return
+        centers, _radii, _frames = self.robot_collision_spheres_world(
+            joint_positions
+        )
+        self._robot_collision_instancer.GetPositionsAttr().Set(
+            [Gf.Vec3f(*(float(value) for value in center)) for center in centers]
         )
 
     def planned_tcp_pose(self, joint_positions):
@@ -4043,6 +4198,7 @@ class CollisionAwareMotion:
 
     def next_action(self):
         self.assert_tree_scene_unchanged()
+        self.update_collision_sphere_visualization()
         self.rmpflow.update_world()
         return self.articulation_policy.get_next_articulation_action()
 

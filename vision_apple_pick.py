@@ -12,10 +12,13 @@ import os
 import queue
 import sys
 import threading
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
 
+DISABLE_CONVEYOR_GRAPH = "--disable-conveyor-graph" in sys.argv
+DISABLE_CAMERA_RUNTIME = "--disable-camera-runtime" in sys.argv
 PROJECT_DIR = Path(__file__).resolve().parent
 BRIDGE_ROOT = Path("/home/rokey/isaacsim/exts/isaacsim.ros2.bridge/jazzy")
 INTERFACE_PREFIX_TEXT = os.environ.get("APPLEPROJ_INTERFACES_PREFIX", "")
@@ -43,6 +46,13 @@ def prepare_isaac_ros_environment():
 
 
 prepare_isaac_ros_environment()
+if DISABLE_CONVEYOR_GRAPH or DISABLE_CAMERA_RUNTIME:
+    # rclpy와 apple_pick에는 이 파일 전용 진단 옵션을 전달하지 않는다.
+    diagnostic_args = {
+        "--disable-conveyor-graph",
+        "--disable-camera-runtime",
+    }
+    sys.argv = [arg for arg in sys.argv if arg not in diagnostic_args]
 
 # import 시 SimulationApp을 한 번만 생성하며 main()은 실행하지 않는다.
 import apple_pick as harvest
@@ -131,6 +141,66 @@ ERROR_CODES = {
 CAMERA_PATH = "/World/base_rsd455/RSD455/Camera_OmniVision_OV9782_Color"
 CAMERA_GRAPH_PATH = "/BaseCameraRosGraph"
 ROBOT_TF_GRAPH_PATH = "/RobotTfRosGraph"
+CONVEYOR_GRAPH_PATH = "/World/ConveyorTrack_01/ConveyorBeltGraph"
+FIXED_CAMERA_RUNTIME_PATHS = (
+    "/World/base_rsd455",
+    "/World/conv_rsd455_01",
+    "/World/conv_rsd455_02",
+    "/World/ConveyorTrack_01/conv_rsd455",
+)
+
+
+def apply_runtime_diagnostic_overrides(stage):
+    """원본 USD를 저장하지 않고 현재 실행의 Session Layer만 변경한다."""
+    if not DISABLE_CONVEYOR_GRAPH:
+        return
+    conveyor_graph = stage.GetPrimAtPath(CONVEYOR_GRAPH_PATH)
+    if not conveyor_graph.IsValid():
+        raise RuntimeError(
+            f"진단용 비활성화 대상 Prim을 찾을 수 없습니다: {CONVEYOR_GRAPH_PATH}"
+        )
+    with Usd.EditContext(stage, stage.GetSessionLayer()):
+        conveyor_graph.SetActive(False)
+    print(
+        f"   [DIAGNOSTIC] Conveyor graph disabled in Session Layer: "
+        f"{CONVEYOR_GRAPH_PATH}"
+    )
+
+
+def disable_camera_runtime_assets(stage):
+    """첫 물리 스텝 전에 고정 D455 payload를 Session Layer에서 제거한다."""
+    if not DISABLE_CAMERA_RUNTIME:
+        return
+    camera_prims = []
+    for camera_path in FIXED_CAMERA_RUNTIME_PATHS:
+        camera_prim = stage.GetPrimAtPath(camera_path)
+        if not camera_prim.IsValid():
+            raise RuntimeError(
+                f"진단용 비활성화 대상 카메라 Prim을 찾을 수 없습니다: {camera_path}"
+            )
+        camera_prims.append(camera_prim)
+    with Usd.EditContext(stage, stage.GetSessionLayer()):
+        for camera_prim in camera_prims:
+            camera_prim.SetActive(False)
+    print(
+        "   [DIAGNOSTIC] Fixed D455 runtime disabled in Session Layer: "
+        + ", ".join(FIXED_CAMERA_RUNTIME_PATHS)
+    )
+
+
+def print_startup_lifecycle(label, stage, world):
+    """첫 Play/step 전후의 Kit, Stage 및 Timeline 생존 상태를 기록한다."""
+    context_stage = harvest.simulation_app.context.get_stage()
+    print(
+        f"   [LIFECYCLE] {label}: "
+        f"app_running={harvest.simulation_app.is_running()}, "
+        f"app_exiting={harvest.simulation_app.is_exiting()}, "
+        f"context_stage={context_stage is not None}, "
+        f"expected_stage={context_stage == stage}, "
+        f"world_playing={world.is_playing()}, "
+        f"world_stopped={world.is_stopped()}",
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -2370,10 +2440,15 @@ class MotionEngine:
 
 def main():
     stage = harvest.open_project_stage()
-    create_base_camera_graph(stage)
+    apply_runtime_diagnostic_overrides(stage)
+    if DISABLE_CAMERA_RUNTIME:
+        print("   [DIAGNOSTIC] Base camera ROS graph creation skipped")
+    else:
+        create_base_camera_graph(stage)
     harvest.configure_breakable_joint(stage)
     harvest.configure_contact_colliders(stage)
     harvest.configure_joint_drives(stage)
+    disable_camera_runtime_assets(stage)
     world = harvest.World(
         stage_units_in_meters=1.0, physics_prim_path="/physicsScene",
         physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0,
@@ -2441,10 +2516,16 @@ def main():
         )
 
     try:
+        print_startup_lifecycle("before publish INITIALIZING", stage, world)
         node.publish_state(SimulationState.INITIALIZING, "Stage와 물리를 초기화합니다.")
+        print_startup_lifecycle("before world.play", stage, world)
         world.play()
+        print_startup_lifecycle("after world.play", stage, world)
+        print_startup_lifecycle("before first world.step", stage, world)
         world.step(render=not harvest.args.headless)
+        print_startup_lifecycle("after first world.step", stage, world)
         publish_current_scene()
+        print_startup_lifecycle("after planning scene publish", stage, world)
         published_tree_signature = harvest.tree_scene_signature(stage)
         node.publish_state(SimulationState.READY, "planning scene 동기화가 완료됐습니다.")
         node.publish_state(SimulationState.PLAYING, "Isaac Sim Timeline이 실행 중입니다.")
@@ -2569,6 +2650,14 @@ def main():
                 pending.handle, *node.execution_version()
             )
             pending.finished.set()
+    except BaseException as error:
+        print(
+            f"   [LIFECYCLE EXIT] {type(error).__name__}: {error!r}",
+            flush=True,
+        )
+        print_startup_lifecycle("BaseException", stage, world)
+        traceback.print_exc()
+        raise
     finally:
         if sort_runtime is not None:
             sort_runtime.reset()

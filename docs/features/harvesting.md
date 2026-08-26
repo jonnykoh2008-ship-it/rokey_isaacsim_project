@@ -75,8 +75,10 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
   매 step RMPflow·PhysX 접촉 규칙으로 검증한다. 접촉 구간을 RRT sampling의
   일반 목표로 만들면 의도된 palm 접촉과 stem 파괴 조건을 비용 함수가 보장하지
   못하므로 기본 방식으로 사용하지 않는다.
-- M0617 전체 링크는 굵은 가지 planning proxy와 충돌하지 않아야 한다.
-- 그리퍼와 손목은 작은 가지 planning proxy와 충돌하지 않아야 한다.
+- M0617 전체 링크는 PCA 추정 반경 `20mm` 이상인 나무 구조 성분의 planning
+  proxy와 충돌하지 않아야 한다.
+- PCA 추정 반경 `20mm` 미만인 작은 가지 성분은 현재 PhysX collision과
+  RRT/RMPflow planning proxy에서 모두 제외한다.
 - 몸통 mesh가 여러 개인 경우 각 mesh를 별도 planning obstacle로 유지한다.
   로봇 collision sphere는 URDF의 관절 간 링크 구간과 collision mesh 범위를
   빠짐없이 덮어야 한다.
@@ -105,16 +107,16 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
   일반 진입 구간에서 접촉하면 즉시 정지하고 `COLLISION_RISK`를 반환한다.
 - pre-grasp → grasp → twist → pull → retract 구간에도 나무 obstacle을
   유지하며 매 simulation step에서 RMPflow world를 갱신한다.
-- 작은 가지는 물리 collision이 비활성화되어도 planning obstacle에서 제외하지
-  않는다. 잎은 visual-only로 유지하고 PhysX 및 RMPflow obstacle에서 제외한다.
+- 단일 나무 구조 mesh는 연결 성분별 PCA 추정 반경을 계산한다. 반경 `20mm`
+  이상인 성분에만 PhysX capsule과 RRT/RMPflow planning proxy를 동일하게
+  적용한다. 그보다 가는 성분과 잎은 양쪽 obstacle에서 제외한다.
 - 경로 corridor 내부 proxy는 경로와 가까운 순서로 선별하되, 시작 TCP와 이미
   겹치는 proxy는 초기 자세를 가두지 않도록 제외한다. 현재 시뮬레이션 튜닝
   임시값은 corridor `0.25 m`, 시작점 제외 반경 `0.18 m`, 가지 최대 48개이다.
-- 작은 가지 형상 proxy의 현재 임시 voxel 크기는 `40mm`이며 기본 sphere
-  반경은 `20mm`다. 작은 가지 안전거리 `20mm`를 별도로 유지해 Lula에 전달되는
-  최종 sphere 반경은 `40mm`다. 이전 60mm voxel/50mm 최종 반경에서 형상
-  과대 근사를 줄인 값이며, 실제 PhysX collider와 몸통 50mm 안전거리는
-  변경하지 않는다.
+- planning 대상 구조 성분의 현재 임시 voxel 크기는 `20mm`이며 기본 sphere
+  반경은 `10mm`다. 추가 branch clearance는 현재 `0mm`로 유지한다. PCA 반경
+  `20mm` 미만 성분을 제외하고 voxel을 세분화해 기존 proxy의 형상 과대 근사를
+  줄인다. PhysX capsule도 동일한 PCA 반경 기준을 사용한다.
 - transit은 로봇 쪽 몸통 전체 bounding box 바깥 `0.45 m`의 안전 waypoint에
   먼저 도달해 자세를 정렬한 다음 staging으로 진입한다. 좌우 재계획 방향은
   로봇-사과 방사축이 아니라 그에 수직인 수평 lateral 축을 사용한다. `0.45 m`는
@@ -122,8 +124,9 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
 
 최소 안전거리의 초기값은 다음과 같다.
 
-- 로봇 링크 ↔ 굵은 가지: 50mm
-- 그리퍼·손목 ↔ 작은 가지: 20mm
+- 로봇 링크 ↔ PCA 반경 `20mm` 이상 나무 구조 성분: 50mm
+- PCA 반경 `20mm` 미만 성분은 현재 obstacle 대상이 아니므로 별도 안전거리도
+  적용하지 않는다.
 
 직접 transit이 수렴하지 않으면 먼저 나무 바깥 안전 waypoint로 후퇴한 뒤 목표
 사과 양옆의 우회 waypoint를 순서대로 사용해 재계획한다. 위치와 회전 오차가
