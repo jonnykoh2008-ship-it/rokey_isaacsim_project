@@ -351,6 +351,20 @@ MAX_TARGET_SETTLE_STEPS = 180
 RRT_CSPACE_SETTLE_TOLERANCE_RAD = 0.03
 RRT_TASK_SETTLE_MAX_POSITION_ERROR_M = 0.05
 RRT_TASK_SETTLE_MAX_ORIENTATION_ERROR_DEG = 10.0
+# 나무 내부 경로는 기존 탐색 한도를 유지한다. 나무를 벗어난 뒤의 운반 경로는
+# 가까운 IK 해를 c-space 목표로 사용하므로 CPU BasicTree가 GUI를 장시간
+# 점유하지 않도록 탐색 횟수를 제한한다.
+RRT_DEFAULT_MAX_ITERATIONS = 50000
+RRT_FAST_TRANSFER_MAX_ITERATIONS = 3000
+RRT_FAST_TRANSFER_STATES = {
+    "NEUTRAL_TRANSFER",
+    "ALIGN_HALF",
+    "ALIGN_DOWN",
+    "CONVEYOR_OUTSIDE_HIGH",
+    "PLACE_ABOVE",
+    "LIFT",
+    "EXIT",
+}
 APPLE_GRASP_MAX_DISTANCE_M = 0.14
 
 # RMPflow planning proxy와 재계획의 초기값이다. 문서의 최소 안전거리를
@@ -601,6 +615,13 @@ def smoothstep(alpha):
 
 def vec(vector, digits=4):
     return "[" + " ".join(f"{value:+.{digits}f}" for value in vector) + "]"
+
+
+def rrt_max_iterations_for_segment(segment_name):
+    """나무 밖 운반 구간에는 짧은 CPU RRT 탐색 한도를 적용한다."""
+    if segment_name in RRT_FAST_TRANSFER_STATES:
+        return RRT_FAST_TRANSFER_MAX_ITERATIONS
+    return RRT_DEFAULT_MAX_ITERATIONS
 
 
 def gf_quat_to_numpy(quaternion):
@@ -4368,6 +4389,51 @@ class CollisionAwareMotion:
         lower_limits = np.asarray(lower_limits, dtype=float)
         upper_limits = np.asarray(upper_limits, dtype=float)
         self.rrt.update_world()
+        max_iterations = rrt_max_iterations_for_segment(segment_name)
+        self.rrt.set_max_iterations(max_iterations)
+        print(
+            f"   [RRT LIMIT] {segment_name}: max_iterations={max_iterations}"
+        )
+
+        # 나무 밖 운반 구간은 현재 관절 자세와 가까운 IK 해를 먼저 구해
+        # task-space RRT의 광범위한 샘플링 대신 c-space RRT를 실행한다.
+        # RRT 경로와 생성 trajectory의 전체 링크 충돌 검증은 아래에서 그대로
+        # 수행하므로 단순 관절 보간으로 안전 검사를 우회하지 않는다.
+        if (
+            target_joint_positions is None
+            and segment_name in RRT_FAST_TRANSFER_STATES
+        ):
+            target_tcp = np.asarray(target_tcp, dtype=float)
+            target_rotation = np.asarray(target_rotation, dtype=float)
+            link_position, link_rotation = tcp_target_to_link6(
+                target_tcp,
+                target_rotation,
+                self.link6_to_palm_translation,
+                self.link6_to_palm_rotation,
+            )
+            ik_goal, solved = self.validation_kinematics.compute_inverse_kinematics(
+                frame_name=EE_FRAME_NAME,
+                target_position=link_position,
+                target_orientation=rot_matrix_to_quat(link_rotation),
+                warm_start=active_positions,
+                position_tolerance=0.005,
+                orientation_tolerance=np.deg2rad(5.0),
+            )
+            ik_goal = np.asarray(ik_goal, dtype=float)
+            if (
+                not solved
+                or ik_goal.shape != active_positions.shape
+                or not np.all(np.isfinite(ik_goal))
+            ):
+                raise ApproachUnreachableError(
+                    f"{segment_name} 가까운 c-space 목표 IK를 구하지 못했습니다."
+                )
+            target_joint_positions = ik_goal
+            print(
+                f"   [RRT IK GOAL] {segment_name}: task-space 목표를 "
+                f"warm-start c-space {vec(ik_goal)}로 변환"
+            )
+
         explicit_cspace_goal = target_joint_positions is not None
         requested_cspace_goal = None
         if explicit_cspace_goal:
