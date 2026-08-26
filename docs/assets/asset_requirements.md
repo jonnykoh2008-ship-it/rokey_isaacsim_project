@@ -66,7 +66,7 @@ v2.0에서 GPU PC 1은 raw RGB, raw depth 및 `CameraInfo`를 발행하고 개�
 - 컨베이어, 푸셔 및 다른 사과와 물리 충돌
 - 줄기에 연결된 동안 breakable joint 적용
 - break force: 15N
-- break torque: 1Nm
+- break torque: 2Nm
 - 작업영역 밖으로 이탈하면 삭제하지 않고 physics, collision 및 visibility를 비활성화한다.
 - reset 시 다시 활성화할 수 있도록 object pool 방식 사용을 우선한다.
 
