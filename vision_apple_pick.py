@@ -66,6 +66,8 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
+from motion_planning_visualization import MotionPlanningVisualizationPublisher
+
 
 MOTION_SEQUENCE = [
     RobotMotion.Goal.APPROACH,
@@ -371,6 +373,7 @@ class RobotMotionNode(Node):
         self.scene_publisher = self.create_publisher(
             PlanningScene, "/planning_scene", latched_qos
         )
+        self.planning_visualization = MotionPlanningVisualizationPublisher(self)
         self.scene_service = self.create_service(
             GetPlanningScene, "/planning_scene/get_snapshot", self.get_scene
         )
@@ -466,6 +469,30 @@ class RobotMotionNode(Node):
         value.scene_version = int(scene_version)
         value.message = message
         self.state_publisher.publish(value)
+        if int(state) in (SimulationState.STOPPED, SimulationState.INITIALIZING):
+            self.planning_visualization.clear(
+                f"state={int(state)} reset={reset_id} scene={scene_version}"
+            )
+
+    def publish_motion_plan(self, snapshot):
+        """실제 planner가 검증한 snapshot만 RViz 토픽으로 전달한다."""
+        with self.lock:
+            scene = self.scene_message
+            reset_id = self.reset_id
+            scene_version = self.scene_version
+        self.planning_visualization.publish_plan(
+            snapshot,
+            scene,
+            reset_id,
+            scene_version,
+        )
+
+    def publish_motion_failure(self, target_position, error_code, message):
+        self.planning_visualization.publish_failure(
+            target_position,
+            error_code,
+            message,
+        )
 
     @staticmethod
     def _pose_stamped(position, quaternion_xyzw, stamp):
@@ -567,11 +594,15 @@ class MotionEngine:
         stage,
         state_callback=None,
         execution_state_callback=None,
+        planning_visualization_callback=None,
+        planning_failure_callback=None,
     ):
         self.world, self.robot, self.stage = world, robot, stage
         self.scene_signature = harvest.tree_scene_signature(stage)
         self.state_callback = state_callback
         self.execution_state_callback = execution_state_callback
+        self.planning_visualization_callback = planning_visualization_callback
+        self.planning_failure_callback = planning_failure_callback
         self.ik, self.lula = harvest.create_ik_solver(robot, stage)
         self.gripper_indices = [robot.get_dof_index(n) for n in harvest.GRIPPER_JOINTS]
         self.arm_indices = harvest.np.asarray(
@@ -668,6 +699,27 @@ class MotionEngine:
             )
         except Exception as error:
             print(f"   Robot hold warning: {error}")
+
+    def _publish_planning_failure(self, request, error_code, message):
+        """시각화 실패는 Action 결과 또는 안전 정지에 영향을 주지 않는다."""
+        if self.planning_failure_callback is None:
+            return
+        try:
+            failure_position, _rotation = self._current_tcp_pose()
+        except Exception:
+            position = request.target_pose.pose.position
+            failure_position = harvest.np.asarray(
+                [position.x, position.y, position.z],
+                dtype=float,
+            )
+        try:
+            self.planning_failure_callback(
+                failure_position,
+                str(error_code),
+                str(message),
+            )
+        except Exception as error:
+            print(f"   [VISUALIZATION WARNING] failure marker: {error}")
 
     def _check_execution_guard(self):
         """cancel/reset/scene 변경과 simulation-time timeout을 공통 검사한다."""
@@ -1091,6 +1143,11 @@ class MotionEngine:
                 if request.motion_type == RobotMotion.Goal.RETRACT:
                     self._return_to_initial(handle)
         except MotionExecutionError as error:
+            self._publish_planning_failure(
+                request,
+                error.error_code,
+                str(error),
+            )
             self._hold_robot()
             self._reset_action_sequence(error.error_code)
             if error.error_code == "307:CANCELLED":
@@ -1099,11 +1156,21 @@ class MotionEngine:
                 handle.abort()
             return self.result(False, error.error_code, str(error))
         except harvest.ApproachUnreachableError as error:
+            self._publish_planning_failure(
+                request,
+                "301:APPROACH_UNREACHABLE",
+                str(error),
+            )
             self._hold_robot()
             self._reset_action_sequence("301:APPROACH_UNREACHABLE")
             handle.abort()
             return self.result(False, "301:APPROACH_UNREACHABLE", str(error))
         except Exception as error:
+            self._publish_planning_failure(
+                request,
+                "312:INTERNAL_ERROR",
+                str(error),
+            )
             self._hold_robot()
             self._reset_action_sequence("312:INTERNAL_ERROR")
             handle.abort()
@@ -1314,6 +1381,7 @@ class MotionEngine:
                 apple_center=center,
                 path_start=current_tcp,
                 pregrasp_tcp=pregrasp,
+                plan_callback=self.planning_visualization_callback,
             )
             if candidate_motion.start_collision is not None:
                 raise MotionExecutionError(
@@ -2124,6 +2192,8 @@ def main():
         stage,
         node.publish_state,
         node.execution_version,
+        node.publish_motion_plan,
+        node.publish_motion_failure,
     )
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
@@ -2187,6 +2257,8 @@ def main():
                     stage,
                     node.publish_state,
                     node.execution_version,
+                    node.publish_motion_plan,
+                    node.publish_motion_failure,
                 )
                 world.play()
                 world.step(render=not harvest.args.headless)
@@ -2244,6 +2316,8 @@ def main():
                     stage,
                     node.publish_state,
                     node.execution_version,
+                    node.publish_motion_plan,
+                    node.publish_motion_failure,
                 )
                 world.play()
                 world.step(render=not harvest.args.headless)
