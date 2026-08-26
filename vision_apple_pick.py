@@ -61,12 +61,14 @@ import rclpy
 import usdrt.Sdf
 from appleproj_interfaces.action import RobotMotion
 from appleproj_interfaces.msg import (
+    CheckpointEvent,
     MotionStatus,
     ObstacleProxy,
+    PlaceCoordinatorStatus,
     PlanningScene,
     SimulationState,
 )
-from appleproj_interfaces.srv import GetPlanningScene
+from appleproj_interfaces.srv import GetPlanningScene, PlaceCommand
 from geometry_msgs.msg import PoseStamped
 from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.core.prims import SingleArticulation
@@ -78,6 +80,12 @@ from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from motion_planning_visualization import MotionPlanningVisualizationPublisher
+from conveyor_checkpoint_tracker import (
+    ConveyorBounds,
+    InspectionCheckpointTracker,
+    LandingObservation,
+    LandingTracker,
+)
 
 
 MOTION_SEQUENCE = [
@@ -149,6 +157,9 @@ FIXED_CAMERA_RUNTIME_PATHS = (
     "/World/conv_rsd455_02",
     "/World/ConveyorTrack_01/conv_rsd455",
 )
+PLACE_STATUS_TOPIC = "/conveyor/place_coordinator_status"
+PLACE_COMMAND_SERVICE = "/conveyor/place_command"
+CHECKPOINT_TOPIC = "/conveyor/checkpoint_events"
 
 
 def apply_runtime_diagnostic_overrides(stage):
@@ -621,6 +632,7 @@ class RobotMotionNode(Node):
         self.simulation_state = SimulationState.INITIALIZING
         self.scene_message = None
         self.last_motion_failure = None
+        self.place_status = None
         latched_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
@@ -648,6 +660,18 @@ class RobotMotionNode(Node):
             "/harvest/motion_status",
             self.on_motion_status,
             status_qos,
+        )
+        self.checkpoint_publisher = self.create_publisher(
+            CheckpointEvent, CHECKPOINT_TOPIC, status_qos
+        )
+        self.place_status_subscription = self.create_subscription(
+            PlaceCoordinatorStatus,
+            PLACE_STATUS_TOPIC,
+            self.on_place_status,
+            latched_qos,
+        )
+        self.place_client = self.create_client(
+            PlaceCommand, PLACE_COMMAND_SERVICE
         )
         self.server = ActionServer(
             self,
@@ -707,6 +731,67 @@ class RobotMotionNode(Node):
             f"state={message.current_state}, code={message.error_code}, "
             f"message={message.message}"
         )
+
+    def on_place_status(self, message):
+        with self.lock:
+            self.place_status = message
+
+    def latest_place_status(self):
+        with self.lock:
+            return self.place_status
+
+    def publish_checkpoint(self, record):
+        value = CheckpointEvent()
+        value.header.stamp = self.get_clock().now().to_msg()
+        value.header.frame_id = record.checkpoint_id
+        value.apple_id = record.apple_id
+        value.checkpoint_id = record.checkpoint_id
+        value.event = (
+            CheckpointEvent.ENTER if record.entered else CheckpointEvent.EXIT
+        )
+        self.checkpoint_publisher.publish(value)
+
+    def send_landing_result(self, result):
+        if not self.place_client.service_is_ready():
+            self.get_logger().error(
+                "Place Coordinator service가 없어 landing 결과를 전달하지 못했습니다."
+            )
+            return
+        status = self.latest_place_status()
+        if status is None:
+            self.get_logger().error("Place 상태 없이 landing 결과를 전달할 수 없습니다.")
+            return
+        request = PlaceCommand.Request()
+        request.header.stamp = self.get_clock().now().to_msg()
+        request.header.frame_id = "world"
+        request.command = (
+            PlaceCommand.Request.CONFIRM_LANDING
+            if result.state == LandingTracker.CONFIRMED
+            else PlaceCommand.Request.FAIL
+        )
+        request.robot_id = result.robot_id
+        request.reservation_id = result.reservation_id
+        request.apple_id = result.apple_id
+        request.place_position_id = status.place_position_id
+        request.reset_id = int(status.reset_id)
+        request.scene_version = int(status.scene_version)
+        if result.state != LandingTracker.CONFIRMED:
+            request.error_code = "LANDING_TIMEOUT"
+        request.message = result.message
+        future = self.place_client.call_async(request)
+
+        def report_response(done):
+            try:
+                response = done.result()
+            except Exception as error:
+                self.get_logger().error(f"landing 결과 전달 실패: {error}")
+                return
+            if not response.accepted:
+                self.get_logger().error(
+                    f"landing 결과 거부 {response.error_code}: {response.message}"
+                )
+
+        future.add_done_callback(report_response)
 
     def execute(self, goal_handle):
         pending = PendingGoal(goal_handle, threading.Event())
@@ -844,6 +929,182 @@ class RobotMotionNode(Node):
             return self.reset_id, self.scene_version, self.simulation_state
 
 
+class AppleConveyorContactMonitor:
+    """Tracks recent PhysX contact between released apples and the belt collider."""
+
+    def __init__(self, now_callback):
+        self.now_callback = now_callback
+        self.last_contact_s = {}
+        self._subscription = (
+            harvest.omni.physx.get_physx_simulation_interface()
+            .subscribe_contact_report_events(self._on_contact_report)
+        )
+
+    @staticmethod
+    def _decode_path(encoded):
+        return harvest.RobotTreeContactMonitor._decode_path(encoded)
+
+    def _on_contact_report(self, headers, _data):
+        now_s = float(self.now_callback())
+        for header in headers:
+            if int(header.num_contact_data) <= 0:
+                continue
+            paths = [
+                self._decode_path(header.actor0),
+                self._decode_path(header.actor1),
+                self._decode_path(header.collider0),
+                self._decode_path(header.collider1),
+            ]
+            if not any(
+                path.startswith(harvest.RUNTIME_CONVEYOR_COLLIDER_PATH)
+                for path in paths
+            ):
+                continue
+            for assembly in harvest.APPLE_ASSEMBLIES:
+                body_path = assembly["apple_body_path"]
+                if any(path.startswith(body_path) for path in paths):
+                    self.last_contact_s[body_path] = now_s
+
+    def is_in_contact(self, apple_body_path, now_s):
+        contact_s = self.last_contact_s.get(str(apple_body_path))
+        return contact_s is not None and float(now_s) - contact_s <= 2.0 / 60.0
+
+    def reset(self):
+        self.last_contact_s.clear()
+
+    def close(self):
+        self._subscription = None
+
+
+class ConveyorLifecycleRuntime:
+    """Isaac-main-thread adapter for landing and the single inspection ROI."""
+
+    def __init__(self, node, engine, stage, world):
+        self.node = node
+        self.engine = engine
+        self.stage = stage
+        self.world = world
+        collider = harvest.require_prim(
+            stage, harvest.RUNTIME_CONVEYOR_COLLIDER_PATH
+        )
+        cache = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.render, UsdGeom.Tokens.proxy],
+            useExtentsHint=True,
+        )
+        box = cache.ComputeWorldBound(collider).ComputeAlignedBox()
+        minimum = harvest.np.asarray(box.GetMin(), dtype=float)
+        maximum = harvest.np.asarray(box.GetMax(), dtype=float)
+        travel_axis = int(harvest.np.argmax((maximum - minimum)[:2]))
+        self.bounds = ConveyorBounds(minimum, maximum, travel_axis)
+        belt_speed = float(os.environ.get("APPLEPROJ_CONVEYOR_SPEED_MPS", "0.30"))
+        self.landing = LandingTracker(self.bounds, belt_speed)
+        self.contact = AppleConveyorContactMonitor(
+            lambda: float(self.world.current_time)
+        )
+        self.inspection = None
+        roi_start = os.environ.get("APPLEPROJ_INSPECTION_ROI_START_FRACTION")
+        roi_end = os.environ.get("APPLEPROJ_INSPECTION_ROI_END_FRACTION")
+        if roi_start is not None and roi_end is not None:
+            self.inspection = InspectionCheckpointTracker(
+                self.bounds,
+                (float(roi_start), float(roi_end)),
+                self.node.publish_checkpoint,
+            )
+        else:
+            self.node.get_logger().warning(
+                "단일 카메라 유효 ROI 위치가 설정되지 않아 "
+                "CONVEYOR_INSPECTION_ROI event 발행은 비활성화됩니다. "
+                "APPLEPROJ_INSPECTION_ROI_START_FRACTION과 "
+                "APPLEPROJ_INSPECTION_ROI_END_FRACTION을 설정하세요."
+            )
+        self.generation = None
+        self.active_landing_key = None
+
+    @staticmethod
+    def _apple_body_path(apple_prim_path):
+        return str(apple_prim_path).rsplit("/", 1)[0]
+
+    def _velocity(self, apple_body_path):
+        prim = self.stage.GetPrimAtPath(apple_body_path)
+        if not prim.IsValid() or not prim.HasAPI(harvest.UsdPhysics.RigidBodyAPI):
+            return None
+        value = harvest.UsdPhysics.RigidBodyAPI(prim).GetVelocityAttr().Get()
+        if value is None:
+            return None
+        velocity = harvest.np.asarray(value, dtype=float)
+        return velocity if velocity.shape == (3,) else None
+
+    def process(self):
+        status = self.node.latest_place_status()
+        if status is None:
+            return
+        generation = (int(status.reset_id), int(status.scene_version))
+        if generation != self.generation:
+            self.generation = generation
+            self.active_landing_key = None
+            self.landing.reset()
+            self.contact.reset()
+            if self.inspection is not None:
+                self.inspection.reset()
+        now_s = float(self.world.current_time)
+        if status.state == PlaceCoordinatorStatus.LANDING_CHECK:
+            key = (status.lock_owner_robot_id, status.reservation_id)
+            if key != self.active_landing_key:
+                apple_path = self.engine.last_released_apple_path
+                if not apple_path:
+                    self.node.get_logger().error(
+                        "LANDING_CHECK 상태지만 RELEASE된 apple prim 기록이 없습니다."
+                    )
+                    return
+                self.active_landing_key = key
+                self.landing.start(
+                    status.lock_owner_robot_id,
+                    status.reservation_id,
+                    status.apple_id,
+                    apple_path,
+                    now_s,
+                )
+                if self.inspection is not None:
+                    self.inspection.bind_apple(status.apple_id, apple_path)
+        if self.landing.session is not None and not self.landing.terminal:
+            apple_path = self.landing.apple_prim_path
+            apple_body_path = self._apple_body_path(apple_path)
+            velocity = self._velocity(apple_body_path)
+            if velocity is None:
+                velocity = harvest.np.full(3, harvest.np.nan)
+            observation = LandingObservation(
+                center=harvest.compute_live_prim_center(
+                    self.stage, apple_path
+                ),
+                linear_velocity=velocity,
+                belt_contact=self.contact.is_in_contact(
+                    apple_body_path, now_s
+                ),
+                gripper_attached=not self.engine.last_release_detached,
+            )
+            result = self.landing.update(observation, now_s)
+            if result is not None:
+                self.node.send_landing_result(result)
+        if self.inspection is not None:
+            centers = {
+                prim_path: harvest.compute_live_prim_center(self.stage, prim_path)
+                for prim_path in self.inspection.apple_paths.values()
+                if self.stage.GetPrimAtPath(prim_path).IsValid()
+            }
+            self.inspection.update(centers)
+
+    def reset(self):
+        self.active_landing_key = None
+        self.landing.reset()
+        self.contact.reset()
+        if self.inspection is not None:
+            self.inspection.reset()
+
+    def close(self):
+        self.contact.close()
+
+
 class MotionEngine:
     """기존 FSM을 Action 단계 경계에서 정지시키는 메인 스레드 실행기."""
 
@@ -890,6 +1151,8 @@ class MotionEngine:
         self.entry_preshape = harvest.GRIPPER_OPEN.copy()
         # swept clearance를 측정한 시점의 기준 자세와 여유이다.
         self.entry_reference = None
+        self.last_released_apple_path = ""
+        self.last_release_detached = False
         self.initial_arm_positions = harvest.INITIAL_ARM_JOINTS_RAD.copy()
         self.initial_gripper_positions = (
             self._require_gripper_joint_positions().copy()
@@ -1400,6 +1663,9 @@ class MotionEngine:
                             "않았습니다.",
                         )
                     self._verify_apple_follows_gripper("PULL")
+                if request.motion_type == RobotMotion.Goal.RELEASE:
+                    self.last_released_apple_path = str(harvest.APPLE_PATH)
+                    self.last_release_detached = bool(self.joint_break.broken)
                 if request.motion_type == RobotMotion.Goal.RETRACT:
                     self._return_to_initial(handle)
         except MotionExecutionError as error:
@@ -2501,6 +2767,7 @@ def main():
         node.publish_motion_plan,
         node.publish_motion_failure,
     )
+    conveyor_lifecycle = ConveyorLifecycleRuntime(node, engine, stage, world)
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     ros_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -2541,6 +2808,7 @@ def main():
                 if published_state != SimulationState.STOPPED:
                     if sort_runtime is not None:
                         sort_runtime.reset()
+                    conveyor_lifecycle.reset()
                     node.publish_state(
                         SimulationState.STOPPED,
                         "Timeline Stop: 실행 중 Goal과 이전 계획을 폐기합니다.",
@@ -2577,6 +2845,8 @@ def main():
                     node.publish_motion_plan,
                     node.publish_motion_failure,
                 )
+                conveyor_lifecycle.engine = engine
+                conveyor_lifecycle.reset()
                 world.play()
                 world.step(render=not harvest.args.headless)
                 reset_id += 1
@@ -2618,6 +2888,7 @@ def main():
                 pending = node.requests.get_nowait()
             except queue.Empty:
                 world.step(render=not harvest.args.headless)
+                conveyor_lifecycle.process()
                 continue
             if world.is_stopped() or not robot.handles_initialized:
                 node.get_logger().warning(
@@ -2641,6 +2912,8 @@ def main():
                     node.publish_motion_plan,
                     node.publish_motion_failure,
                 )
+                conveyor_lifecycle.engine = engine
+                conveyor_lifecycle.reset()
                 world.play()
                 world.step(render=not harvest.args.headless)
                 reset_id += 1
@@ -2655,6 +2928,7 @@ def main():
                 pending.handle, *node.execution_version()
             )
             pending.finished.set()
+            conveyor_lifecycle.process()
     except BaseException as error:
         print(
             f"   [LIFECYCLE EXIT] {type(error).__name__}: {error!r}",
@@ -2666,6 +2940,7 @@ def main():
     finally:
         if sort_runtime is not None:
             sort_runtime.reset()
+        conveyor_lifecycle.close()
         engine.close()
         executor.shutdown()
         node.destroy_node()

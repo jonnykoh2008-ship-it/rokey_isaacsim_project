@@ -1,0 +1,25 @@
+std_msgs/Header header
+
+uint8 RESERVE=1
+uint8 START_PLACING=2
+uint8 RELEASED=3
+uint8 CONFIRM_LANDING=4
+uint8 FAIL=5
+uint8 CLEAR_ERROR=6
+
+uint8 command
+string robot_id
+string reservation_id
+string apple_id
+string place_position_id
+uint64 reset_id
+uint64 scene_version
+bool safety_confirmed
+string error_code
+string message
+---
+bool accepted
+bool queued
+uint8 state
+string error_code
+string message

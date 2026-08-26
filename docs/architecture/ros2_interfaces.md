@@ -10,10 +10,19 @@
 - `apple_id`와 `inspection_id`는 한 처리 주기 동안 변경하지 않는다.
 - 센서 스트림에는 Sensor Data QoS를 기본 후보로 사용한다.
 - 상태·결과 메시지는 신뢰성 우선 QoS를 사용한다. 정확한 QoS는 TBD다.
+- 로봇별 최상위 namespace는 `/<robot_id>`로 하고, 현재 값은
+  `/robot_01`, `/robot_02`로 확정한다.
+- target, perception status, motion action/status, joint state, camera 및
+  planning visualization은 해당 robot namespace 아래에 둔다.
+- `/clock`, `/simulation/state`, `/planning_scene`, `/quality/*` 및
+  `/conveyor/*`는 global/shared interface로 유지한다.
+- TF transport는 `/tf`와 `/tf_static` global topic을 사용하고, frame ID는
+  `robot_01/...`, `robot_02/...`처럼 robot prefix를 사용한다.
 - v2.0에서 영상의 송신·센서 권위자는 GPU PC 1이고, 영상 수신·사과 3D 좌표
   계산·target 발행 주체는 개인 PC 1이다.
-- `/harvest/target`은 개인 PC 1에서 GPU PC 1으로 전달하는 수확 전용 target
-  계약이며, `/harvest/perception_status`는 target 생성 전후의 인식 상태 계약이다.
+- `/<robot_id>/harvest/target`은 개인 PC 1에서 GPU PC 1으로 전달하는 로봇별
+  수확 target 계약이며, `/<robot_id>/harvest/perception_status`는 target
+  생성 전후의 로봇별 인식 상태 계약이다.
 - v2.0에서 경로 계획·궤적 생성·로봇 실행의 권위자는 GPU PC 1이다. 개인 PC 1은
   최종 waypoint를 발행하지 않는다.
 

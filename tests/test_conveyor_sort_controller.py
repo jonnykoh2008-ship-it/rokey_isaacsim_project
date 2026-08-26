@@ -65,7 +65,7 @@ class ConveyorSortControllerTest(unittest.TestCase):
         inspection_id="inspection-1",
         grade=SortCommand.Request.HIGH,
         pusher_id=SortCommand.Request.PUSHER_1,
-        trigger="CONVEYOR_4_PUSHER_1_TRIGGER",
+        trigger="CONVEYOR_PUSHER_1_TRIGGER",
     ):
         value = SortCommand.Request()
         value.command_id = command_id
@@ -91,7 +91,7 @@ class ConveyorSortControllerTest(unittest.TestCase):
             (
                 self.request(
                     pusher_id=SortCommand.Request.PUSHER_2,
-                    trigger="CONVEYOR_4_PUSHER_2_TRIGGER",
+                    trigger="CONVEYOR_PUSHER_2_TRIGGER",
                 ),
                 "GRADE_PUSHER_MISMATCH",
             ),
@@ -138,7 +138,7 @@ class ConveyorSortControllerTest(unittest.TestCase):
     def test_matching_checkpoint_executes_complete_state_flow(self):
         self.controller.submit(self.request(), 1.0)
         self.controller.checkpoint(
-            "CONVEYOR_4_PUSHER_1_TRIGGER", "apple-1", True, 2.0
+            "CONVEYOR_PUSHER_1_TRIGGER", "apple-1", True, 2.0
         )
         self.assertEqual([1], self.actuator.extend_calls)
 
@@ -170,14 +170,14 @@ class ConveyorSortControllerTest(unittest.TestCase):
         self.controller.submit(self.request(), 1.0)
         for timestamp in (2.0, 2.1):
             self.controller.checkpoint(
-                "CONVEYOR_4_PUSHER_1_TRIGGER", "apple-1", True, timestamp
+                "CONVEYOR_PUSHER_1_TRIGGER", "apple-1", True, timestamp
             )
         self.assertEqual([1], self.actuator.extend_calls)
 
     def test_wrong_apple_at_selected_trigger_fails(self):
         self.controller.submit(self.request(), 1.0)
         self.controller.checkpoint(
-            "CONVEYOR_4_PUSHER_1_TRIGGER", "apple-other", True, 2.0
+            "CONVEYOR_PUSHER_1_TRIGGER", "apple-other", True, 2.0
         )
         self.assertEqual(SortStatus.FAILED, self.statuses[-1][1])
         self.assertEqual("APPLE_ID_MISMATCH", self.statuses[-1][3])
@@ -189,7 +189,7 @@ class ConveyorSortControllerTest(unittest.TestCase):
 
         self.controller.submit(self.request(command_id="command-2"), 7.0)
         self.controller.checkpoint(
-            "CONVEYOR_4_PUSHER_1_TRIGGER", "apple-1", True, 8.0
+            "CONVEYOR_PUSHER_1_TRIGGER", "apple-1", True, 8.0
         )
         self.controller.tick(10.0)
         self.assertEqual("PUSH_TIMEOUT", self.statuses[-1][3])
@@ -197,10 +197,10 @@ class ConveyorSortControllerTest(unittest.TestCase):
         self.actuator.home[1] = True
         self.controller.submit(self.request(command_id="command-3"), 11.0)
         self.controller.checkpoint(
-            "CONVEYOR_4_PUSHER_1_TRIGGER", "apple-1", False, 11.1
+            "CONVEYOR_PUSHER_1_TRIGGER", "apple-1", False, 11.1
         )
         self.controller.checkpoint(
-            "CONVEYOR_4_PUSHER_1_TRIGGER", "apple-1", True, 12.0
+            "CONVEYOR_PUSHER_1_TRIGGER", "apple-1", True, 12.0
         )
         self.actuator.jammed = True
         self.controller.tick(12.1)
@@ -210,10 +210,10 @@ class ConveyorSortControllerTest(unittest.TestCase):
         self.actuator.home[1] = True
         self.controller.submit(self.request(command_id="command-4"), 13.0)
         self.controller.checkpoint(
-            "CONVEYOR_4_PUSHER_1_TRIGGER", "apple-1", False, 13.1
+            "CONVEYOR_PUSHER_1_TRIGGER", "apple-1", False, 13.1
         )
         self.controller.checkpoint(
-            "CONVEYOR_4_PUSHER_1_TRIGGER", "apple-1", True, 14.0
+            "CONVEYOR_PUSHER_1_TRIGGER", "apple-1", True, 14.0
         )
         self.actuator.extended[1] = True
         self.controller.tick(14.1)
