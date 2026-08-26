@@ -21,6 +21,20 @@ scene 및 로봇 동작, 컨베이어 품질검사는 이 문서의 범위가 �
   planning scene을 기준으로 접근 orientation과 pre-grasp pose를 결정한다.
 - 장애물 proxy의 생성·분류·안전거리 적용은 GPU PC 1이 담당한다.
 
+## 멀티로봇 카메라 매핑
+
+저장된 USD에서 각 로봇의 수확 인식 카메라는 다음 D455 Prim을 사용한다.
+
+| 로봇 | 카메라 Prim | 담당 수확 영역 |
+|---|---|---|
+| `robot_01` | `/World/base_rsd455_01` | `/World/Xform`의 `tree`·`apple_branch[_1/_2]` |
+| `robot_02` | `/World/base_rsd455_02` | `/World/Xform_03`의 `tree`·`apple_branch[_1/_2]` |
+
+GPU PC 1의 카메라 발행 코드는 `--robot-id`로 위 Prim을 선택한다. 현재 공통
+RGB-D topic 이름과 robot별 ROS namespace는 `TBD`로 유지하며, 개인 PC 1
+인식 노드는 카메라별 입력·TF frame을 선택할 수 있도록 별도 modification
+request를 따른다.
+
 ## v2.0 인식 흐름
 
 ```text

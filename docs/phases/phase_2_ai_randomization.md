@@ -35,6 +35,14 @@ RRT seed, sampling limit, collision-check 해상도, trajectory 제약 및 재�
 정책은 GPU PC 1에서 시험한다. 개인 PC 1은 검출·좌표 계산 성능과 target
 timestamp 품질을 시험한다.
 
+## 다중 사과 연속 수확
+
+- 다중 사과의 ID·대기열·실패 후순위 재시도 및 접촉 이후 안전 정지 동작은
+  `docs/features/harvest_perception.md`와 `docs/features/harvesting.md`를 따른다.
+- 이 단계의 각 사과 stem FixedJoint에는 승인된 break force `15N`, break torque
+  `2Nm`를 동일하게 적용한다. 파손은 `TWIST` 또는 `PULL`에서 확인하며,
+  `APPROACH`·`GRASP` 중 파손은 조기 파손 실패로 처리한다.
+
 ## 품질 분류
 
 - 현재 선행 MVP는 크기·위치·자세·조명을 바꾼 합성 RGB로 OpenCV 사과 검출과

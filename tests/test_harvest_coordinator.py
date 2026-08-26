@@ -28,6 +28,8 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator._active_candidate = None
         coordinator._latest_target_stamps = {}
         coordinator._started_target_keys = set()
+        coordinator.safety_stopped = False
+        coordinator.safety_stop_reason = None
         coordinator.target_samples = {}
         coordinator.pending_targets = {}
         coordinator.retry_targets = {}
@@ -61,6 +63,7 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator.request_snapshot = Mock()
         coordinator._publish_status = Mock()
         coordinator.get_logger = Mock(return_value=Mock())
+        coordinator.queue_dispatch_timer = Mock()
         return coordinator
 
     @staticmethod
@@ -394,6 +397,44 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
 
         self.assertIn((2, "apple-2"), coordinator.pending_targets)
         self.assertTrue(coordinator.running)
+        coordinator.queue_dispatch_timer.reset.assert_not_called()
+
+    def test_new_target_ids_restart_batch_debounce(self):
+        coordinator = self.make_coordinator()
+        coordinator.simulation_state = self.state(SimulationState.PLAYING)
+        coordinator.planning_scene = self.scene()
+        coordinator._planning_inputs_synchronized = Mock(return_value=True)
+
+        coordinator.on_target(self.target_message(target_id="apple-3"))
+        coordinator.on_target(self.target_message(target_id="apple-1"))
+        coordinator.on_target(self.target_message(target_id="apple-2"))
+
+        self.assertEqual(coordinator.queue_dispatch_timer.reset.call_count, 3)
+        self.assertFalse(coordinator.running)
+        self.assertEqual(len(coordinator.pending_targets), 3)
+
+    def test_batch_dispatch_selects_nearest_after_all_ids_arrive(self):
+        coordinator = self.make_coordinator()
+        coordinator.planning_scene = PlanningScene()
+        far = self.candidate("apple-3", [1.5, 0.0, 0.0])
+        near = self.candidate("apple-1", [0.6, 0.0, 0.0])
+        middle = self.candidate("apple-2", [1.0, 0.0, 0.0])
+        coordinator.pending_targets = {
+            far.key: far,
+            near.key: near,
+            middle.key: middle,
+        }
+        coordinator._prepare_approach_goal = Mock(
+            return_value=(2, 3, np.array([0.0, 0.0, 0.0, 1.0]))
+        )
+        coordinator.send_next = Mock()
+
+        coordinator._dispatch_pending_targets()
+
+        self.assertEqual(coordinator._active_target_key, near.key)
+        self.assertIn(far.key, coordinator.pending_targets)
+        self.assertIn(middle.key, coordinator.pending_targets)
+        coordinator.queue_dispatch_timer.cancel.assert_called()
 
     def test_first_precontact_failure_moves_target_to_retry_queue(self):
         coordinator = self.make_coordinator()
@@ -453,10 +494,12 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
     def test_postcontact_failure_stops_without_starting_next(self):
         coordinator = self.make_coordinator()
         candidate = self.candidate("apple-1", [0.8, 0.1, 1.2])
+        queued = self.candidate("apple-2", [0.9, 0.1, 1.2])
         coordinator.running = True
         coordinator.target = PoseStamped()
         coordinator._active_candidate = candidate
         coordinator._active_target_key = candidate.key
+        coordinator.pending_targets[queued.key] = queued
         coordinator._start_next_target = Mock()
 
         coordinator._handle_active_failure(
@@ -465,8 +508,51 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         )
 
         self.assertFalse(coordinator.running)
+        self.assertTrue(coordinator.safety_stopped)
+        self.assertEqual(coordinator.pending_targets, {})
+        self.assertEqual(coordinator.retry_targets, {})
         self.assertIn(candidate.key, coordinator.final_failed_target_keys)
         coordinator._start_next_target.assert_not_called()
+        coordinator._publish_status.assert_called_once_with(
+            "SAFETY_STOPPED",
+            False,
+            0.0,
+            "302:COLLISION_RISK",
+            "접촉 이후 실패로 reset 전까지 연속 수확을 중단합니다: GRASP 이후 실패",
+        )
+
+    def test_safety_stop_rejects_new_target(self):
+        coordinator = self.make_coordinator()
+        coordinator.safety_stopped = True
+        coordinator.safety_stop_reason = "운반 실패"
+
+        coordinator.on_target(self.target_message(target_id="apple-2"))
+
+        self.assertEqual(coordinator.pending_targets, {})
+        coordinator._publish_status.assert_called_once()
+        status = coordinator._publish_status.call_args.args
+        self.assertEqual(status[0], "TARGET_RECEIVED")
+        self.assertEqual(status[3], "302:COLLISION_RISK")
+        self.assertIn("SAFETY_STOPPED", status[4])
+
+    def test_safety_stop_is_released_only_by_reset_id_change(self):
+        coordinator = self.make_coordinator()
+        coordinator.safety_stopped = True
+        coordinator.safety_stop_reason = "운반 실패"
+        coordinator.simulation_state = self.state(
+            SimulationState.PLAYING, reset_id=2, scene_version=3
+        )
+
+        coordinator.on_state(
+            self.state(SimulationState.READY, reset_id=2, scene_version=4)
+        )
+        self.assertTrue(coordinator.safety_stopped)
+
+        coordinator.on_state(
+            self.state(SimulationState.READY, reset_id=3, scene_version=1)
+        )
+        self.assertFalse(coordinator.safety_stopped)
+        self.assertIsNone(coordinator.safety_stop_reason)
 
 
 if __name__ == "__main__":

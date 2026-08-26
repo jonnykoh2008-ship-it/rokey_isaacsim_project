@@ -79,6 +79,12 @@ from isaacsim import SimulationApp
 def parse_arguments():
     """Isaac Sim을 시작하기 전에 실행 옵션을 읽는다."""
     parser = argparse.ArgumentParser(description="base_rsd455 ROS 2 publisher")
+    parser.add_argument(
+        "--robot-id",
+        choices=("robot_01", "robot_02"),
+        default="robot_01",
+        help="USD base D455 선택 (기본값: robot_01)",
+    )
     parser.add_argument("--headless", action="store_true", help="창 없이 실행")
     parser.add_argument(
         "--max-steps",
@@ -125,10 +131,13 @@ from pxr import Usd, UsdGeom
 
 PROJECT_DIR = Path(__file__).resolve().parent
 STAGE_PATH = PROJECT_DIR / "m0617_3fgripper08201638.usd"
-CAMERA_PRIM_PATH = (
-    "/World/base_rsd455/RSD455/Camera_OmniVision_OV9782_Color"
-)
-GRAPH_PATH = "/BaseCameraRosGraph"
+CAMERA_ROOT_PATHS = {
+    "robot_01": "/World/base_rsd455_01",
+    "robot_02": "/World/base_rsd455_02",
+}
+CAMERA_ROOT_PATH = CAMERA_ROOT_PATHS[ARGS.robot_id]
+CAMERA_PRIM_PATH = f"{CAMERA_ROOT_PATH}/RSD455/Camera_OmniVision_OV9782_Color"
+GRAPH_PATH = f"/BaseCameraRosGraph_{ARGS.robot_id}"
 FRAME_ID = "base_camera"
 
 RGB_TOPIC = "/base_camera/color/image_raw"
@@ -158,16 +167,16 @@ def open_project_stage():
     stage = omni.usd.get_context().get_stage()
     camera_prim = stage.GetPrimAtPath(CAMERA_PRIM_PATH)
     if not camera_prim.IsValid() or not camera_prim.IsA(UsdGeom.Camera):
-        base_camera_prim = stage.GetPrimAtPath("/World/base_rsd455")
+        base_camera_prim = stage.GetPrimAtPath(CAMERA_ROOT_PATH)
         if base_camera_prim.IsValid():
             raise RuntimeError(
-                "base_rsd455 Prim은 있지만 D455 payload 안의 Color Camera가 "
+                f"{CAMERA_ROOT_PATH} Prim은 있지만 D455 payload 안의 Color Camera가 "
                 "로드되지 않았습니다. 에셋 서버 연결 또는 로컬 캐시를 "
                 "확인하세요. 예상 경로: "
                 f"{CAMERA_PRIM_PATH}"
             )
         raise RuntimeError(
-            "프로젝트 Stage에 base_rsd455가 없습니다. 예상 Camera 경로: "
+            f"프로젝트 Stage에 {CAMERA_ROOT_PATH}가 없습니다. 예상 Camera 경로: "
             f"{CAMERA_PRIM_PATH}"
         )
 
@@ -390,9 +399,11 @@ def main():
     simulation_context.play()
 
     print("\n" + "=" * 72)
-    print(" base_rsd455 ROS 2 Publisher")
+    print(f" {ARGS.robot_id} base_rsd455 ROS 2 Publisher")
     print("=" * 72)
     print(f" Stage       : {STAGE_PATH}")
+    print(f" Robot ID    : {ARGS.robot_id}")
+    print(f" Camera Root : {CAMERA_ROOT_PATH}")
     print(f" Camera Prim : {CAMERA_PRIM_PATH}")
     print(f" Resolution  : {ARGS.width} x {ARGS.height}")
     print(f" RGB         : {RGB_TOPIC}")
@@ -419,7 +430,7 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print(f"[ERROR] base_rsd455 발행 실패: {error}", file=sys.stderr)
+        print(f"[ERROR] {ARGS.robot_id} base_rsd455 발행 실패: {error}", file=sys.stderr)
         raise
     finally:
         SIMULATION_APP.close()

@@ -40,7 +40,7 @@ WAITING
   → PUSH_CONFIRMED
   → RETRACTING
   → HOME_CONFIRMED
-  → WAITING
+  → COMPLETED
 ```
 
 - 원점 복귀가 확인되기 전에는 다음 사과의 푸셔 동작을 허용하지 않는다.
@@ -57,6 +57,30 @@ WAITING
   담당하며 푸셔 명령과 별도의 상태 머신으로 유지한다.
 - 개인 PC 1의 RViz는 GPU PC 1이 발행하는 수확·푸셔 상태 visualization을
   원격 표시할 수 있으나 푸셔 동작을 승인하지 않는다.
+
+### SortCommand 계약
+
+```text
+Service: /conveyor/sort_command
+Type: appleproj_interfaces/srv/SortCommand
+
+Topic: /conveyor/sort_status
+Type: appleproj_interfaces/msg/SortStatus
+QoS: Reliable, Transient Local, Keep Last 10
+```
+
+등급·푸셔·checkpoint 매핑은 다음으로 고정한다.
+
+| 등급 | 푸셔 | trigger checkpoint |
+|---|---|---|
+| `HIGH` | `PUSHER_1` | `CONVEYOR_4_PUSHER_1_TRIGGER` |
+| `MEDIUM` | `PUSHER_2` | `CONVEYOR_4_PUSHER_2_TRIGGER` |
+| `LOW` | `PUSHER_3` | `CONVEYOR_4_PUSHER_3_TRIGGER` |
+
+GPU PC 1은 `/conveyor/checkpoint_events`에도 같은 checkpoint 이름을 발행한다.
+서비스의 `accepted=true`는 명령 접수 완료이며 푸셔 작동 완료를 뜻하지 않는다.
+상세 request/response, 중복 처리, 상태 흐름, 오류 코드 및 reset 규칙은
+`docs/architecture/ros2_interfaces.md`의 `SortCommand`와 `SortStatus` 계약을 따른다.
 
 ## 미확정 사항
 

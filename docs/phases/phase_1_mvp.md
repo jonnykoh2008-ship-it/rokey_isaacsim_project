@@ -36,7 +36,7 @@ target을 계산하고, GPU PC 1이 Lula RRT 기반 경로 계획과 로봇 실�
 - 급격한 joint 변화 및 singularity 방지
 - 45°/1초 손목 회전
 - 50mm/s, 최대 100mm 직선 당김
-- 15N/1Nm breakable stem joint
+- 15N/2Nm breakable stem joint
 - 컨베이어 1에 저상 배치
 
 ## 품질 검사

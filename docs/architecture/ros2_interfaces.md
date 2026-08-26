@@ -38,8 +38,26 @@
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
 | Service | `/quality/retry_inspection` | `appleproj_interfaces/srv/RetryInspection` | GPU PC 1 | 개인 PC 2 |
 | Topic | `/conveyor/checkpoint_events` | `appleproj_interfaces/msg/CheckpointEvent` | GPU PC 1 | 개인 PC 2 |
+| Service | `/conveyor/sort_command` | `appleproj_interfaces/srv/SortCommand` | GPU PC 1 | 개인 PC 2 |
+| Topic | `/conveyor/sort_status` | `appleproj_interfaces/msg/SortStatus` | GPU PC 1 | 개인 PC 2 |
 
 Action과 Service 표에서 서버는 요청을 실행하는 쪽이고 클라이언트는 요청을 보내는 쪽이다.
+
+## USD 멀티로봇 센서·자산 매핑
+
+GPU PC 1은 실행 시 `--robot-id`로 다음 USD 수확 프로파일을 선택한다.
+
+| robot ID | 로봇 Prim | 초기 관절 자세 (deg) | 담당 tree/사과 영역 | D455 Prim |
+|---|---|---|---|---|
+| `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` | `/World/Xform` | `/World/base_rsd455_01` |
+| `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` | `/World/Xform_03` | `/World/base_rsd455_02` |
+
+각 M0617은 `m0617_rail/root_joint`를 Articulation root로 사용하며, 본체의
+`FixedJoint`로 rail mount에 연결된다. 사과 fixed joint는 각
+`apple_branch_xx` 내부에서 `branchbody`와 `applebody`를 연결한다. 현재 표의
+`/base_camera/...` 센서 topic은 v2.0 호환 계약으로 유지한다. 두 카메라를
+동시에 운용하기 위한 robot별 topic/action/service namespace와 `HarvestTarget`
+내부의 최종 robot/tree 식별 필드는 아직 `TBD`다.
 
 ## 공통 표준 인터페이스
 
@@ -421,11 +439,72 @@ Response:
 
 개인 PC 2에서 GPU PC 1로 전달한다. MVP에서는 사용하지 않으며, 2차 개발의 컨베이어 4 실제 푸셔 제어부터 사용한다.
 
-필수 후보 필드:
+```text
+서비스: /conveyor/sort_command
+타입: appleproj_interfaces/srv/SortCommand
+서버: GPU PC 1
+클라이언트: 개인 PC 2
+```
 
-- `apple_id`
-- `grade`
-- `pusher_id`
-- trigger 조건 또는 목표 simulation time
+Request 필드:
 
-토픽·서비스·액션 선택과 QoS는 TBD다.
+- `header`: `/clock` 기준 요청 생성 시각
+- `command_id`: 분류 명령 식별자
+- `apple_id`: 분류 대상 사과 식별자
+- `inspection_id`: 품질검사 식별자
+- `grade`: `HIGH=1`, `MEDIUM=2`, `LOW=3`
+- `pusher_id`: `PUSHER_1=1`, `PUSHER_2=2`, `PUSHER_3=3`
+- `trigger_checkpoint_id`: 푸셔 작동을 허용하는 checkpoint 식별자
+
+Response 필드:
+
+- `accepted`: 명령 접수 여부. `true`는 실제 푸셔 작동 완료가 아니라 접수 완료를 뜻한다.
+- `command_id`: 요청의 명령 식별자
+- `error_code`: 정상 접수 시 빈 문자열
+- `message`: 접수 또는 거절 상세 설명
+
+등급·푸셔·trigger 매핑은 다음과 같다.
+
+| 등급 | 푸셔 | `trigger_checkpoint_id` |
+|---|---|---|
+| `HIGH` | `PUSHER_1` | `CONVEYOR_4_PUSHER_1_TRIGGER` |
+| `MEDIUM` | `PUSHER_2` | `CONVEYOR_4_PUSHER_2_TRIGGER` |
+| `LOW` | `PUSHER_3` | `CONVEYOR_4_PUSHER_3_TRIGGER` |
+
+GPU PC 1은 `/conveyor/checkpoint_events`에도 위와 동일한 checkpoint 이름을 사용한다.
+요청의 세 식별자가 비어 있거나 grade, pusher, trigger 매핑이 유효하지 않으면
+거절한다. 동일 `command_id`와 동일 요청은 새 동작을 만들지 않고 기존 응답을
+반환하며, 동일 `command_id`의 내용이 다르면 거절한다. 이미 분류 완료된 사과도
+거절한다. 푸셔가 원점에 있지 않고 안전하게 대기할 수 없거나 다른 푸셔가 동작
+중이거나 Isaac Sim이 Stop/Reset 처리 중인 경우에는 접수하지 않는다.
+
+## SortStatus
+
+GPU PC 1이 분류 명령의 실제 실행 상태를 발행한다.
+
+```text
+토픽: /conveyor/sort_status
+타입: appleproj_interfaces/msg/SortStatus
+송신: GPU PC 1
+수신: 개인 PC 2
+QoS: Reliable, Transient Local, Keep Last 10
+```
+
+정상 상태 흐름은 `ARMED → APPLE_CONFIRMED → EXTENDING → PUSH_CONFIRMED →
+RETRACTING → HOME_CONFIRMED → COMPLETED`다. 실패 시 `FAILED`, 명시적 취소 시
+`CANCELLED`를 발행한다. 정상 상태의 `error_code`는 빈 문자열이다.
+
+GPU PC 1은 명령이 `ARMED`이고, 지정 trigger에 동일 `apple_id`의 사과가 도착했고,
+푸셔 원점 복귀가 확인되며, 다른 푸셔가 동작 중이지 않고, 동일 trigger 체류에서
+아직 작동하지 않았을 때만 푸셔를 구동한다. 동일 trigger 이벤트는 한 번만 소비한다.
+
+오류 코드는 `INVALID_COMMAND`, `INVALID_GRADE`, `INVALID_PUSHER`,
+`GRADE_PUSHER_MISMATCH`, `INVALID_TRIGGER`, `DUPLICATE_COMMAND_CONFLICT`,
+`APPLE_ALREADY_SORTED`, `PUSHER_BUSY`, `PUSHER_NOT_HOME`, `APPLE_ID_MISMATCH`,
+`TRIGGER_TIMEOUT`, `PUSH_TIMEOUT`, `JAM_DETECTED`, `HOME_TIMEOUT`,
+`SIMULATION_RESET`, `CANCELLED`, `INTERNAL_ERROR`를 사용한다.
+
+Timeline Stop 또는 Reset 시 GPU PC 1은 대기 명령을 폐기하고 실행 중인 푸셔를
+안전 정지한 뒤 가능한 경우 원점으로 복귀시킨다. 영향받은 각 명령에 대해
+`state=CANCELLED`, `error_code=SIMULATION_RESET` 상태를 발행하고 이전 command,
+완료 사과 및 소비한 trigger 이벤트 캐시를 초기화한다.

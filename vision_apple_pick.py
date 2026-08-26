@@ -12,10 +12,13 @@ import os
 import queue
 import sys
 import threading
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
 
+DISABLE_CONVEYOR_GRAPH = "--disable-conveyor-graph" in sys.argv
+DISABLE_CAMERA_RUNTIME = "--disable-camera-runtime" in sys.argv
 PROJECT_DIR = Path(__file__).resolve().parent
 BRIDGE_ROOT = Path("/home/rokey/isaacsim/exts/isaacsim.ros2.bridge/jazzy")
 INTERFACE_PREFIX_TEXT = os.environ.get("APPLEPROJ_INTERFACES_PREFIX", "")
@@ -43,6 +46,13 @@ def prepare_isaac_ros_environment():
 
 
 prepare_isaac_ros_environment()
+if DISABLE_CONVEYOR_GRAPH or DISABLE_CAMERA_RUNTIME:
+    # rclpy와 apple_pick에는 이 파일 전용 진단 옵션을 전달하지 않는다.
+    diagnostic_args = {
+        "--disable-conveyor-graph",
+        "--disable-camera-runtime",
+    }
+    sys.argv = [arg for arg in sys.argv if arg not in diagnostic_args]
 
 # import 시 SimulationApp을 한 번만 생성하며 main()은 실행하지 않는다.
 import apple_pick as harvest
@@ -59,6 +69,7 @@ from appleproj_interfaces.msg import (
 from appleproj_interfaces.srv import GetPlanningScene
 from geometry_msgs.msg import PoseStamped
 from isaacsim.core.utils.extensions import enable_extension
+from isaacsim.core.prims import SingleArticulation
 from pxr import Usd, UsdGeom
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
@@ -127,9 +138,261 @@ ERROR_CODES = {
     "INTERNAL_ERROR": "312:INTERNAL_ERROR",
 }
 
-CAMERA_PATH = "/World/base_rsd455/RSD455/Camera_OmniVision_OV9782_Color"
-CAMERA_GRAPH_PATH = "/BaseCameraRosGraph"
-ROBOT_TF_GRAPH_PATH = "/RobotTfRosGraph"
+CAMERA_PATH = harvest.ROBOT_PROFILE.camera_prim_path
+CAMERA_GRAPH_PATH = f"/BaseCameraRosGraph_{harvest.ROBOT_PROFILE.robot_id}"
+ROBOT_TF_GRAPH_PATH = f"/RobotTfRosGraph_{harvest.ROBOT_PROFILE.robot_id}"
+CONVEYOR_GRAPH_PATH = "/World/ConveyorTrack_01/ConveyorBeltGraph"
+FIXED_CAMERA_RUNTIME_PATHS = (
+    "/World/base_rsd455_01",
+    "/World/base_rsd455_02",
+    "/World/conv_rsd455_01",
+    "/World/conv_rsd455_02",
+    "/World/ConveyorTrack_01/conv_rsd455",
+)
+
+
+def apply_runtime_diagnostic_overrides(stage):
+    """원본 USD를 저장하지 않고 현재 실행의 Session Layer만 변경한다."""
+    if not DISABLE_CONVEYOR_GRAPH:
+        return
+    conveyor_graph = stage.GetPrimAtPath(CONVEYOR_GRAPH_PATH)
+    if not conveyor_graph.IsValid():
+        raise RuntimeError(
+            f"진단용 비활성화 대상 Prim을 찾을 수 없습니다: {CONVEYOR_GRAPH_PATH}"
+        )
+    with Usd.EditContext(stage, stage.GetSessionLayer()):
+        conveyor_graph.SetActive(False)
+    print(
+        f"   [DIAGNOSTIC] Conveyor graph disabled in Session Layer: "
+        f"{CONVEYOR_GRAPH_PATH}"
+    )
+
+
+def disable_camera_runtime_assets(stage):
+    """첫 물리 스텝 전에 고정 D455 payload를 Session Layer에서 제거한다."""
+    if not DISABLE_CAMERA_RUNTIME:
+        return
+    camera_prims = []
+    for camera_path in FIXED_CAMERA_RUNTIME_PATHS:
+        camera_prim = stage.GetPrimAtPath(camera_path)
+        if not camera_prim.IsValid():
+            raise RuntimeError(
+                f"진단용 비활성화 대상 카메라 Prim을 찾을 수 없습니다: {camera_path}"
+            )
+        camera_prims.append(camera_prim)
+    with Usd.EditContext(stage, stage.GetSessionLayer()):
+        for camera_prim in camera_prims:
+            camera_prim.SetActive(False)
+    print(
+        "   [DIAGNOSTIC] Fixed D455 runtime disabled in Session Layer: "
+        + ", ".join(FIXED_CAMERA_RUNTIME_PATHS)
+    )
+
+
+def print_startup_lifecycle(label, stage, world):
+    """첫 Play/step 전후의 Kit, Stage 및 Timeline 생존 상태를 기록한다."""
+    context_stage = harvest.simulation_app.context.get_stage()
+    print(
+        f"   [LIFECYCLE] {label}: "
+        f"app_running={harvest.simulation_app.is_running()}, "
+        f"app_exiting={harvest.simulation_app.is_exiting()}, "
+        f"context_stage={context_stage is not None}, "
+        f"expected_stage={context_stage == stage}, "
+        f"world_playing={world.is_playing()}, "
+        f"world_stopped={world.is_stopped()}",
+        flush=True,
+    )
+
+
+@dataclass(frozen=True)
+class PusherJointConfig:
+    pusher_id: int
+    articulation_prim_path: str
+    joint_name: str
+    home_position_m: float
+    extended_position_m: float
+    position_tolerance_m: float
+    jam_effort_threshold_n: float
+
+
+def _required_environment(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"필수 푸셔 런타임 설정이 없습니다: {name}")
+    return value
+
+
+def pushers_enabled():
+    """Keep harvesting runnable when the optional phase-2 pusher is absent."""
+    value = os.environ.get("APPLEPROJ_ENABLE_PUSHERS", "0").strip().lower()
+    if value in ("0", "false", "no", "off", ""):
+        return False
+    if value in ("1", "true", "yes", "on"):
+        return True
+    raise RuntimeError(
+        "APPLEPROJ_ENABLE_PUSHERS는 1/true/on 또는 0/false/off여야 합니다"
+    )
+
+
+def load_pusher_configuration(timing_config_type):
+    """Load physical values without inventing defaults for still-TBD requirements."""
+    configs = []
+    for pusher_id in (1, 2, 3):
+        prefix = f"APPLEPROJ_PUSHER_{pusher_id}"
+        try:
+            home = float(_required_environment(f"{prefix}_HOME_M"))
+            extended = float(_required_environment(f"{prefix}_EXTENDED_M"))
+            tolerance = float(_required_environment(f"{prefix}_POSITION_TOLERANCE_M"))
+            jam_effort = float(_required_environment(f"{prefix}_JAM_EFFORT_N"))
+        except ValueError as exc:
+            raise RuntimeError(f"{prefix} 수치 설정이 실수가 아닙니다") from exc
+        if home == extended or tolerance <= 0.0 or jam_effort <= 0.0:
+            raise RuntimeError(
+                f"{prefix}: home/extended는 달라야 하고 tolerance/effort는 양수여야 합니다"
+            )
+        configs.append(
+            PusherJointConfig(
+                pusher_id=pusher_id,
+                articulation_prim_path=_required_environment(f"{prefix}_PRIM_PATH"),
+                joint_name=_required_environment(f"{prefix}_JOINT_NAME"),
+                home_position_m=home,
+                extended_position_m=extended,
+                position_tolerance_m=tolerance,
+                jam_effort_threshold_n=jam_effort,
+            )
+        )
+    try:
+        timing = timing_config_type(
+            trigger_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_TRIGGER_TIMEOUT_S")),
+            push_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_PUSH_TIMEOUT_S")),
+            home_timeout_s=float(_required_environment("APPLEPROJ_PUSHER_HOME_TIMEOUT_S")),
+        )
+    except ValueError as exc:
+        raise RuntimeError("푸셔 timeout 설정이 유효한 양수가 아닙니다") from exc
+    return configs, timing
+
+
+class IsaacPrismaticPusherActuator:
+    """Position-drive adapter for three configured Isaac Sim articulations."""
+
+    def __init__(self, world, configs):
+        self.configs = {config.pusher_id: config for config in configs}
+        self.articulations = {}
+        self.joint_indices = {}
+        prim_paths = [config.articulation_prim_path for config in configs]
+        if len(set(prim_paths)) != len(prim_paths):
+            raise RuntimeError("각 푸셔는 서로 다른 articulation prim path를 사용해야 합니다")
+        for config in configs:
+            articulation = world.scene.add(
+                SingleArticulation(
+                    prim_path=config.articulation_prim_path,
+                    name=f"conveyor_pusher_{config.pusher_id}",
+                )
+            )
+            self.articulations[config.pusher_id] = articulation
+
+    @property
+    def available(self):
+        return True
+
+    def validate_initialized(self):
+        for pusher_id, articulation in self.articulations.items():
+            config = self.configs[pusher_id]
+            if not articulation.handles_initialized:
+                raise RuntimeError(
+                    f"PUSHER_{pusher_id} articulation handle 초기화 실패: "
+                    f"{config.articulation_prim_path}"
+                )
+            if config.joint_name not in articulation.dof_names:
+                raise RuntimeError(
+                    f"PUSHER_{pusher_id} joint를 찾을 수 없습니다: {config.joint_name}"
+                )
+            index = articulation.get_dof_index(config.joint_name)
+            properties = articulation.dof_properties[index]
+            if int(properties["type"]) != 2:
+                raise RuntimeError(
+                    f"PUSHER_{pusher_id} joint가 prismatic DOF가 아닙니다: {config.joint_name}"
+                )
+            if not bool(properties["hasLimits"]):
+                raise RuntimeError(f"PUSHER_{pusher_id} prismatic joint limit이 없습니다")
+            lower = float(properties["lower"])
+            upper = float(properties["upper"])
+            for label, target in (
+                ("home", config.home_position_m),
+                ("extended", config.extended_position_m),
+            ):
+                if target < lower or target > upper:
+                    raise RuntimeError(
+                        f"PUSHER_{pusher_id} {label} target {target}가 "
+                        f"joint limit [{lower}, {upper}] 밖입니다"
+                    )
+            if float(properties["maxVelocity"]) <= 0.0 or float(properties["maxEffort"]) <= 0.0:
+                raise RuntimeError(
+                    f"PUSHER_{pusher_id} joint maxVelocity/maxEffort가 유효하지 않습니다"
+                )
+            self.joint_indices[pusher_id] = int(index)
+
+    def _position(self, pusher_id):
+        articulation = self.articulations[pusher_id]
+        index = self.joint_indices[pusher_id]
+        value = articulation.get_joint_positions(
+            joint_indices=harvest.np.asarray([index], dtype=harvest.np.int32)
+        )
+        if value is None or len(value) != 1 or not harvest.np.isfinite(value[0]):
+            raise RuntimeError(f"PUSHER_{pusher_id} joint position을 읽을 수 없습니다")
+        return float(value[0])
+
+    def _command(self, pusher_id, target):
+        articulation = self.articulations[pusher_id]
+        index = self.joint_indices[pusher_id]
+        articulation.apply_action(
+            harvest.ArticulationAction(
+                joint_positions=harvest.np.asarray([target], dtype=float),
+                joint_indices=harvest.np.asarray([index], dtype=harvest.np.int32),
+            )
+        )
+
+    def is_home(self, pusher_id):
+        config = self.configs[pusher_id]
+        return abs(self._position(pusher_id) - config.home_position_m) <= config.position_tolerance_m
+
+    def begin_extend(self, pusher_id):
+        self._command(pusher_id, self.configs[pusher_id].extended_position_m)
+
+    def is_extended(self, pusher_id):
+        config = self.configs[pusher_id]
+        return (
+            abs(self._position(pusher_id) - config.extended_position_m)
+            <= config.position_tolerance_m
+        )
+
+    def begin_retract(self, pusher_id):
+        self._command(pusher_id, self.configs[pusher_id].home_position_m)
+
+    def is_jammed(self, pusher_id):
+        articulation = self.articulations[pusher_id]
+        index = self.joint_indices[pusher_id]
+        effort = articulation.get_measured_joint_efforts(
+            joint_indices=harvest.np.asarray([index], dtype=harvest.np.int32)
+        )
+        if effort is None or len(effort) != 1 or not harvest.np.isfinite(effort[0]):
+            raise RuntimeError(f"PUSHER_{pusher_id} joint effort를 읽을 수 없습니다")
+        return abs(float(effort[0])) >= self.configs[pusher_id].jam_effort_threshold_n
+
+    def progress(self, pusher_id, extending):
+        config = self.configs[pusher_id]
+        span = config.extended_position_m - config.home_position_m
+        extension = (self._position(pusher_id) - config.home_position_m) / span
+        extension = max(0.0, min(1.0, extension))
+        return extension if extending else 1.0 - extension
+
+    def stop_all(self):
+        for pusher_id in self.configs:
+            self._command(pusher_id, self._position(pusher_id))
+
+    def try_home_all(self):
+        for pusher_id, config in self.configs.items():
+            self._command(pusher_id, config.home_position_m)
 
 
 def _multiply_xyzw(a, b):
@@ -222,19 +485,16 @@ def create_robot_tf_graph(stage):
     `world → odom`은 항등, `odom → base_link`는 MVP에서 로봇이 고정이므로
     USD에서 읽은 고정 변환이다. 로봇 링크만 Isaac이 동적으로 발행한다.
 
-    레일(`m0617_rail`)은 TF 대상에서 제외한다. 레일 URDF의 베이스 링크
-    이름이 `world`라서 ROS의 `world` 프레임과 충돌하기 때문이다. 그 prim은
-    참조 에셋에서 들어오고 articulation root joint와 rail_joint가 경로로
-    참조하고 있어 rename할 수 없다. MVP에서 레일은 고정이므로 TF에서 빠져도
-    무방하며, 3차 레일 도입 시 재설계한다.
+    현재 저장된 USD에서는 `m0617_rail/root_joint`가 Articulation root로
+    기능한다. TF link 범위는 `--robot-id`로 선택한 `m0617_01` 또는
+    `m0617_02` 본체와 그리퍼로 제한한다.
 
     같은 TF를 두 노드가 중복 발행하지 않도록 robot_state_publisher는 쓰지
     않는다.
     """
-    # ArticulationRootAPI는 Xform이 아니라 root_joint에 적용돼 있다
-    # (apple_pick.validate_articulation_setup 참고). SingleManipulator는
-    # 하위를 탐색해 찾아내지만 OmniGraph 노드는 정확한 prim을 요구하므로
-    # ARTICULATION_PRIM_PATH를 주면 "is not an articulation"으로 실패한다.
+    # open_project_stage()가 선택한 m0617_rail 아래의 root_joint와 M0617
+    # mount FixedJoint를 검증한다. OmniGraph 노드는 정확한 articulation root
+    # prim을 요구하므로 root_joint 경로를 직접 전달한다.
     articulation_path = harvest.ARTICULATION_ROOT_JOINT_PATH
     articulation = harvest.require_prim(stage, articulation_path)
     if not articulation.HasAPI(harvest.UsdPhysics.ArticulationRootAPI):
@@ -251,8 +511,8 @@ def create_robot_tf_graph(stage):
     base_world, _base_quat = harvest.get_prim_world_pose(
         stage, harvest.ROBOT_BASE_PATH
     )
-    # 레일의 `world` 링크를 피하려고 로봇 서브트리의 rigid body만 고른다.
-    # base_link는 parentPrim이므로 자기참조를 막기 위해 제외한다.
+    # 선택한 M0617 서브트리의 rigid body만 고른다. base_link는 parentPrim이므로
+    # 자기참조를 막기 위해 제외한다.
     robot_root = harvest.require_prim(stage, harvest.ROBOT_PRIM_PATH)
     link_paths = [
         str(prim.GetPath())
@@ -319,9 +579,9 @@ def create_robot_tf_graph(stage):
                     ("OdomBase.inputs:staticPublisher", True),
                     ("OdomBase.inputs:translation", list(base_world)),
                     ("OdomBase.inputs:rotation", base_quat),
-                    # base_link 기준으로 로봇 링크만 동적 발행한다.
-                    # articulation 전체를 주면 레일의 `world` 링크까지 딸려와
-                    # ROS world 프레임과 충돌하므로 링크를 명시한다.
+                    # base_link 기준으로 선택한 로봇 링크만 동적 발행한다.
+                    # articulation 전체를 주지 않고 링크를 명시해 robot별
+                    # TF 경계를 유지한다.
                     ("RobotTf.inputs:topicName", "/tf"),
                     ("RobotTf.inputs:parentPrim",
                      [usdrt.Sdf.Path(harvest.ROBOT_BASE_PATH)]),
@@ -1408,6 +1668,13 @@ class MotionEngine:
                     resume_callback=self._publish_resume,
                 )
             except harvest.ApproachUnreachableError as error:
+                if self.joint_break.broken:
+                    raise MotionExecutionError(
+                        "302:COLLISION_RISK",
+                        "RRT trajectory 실행 중 목표 사과 stem joint가 "
+                        f"파손됐습니다: candidate={candidate_name}, "
+                        f"state={self.joint_break.break_state}",
+                    ) from error
                 failures.append(f"{candidate_name}={error}")
                 print(f"   [APPROACH REPLAN] {candidate_name} 실패: {error}")
                 continue
@@ -1809,7 +2076,14 @@ class MotionEngine:
                         )
                     raise MotionExecutionError(
                         "304:MOTION_TIMEOUT",
-                        "TCP가 목표를 제한 시간 안에 추종하지 못했습니다.",
+                        "TCP가 목표를 제한 시간 안에 추종하지 못했습니다: "
+                        f"state={motion_state}, "
+                        f"position={self.fsm.last_position_error_m:.4f} m, "
+                        "rotation="
+                        f"{self.fsm.last_orientation_error_deg:.2f} deg, "
+                        f"joint_broken={self.joint_break.broken}, "
+                        f"break_state={self.joint_break.break_state or 'NONE'}, "
+                        f"palm_contacted={self.apple_contact.palm_contacted}",
                     )
             else:
                 failures += 1
@@ -2171,21 +2445,53 @@ class MotionEngine:
 
 def main():
     stage = harvest.open_project_stage()
-    create_base_camera_graph(stage)
+    apply_runtime_diagnostic_overrides(stage)
+    if DISABLE_CAMERA_RUNTIME:
+        print("   [DIAGNOSTIC] Base camera ROS graph creation skipped")
+    else:
+        create_base_camera_graph(stage)
     harvest.configure_breakable_joint(stage)
     harvest.configure_contact_colliders(stage)
     harvest.configure_joint_drives(stage)
+    disable_camera_runtime_assets(stage)
     world = harvest.World(
         stage_units_in_meters=1.0, physics_prim_path="/physicsScene",
         physics_dt=1.0 / 60.0, rendering_dt=1.0 / 60.0,
     )
+    pusher_actuator = None
+    pusher_timing = None
+    sort_runtime_type = None
+    if pushers_enabled():
+        try:
+            from conveyor_sort_controller import SortRuntime, TimingConfig
+        except ImportError as exc:
+            raise RuntimeError(
+                "푸셔 기능을 활성화하려면 APPLEPROJ_INTERFACES_PREFIX에 "
+                "SortCommand와 SortStatus가 빌드되어 있어야 합니다"
+            ) from exc
+        pusher_configs, pusher_timing = load_pusher_configuration(TimingConfig)
+        pusher_actuator = IsaacPrismaticPusherActuator(world, pusher_configs)
+        sort_runtime_type = SortRuntime
+    else:
+        print(
+            "   [PUSHER] 비활성화: APPLEPROJ_ENABLE_PUSHERS=1일 때만 "
+            "SortCommand/SortStatus와 푸셔 articulation을 초기화합니다."
+        )
     robot = harvest.create_robot(world)
+    if pusher_actuator is not None:
+        pusher_actuator.validate_initialized()
+        pusher_actuator.try_home_all()
     # create_robot 안의 world.reset()이 articulation과 PhysX view를 초기화한
     # 뒤라야 TF/JointState 노드가 articulation을 찾을 수 있다. 그 전에 그래프를
     # 만들면 "did not match any articulations"로 빈 TF만 발행된다.
     create_robot_tf_graph(stage)
     rclpy.init()
     node = RobotMotionNode()
+    sort_runtime = (
+        sort_runtime_type(node, pusher_actuator, pusher_timing)
+        if sort_runtime_type is not None
+        else None
+    )
     engine = MotionEngine(
         world,
         robot,
@@ -2215,10 +2521,16 @@ def main():
         )
 
     try:
+        print_startup_lifecycle("before publish INITIALIZING", stage, world)
         node.publish_state(SimulationState.INITIALIZING, "Stage와 물리를 초기화합니다.")
+        print_startup_lifecycle("before world.play", stage, world)
         world.play()
+        print_startup_lifecycle("after world.play", stage, world)
+        print_startup_lifecycle("before first world.step", stage, world)
         world.step(render=not harvest.args.headless)
+        print_startup_lifecycle("after first world.step", stage, world)
         publish_current_scene()
+        print_startup_lifecycle("after planning scene publish", stage, world)
         published_tree_signature = harvest.tree_scene_signature(stage)
         node.publish_state(SimulationState.READY, "planning scene 동기화가 완료됐습니다.")
         node.publish_state(SimulationState.PLAYING, "Isaac Sim Timeline이 실행 중입니다.")
@@ -2227,6 +2539,8 @@ def main():
         while harvest.simulation_app.is_running():
             if world.is_stopped():
                 if published_state != SimulationState.STOPPED:
+                    if sort_runtime is not None:
+                        sort_runtime.reset()
                     node.publish_state(
                         SimulationState.STOPPED,
                         "Timeline Stop: 실행 중 Goal과 이전 계획을 폐기합니다.",
@@ -2251,6 +2565,9 @@ def main():
                 )
                 engine.close()
                 world.reset()
+                if pusher_actuator is not None:
+                    pusher_actuator.validate_initialized()
+                    pusher_actuator.try_home_all()
                 engine = MotionEngine(
                     world,
                     robot,
@@ -2295,6 +2612,8 @@ def main():
                     "새 scene_version으로 실행 중입니다.",
                 )
                 continue
+            if sort_runtime is not None:
+                sort_runtime.process(float(world.current_time), simulation_ready=True)
             try:
                 pending = node.requests.get_nowait()
             except queue.Empty:
@@ -2310,6 +2629,9 @@ def main():
                 )
                 engine.close()
                 world.reset()
+                if pusher_actuator is not None:
+                    pusher_actuator.validate_initialized()
+                    pusher_actuator.try_home_all()
                 engine = MotionEngine(
                     world,
                     robot,
@@ -2333,7 +2655,17 @@ def main():
                 pending.handle, *node.execution_version()
             )
             pending.finished.set()
+    except BaseException as error:
+        print(
+            f"   [LIFECYCLE EXIT] {type(error).__name__}: {error!r}",
+            flush=True,
+        )
+        print_startup_lifecycle("BaseException", stage, world)
+        traceback.print_exc()
+        raise
     finally:
+        if sort_runtime is not None:
+            sort_runtime.reset()
         engine.close()
         executor.shutdown()
         node.destroy_node()

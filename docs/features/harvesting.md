@@ -13,6 +13,24 @@
   계산한다.
 - Lula/RMPflow 제어 frame: `link_6`
 
+## 멀티로봇 USD 프로파일
+
+GPU PC 1 실행 코드는 `--robot-id`로 한 수확 프로파일을 선택한다.
+
+| 프로파일 | M0617 Prim | 초기 관절 자세 (deg) | 담당 tree/사과 | 카메라 Prim |
+|---|---|---|---|---|
+| `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` | `/World/Xform/tree`, `/World/Xform/apple_branch[_1/_2]` | `/World/base_rsd455_01` |
+| `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` | `/World/Xform_03/tree`, `/World/Xform_03/apple_branch[_1/_2]` | `/World/base_rsd455_02` |
+
+각 로봇은 `m0617_rail/root_joint`를 Articulation root로 사용한다. M0617 본체는
+각 본체 Prim의 `FixedJoint`로 rail mount에 연결되며, `rail_joint`는 저장된 초기
+위치를 유지한다. 직접 M0617 Prim 아래의 `root_joint`는 별도 Articulation root로
+사용하지 않는다.
+
+사과의 `PhysicsFixedJoint`는 각 `apple_branch_xx` 내부에서
+`branchbody → applebody`를 연결한다. 수확 코드는 Stage의 joint relationship을
+검증한 뒤 실행 중 파손 한계를 적용한다.
+
 ## 상태 흐름
 
 ```text
@@ -75,8 +93,10 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
   매 step RMPflow·PhysX 접촉 규칙으로 검증한다. 접촉 구간을 RRT sampling의
   일반 목표로 만들면 의도된 palm 접촉과 stem 파괴 조건을 비용 함수가 보장하지
   못하므로 기본 방식으로 사용하지 않는다.
-- M0617 전체 링크는 굵은 가지 planning proxy와 충돌하지 않아야 한다.
-- 그리퍼와 손목은 작은 가지 planning proxy와 충돌하지 않아야 한다.
+- M0617 전체 링크는 로컬 PCA 추정 반경 `20mm` 이상인 나무 구조 구간의 planning
+  proxy와 충돌하지 않아야 한다.
+- 로컬 PCA 추정 반경 `20mm` 미만인 작은 가지 구간은 현재 PhysX collision과
+  RRT/RMPflow planning proxy에서 모두 제외한다.
 - 몸통 mesh가 여러 개인 경우 각 mesh를 별도 planning obstacle로 유지한다.
   로봇 collision sphere는 URDF의 관절 간 링크 구간과 collision mesh 범위를
   빠짐없이 덮어야 한다.
@@ -105,16 +125,18 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
   일반 진입 구간에서 접촉하면 즉시 정지하고 `COLLISION_RISK`를 반환한다.
 - pre-grasp → grasp → twist → pull → retract 구간에도 나무 obstacle을
   유지하며 매 simulation step에서 RMPflow world를 갱신한다.
-- 작은 가지는 물리 collision이 비활성화되어도 planning obstacle에서 제외하지
-  않는다. 잎은 visual-only로 유지하고 PhysX 및 RMPflow obstacle에서 제외한다.
+- 단일 나무 구조 mesh는 연결 성분을 장축 방향 `40mm` 구간으로 나누고 로컬
+  PCA 반경을 계산한다. 로컬 반경 `20mm` 이상인 구간에만 짧은 PhysX capsule과
+  RRT/RMPflow planning proxy를 동일하게 적용한다. 한 가지 안에서도 그보다
+  가는 구간과 잎은 양쪽 obstacle에서 제외한다.
 - 경로 corridor 내부 proxy는 경로와 가까운 순서로 선별하되, 시작 TCP와 이미
   겹치는 proxy는 초기 자세를 가두지 않도록 제외한다. 현재 시뮬레이션 튜닝
   임시값은 corridor `0.25 m`, 시작점 제외 반경 `0.18 m`, 가지 최대 48개이다.
-- 작은 가지 형상 proxy의 현재 임시 voxel 크기는 `40mm`이며 기본 sphere
-  반경은 `20mm`다. 작은 가지 안전거리 `20mm`를 별도로 유지해 Lula에 전달되는
-  최종 sphere 반경은 `40mm`다. 이전 60mm voxel/50mm 최종 반경에서 형상
-  과대 근사를 줄인 값이며, 실제 PhysX collider와 몸통 50mm 안전거리는
-  변경하지 않는다.
+- planning 대상 구조 성분의 현재 임시 voxel 크기는 `20mm`이며 기본 sphere
+  반경은 `10mm`다. 추가 branch clearance는 현재 `0mm`로 유지한다. PCA 반경
+  `20mm` 미만 로컬 구간을 제외하고 voxel을 세분화해 기존 proxy의 형상 과대
+  근사를 줄인다. PhysX capsule도 동일한 `40mm` 구간과 로컬 PCA 반경 기준을
+  사용한다.
 - transit은 로봇 쪽 몸통 전체 bounding box 바깥 `0.45 m`의 안전 waypoint에
   먼저 도달해 자세를 정렬한 다음 staging으로 진입한다. 좌우 재계획 방향은
   로봇-사과 방사축이 아니라 그에 수직인 수평 lateral 축을 사용한다. `0.45 m`는
@@ -122,8 +144,9 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
 
 최소 안전거리의 초기값은 다음과 같다.
 
-- 로봇 링크 ↔ 굵은 가지: 50mm
-- 그리퍼·손목 ↔ 작은 가지: 20mm
+- 로봇 링크 ↔ PCA 반경 `20mm` 이상 나무 구조 성분: 50mm
+- PCA 반경 `20mm` 미만 성분은 현재 obstacle 대상이 아니므로 별도 안전거리도
+  적용하지 않는다.
 
 직접 transit이 수렴하지 않으면 먼저 나무 바깥 안전 waypoint로 후퇴한 뒤 목표
 사과 양옆의 우회 waypoint를 순서대로 사용해 재계획한다. 위치와 회전 오차가
@@ -167,9 +190,9 @@ RMPflow gain, proxy voxel 크기, proxy 수 제한 및 영향 반경은 시뮬�
 Stem joint:
 
 - break force: 15N
-- break torque: 1Nm
+- break torque: 2Nm
 
-회전 중 1Nm을 초과해 조기 분리되는지 시험하고 필요 시 별도 승인 후 조정한다.
+회전 중 2Nm을 초과해 조기 분리되는지 시험하고 필요 시 별도 승인 후 조정한다.
 
 ## 컨베이어 배치
 
@@ -215,10 +238,14 @@ Stem joint:
   완료된 뒤 다음 사과를 시작한다.
 - 실행 중 들어온 현재 target의 갱신은 실행 목표를 바꾸지 않는다. 아직 시작하지
   않은 target은 같은 ID의 최신 안정 좌표로 갱신한다.
-- 접촉 전 `APPROACH` 계획 또는 실행이 처음 실패한 target은 일반 대기열이 모두
+- 실제 접촉이 없는 `APPROACH_UNREACHABLE` 계획 또는 실행이 처음 실패한 target은 일반 대기열이 모두
   끝난 뒤 실행하는 재시도 대기열로 이동한다. 다른 사과를 모두 처리한 뒤 1회만
   재시도하고, 두 번째 실패는 최종 실패로 기록한다.
-- `GRASP` 이후의 접촉·파지·운반 구간에서 실패하면 사과를 들었거나 로봇이 나무
-  내부에 있을 수 있으므로 다음 target을 실행하지 않고 즉시 안전 정지한다.
+- `APPROACH` 중 실제 로봇-나무 접촉이나 stem 조기 파손을 포함해, 접촉 이후
+  또는 `GRASP` 이후의 파지·운반 구간에서 실패하면 사과를 들었거나 로봇이 나무
+  내부에 있을 수 있으므로 `SAFETY_STOPPED` 상태로 전환한다. 이 상태에서는 기존
+  pending/retry 대기열을 폐기하고 새 target도 실행하지 않는다. scene version만
+  변경되어도 해제하지 않으며 Timeline reset으로 `reset_id`가 변경된 뒤에만
+  안전 정지를 해제한다.
 - 성공한 target과 재시도까지 실패한 target은 같은 `reset_id`에서 다시 실행하지
   않는다. Timeline reset 시 대기열과 완료·실패·재시도 기록을 모두 폐기한다.

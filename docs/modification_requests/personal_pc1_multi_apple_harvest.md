@@ -9,6 +9,35 @@
   `process_rgbd`, `publish_harvest_target` 및 신규 tracker 보조 함수
 - 관련 계약: `/harvest/target`, `/harvest/perception_status`
 
+## USD 멀티로봇 입력 매핑 추가
+
+GPU PC 1의 저장된 USD가 다음 두 수확 입력을 제공하도록 변경되었다.
+
+| `robot_id` | 카메라 Prim | 담당 USD 수확 영역 | 초기 관절 자세 (deg) |
+|---|---|---|---|
+| `robot_01` | `/World/base_rsd455_01` | `/World/Xform/tree` 및 `/World/Xform/apple_branch[_1/_2]` | `[0, 0, -90, 0, 90, 0]` |
+| `robot_02` | `/World/base_rsd455_02` | `/World/Xform_03/tree` 및 `/World/Xform_03/apple_branch[_1/_2]` | `[0, 0, 90, 0, -90, 0]` |
+
+개인 PC 1 인식 노드는 다음 수정을 요청한다.
+
+1. 실행 parameter로 `robot_id`를 받아 담당 RGB-D/CameraInfo 입력을 선택한다.
+2. `robot_01`은 `base_rsd455_01`, `robot_02`는 `base_rsd455_02` 카메라
+   frame/TF를 사용한다. 영상 timestamp 기준의 `world` 변환 규칙은 유지한다.
+3. 두 인식 프로세스를 분리 실행할 수 있도록 카메라별 입력 topic과 debug 출력
+   구성을 parameter화한다. 최종 robot별 ROS topic/action namespace는 공동
+   인터페이스 승인 전까지 `TBD`로 두며, 임의의 고정 이름을 계약으로 승격하지
+   않는다.
+4. 선택한 `robot_id`와 담당 tree 영역이 일치하지 않는 target은 발행하지 않고
+   `perception_status`에 진단 상태를 기록한다. `HarvestTarget.msg`에
+   `robot_id`/`tree_id` 필드를 추가하는 것은 공동 interface 승인 후 별도 작업으로
+   진행한다.
+5. reset 시 선택한 카메라의 입력 cache, track 및 target 발행 이력을 해당
+   `robot_id` 범위에서 폐기한다.
+
+이 요청은 개인 PC 1 소유의 `base_apple_detector.py`를 GPU PC 1이 직접 수정하지
+않기 위한 변경 계약이다. 구현 후 개인 PC 1에서 ROS 2 Jazzy/Fast DDS와
+`use_sim_time:=true` 조건으로 검증한다.
+
 ## 관찰된 문제
 
 현재 검출기는 한 프레임에서 모든 유효 빨간 사과 contour를 계산하지만 카메라와
