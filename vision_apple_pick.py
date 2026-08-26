@@ -149,13 +149,13 @@ ERROR_CODES = {
 CAMERA_PATH = harvest.ROBOT_PROFILE.camera_prim_path
 CAMERA_GRAPH_PATH = f"/BaseCameraRosGraph_{harvest.ROBOT_PROFILE.robot_id}"
 ROBOT_TF_GRAPH_PATH = f"/RobotTfRosGraph_{harvest.ROBOT_PROFILE.robot_id}"
-CONVEYOR_GRAPH_PATH = "/World/ConveyorTrack_01/ConveyorBeltGraph"
+CONVEYOR_GRAPH_PATH = "/World/ConveyorTrack/ConveyorBeltGraph"
 FIXED_CAMERA_RUNTIME_PATHS = (
     "/World/base_rsd455_01",
     "/World/base_rsd455_02",
     "/World/conv_rsd455_01",
     "/World/conv_rsd455_02",
-    "/World/ConveyorTrack_01/conv_rsd455",
+    "/World/ConveyorTrack/conv_rsd455",
 )
 PLACE_STATUS_TOPIC = "/conveyor/place_coordinator_status"
 PLACE_COMMAND_SERVICE = "/conveyor/place_command"
@@ -2205,6 +2205,7 @@ class MotionEngine:
             )
         failures = 0
         hold_arm_positions = None
+        grasp_contact_hold_positions = None
         grasp_settle_remaining = harvest.GRASP_SETTLE_STEPS
         reported_force_state = None
         while not self.fsm.done and self.fsm.NAMES[self.fsm.state] != stop_state:
@@ -2235,11 +2236,11 @@ class MotionEngine:
                     print(
                         "   [CLEAR_UP SKIP] RETREAT 자세가 나무 proxy "
                         f"안전영역 밖입니다: clearance {clearance:.4f} m; "
-                        "TREE_EXIT RRT로 수직·수평 이동을 함께 계획합니다.",
+                        "고정 0.45 m TREE_EXIT을 생략하고 "
+                        "NEUTRAL_TRANSFER RRT로 직접 이동합니다.",
                         flush=True,
                     )
-                    self.fsm.skip_current_state(
-                        "CLEAR_UP",
+                    self.fsm.skip_tree_exit_from_clear_pose(
                         actual,
                         actual_rotation,
                     )
@@ -2313,6 +2314,11 @@ class MotionEngine:
                         "302:COLLISION_RISK",
                         "사과 FixedJoint가 GRASP_SETTLE 중 조기 파손됐습니다.",
                     )
+                if grasp_settle_remaining == 0:
+                    # ENTER에서 발생한 접촉 기록을 GRASP 손가락 수에 섞지 않는다.
+                    # palm 접촉은 GRASP admission 조건이므로 그대로 유지한다.
+                    self.apple_contact.reset_finger_contacts()
+                    print("   [GRASP CONTACT] finger contact count reset")
                 continue
 
             self.joint_break.set_state(motion_state)
@@ -2426,17 +2432,36 @@ class MotionEngine:
                         "300:IK_FAILED",
                         "RMPflow 관절 목표가 연속으로 유효하지 않습니다.",
                     )
-            harvest.apply_gripper_target(
-                self.robot,
-                self.gripper_indices,
-                grip,
-                open_positions=self.entry_preshape,
-            )
+            if motion_state == "GRASP" and grasp_contact_hold_positions is not None:
+                harvest.apply_gripper_positions(
+                    self.robot,
+                    self.gripper_indices,
+                    grasp_contact_hold_positions,
+                )
+            else:
+                harvest.apply_gripper_target(
+                    self.robot,
+                    self.gripper_indices,
+                    grip,
+                    open_positions=self.entry_preshape,
+                )
             # advance()가 마지막 표본에서 다음 상태로 넘어가더라도 방금 실제로
             # 실행한 상태 이름으로 feedback을 보낸다. 다음 상태가 실행되기 전에
             # RETREAT 100%처럼 보이는 오표시를 방지한다.
             self.feedback(handle, motion_state, state_progress)
             self.world.step(render=not harvest.args.headless)
+            if (
+                motion_state == "GRASP"
+                and grasp_contact_hold_positions is None
+                and self.apple_contact.finger_contacted
+            ):
+                grasp_contact_hold_positions = (
+                    self._require_gripper_joint_positions().copy()
+                )
+                print(
+                    "   [GRASP CONTACT HOLD] first finger contacted; "
+                    "현재 실제 관절 자세에서 추가 폐합을 중지합니다."
+                )
             self._handle_entry_apple_contact(
                 motion_state, self._require_arm_joint_positions()
             )
