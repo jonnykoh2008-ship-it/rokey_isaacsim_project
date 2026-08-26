@@ -167,9 +167,9 @@ RMPflow gain, proxy voxel 크기, proxy 수 제한 및 영향 반경은 시뮬�
 Stem joint:
 
 - break force: 15N
-- break torque: 1Nm
+- break torque: 2Nm
 
-회전 중 1Nm을 초과해 조기 분리되는지 시험하고 필요 시 별도 승인 후 조정한다.
+회전 중 2Nm을 초과해 조기 분리되는지 시험하고 필요 시 별도 승인 후 조정한다.
 
 ## 컨베이어 배치
 

@@ -2001,7 +2001,14 @@ class MotionEngine:
                         )
                     raise MotionExecutionError(
                         "304:MOTION_TIMEOUT",
-                        "TCP가 목표를 제한 시간 안에 추종하지 못했습니다.",
+                        "TCP가 목표를 제한 시간 안에 추종하지 못했습니다: "
+                        f"state={motion_state}, "
+                        f"position={self.fsm.last_position_error_m:.4f} m, "
+                        "rotation="
+                        f"{self.fsm.last_orientation_error_deg:.2f} deg, "
+                        f"joint_broken={self.joint_break.broken}, "
+                        f"break_state={self.joint_break.break_state or 'NONE'}, "
+                        f"palm_contacted={self.apple_contact.palm_contacted}",
                     )
             else:
                 failures += 1

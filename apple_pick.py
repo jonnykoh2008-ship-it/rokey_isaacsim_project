@@ -53,8 +53,8 @@ parser.add_argument(
 parser.add_argument(
     "--break-torque-nm",
     type=float,
-    default=1.0,
-    help="torque/both 진단 모드의 break torque (기본값: 1.0 N·m)",
+    default=1.5,
+    help="torque/both 진단 모드의 break torque (기본값: 1.5 N·m)",
 )
 args, _unknown = parser.parse_known_args()
 
@@ -135,7 +135,7 @@ SCENE_01_ROOT_PATH = f"{TREE_ROOT_PATH}/scene_01"
 PLANNING_OBSTACLE_ROOT_PATH = "/World/RuntimeHarvestPlanningObstacles"
 RUNTIME_TREE_COLLIDER_ROOT_PATH = "/World/RuntimeHarvestTreeColliders"
 COLLISION_DEBUG_ROOT_PATH = "/World/RuntimeHarvestCollisionDebug"
-CONVEYOR_PATH = "/World/ConveyorTrack"
+CONVEYOR_PATH = "/World/ConveyorTrack_01"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
 FIXED_CAMERA_ROOT_PATHS = ["/World/base_rsd455"]
 
@@ -155,7 +155,7 @@ INITIAL_ARM_JOINTS_RAD = np.deg2rad(INITIAL_ARM_JOINTS_DEG)
 # 사과 분리와 이동 조건
 # ══════════════════════════════════════════════════════════════
 BREAK_FORCE_N = 15.0
-BREAK_TORQUE_NM = 1.0
+BREAK_TORQUE_NM = 1.5
 
 # palm collision mesh 앞면(+Y 50.8 mm)과 명목 사과 반지름(40 mm)을 합친 포위
 # 파지 중심이다. 접촉 여유는 현재 0 mm이므로 실효 offset은 90.8 mm이며,
@@ -252,8 +252,8 @@ SMALL_BRANCH_CLEARANCE_M = 0.000
 # 작은 가지는 40 mm voxel 형상 반경 20 mm만 사용하며 추가 clearance는 없다.
 # 몸통·큰 가지에는 10 mm planning clearance를 적용한다.
 BRANCH_PROXY_VOXEL_M = 0.040
-UNIFIED_TREE_STRUCTURE_NAME = "structure_004_7"
-# structure_004_7 시험용 임시 분류값. 연결 성분의 PCA 추정 반경이 이 값
+UNIFIED_TREE_STRUCTURE_NAMES = ("structure_004_7", "summertree")
+# 단일 구조 mesh 시험용 임시 분류값. 연결 성분의 PCA 추정 반경이 이 값
 # 이상이면 몸통/큰 가지 PhysX proxy를 만들고, 더 가는 가지는 planning-only로
 # 유지한다. 실제 접촉 시험 후 asset requirement의 TBD 값으로 확정해야 한다.
 TREE_PHYSX_MIN_BRANCH_RADIUS_M = 0.010
@@ -313,13 +313,13 @@ ARM_DRIVE_DAMPING = 1.0e4
 ARM_DRIVE_MAX_FORCE = 2.0e3
 GRIPPER_DRIVE_STIFFNESS = 50.0
 GRIPPER_DRIVE_DAMPING = 5.0
-# 11개 손가락 관절의 동시 접촉 토크가 stem의 1 N·m 한계에 집중되지 않도록
+# 11개 손가락 관절의 동시 접촉 토크가 stem의 1.5 N·m 한계에 집중되지 않도록
 # GRASP는 저토크로 접촉하고, TWIST/PULL과 운반 중에는 사과가 미끄러지지
 # 않도록 유지 토크를 높인다. 실제 파지 시험 후 재조정할 임시값이다.
 GRIPPER_GRASP_MAX_FORCE = 0.08
 GRIPPER_HOLD_MAX_FORCE = 0.50
 GRIPPER_DRIVE_MAX_FORCE = GRIPPER_GRASP_MAX_FORCE
-# entry pre-shape는 사과에 닿기 전 자세라 stem의 1 N·m 제한과 무관하다.
+# entry pre-shape는 사과에 닿기 전 자세라 stem의 1.5 N·m 제한과 무관하다.
 # GRASP용 저토크로는 팔이 가속하는 동안 손가락이 명령 자세를 유지하지 못해
 # 정적으로 측정한 swept clearance와 실제 진입 자세가 달라질 수 있다.
 GRIPPER_ENTRY_MAX_FORCE = GRIPPER_HOLD_MAX_FORCE
@@ -852,6 +852,8 @@ class RobotTreeContactMonitor:
     def _is_tree_path(path):
         if _is_scene_01_path(path):
             return False
+        if _is_tree_visual_only_path(path):
+            return False
         lowered = path.lower()
         return (
             path.startswith(TREE_ROOT_PATH)
@@ -1124,9 +1126,34 @@ def set_gripper_drive_max_force(stage, max_force):
 
 
 def _is_unified_tree_structure_path(path):
-    """GLTF importer의 점(.)→밑줄 이름 정규화를 모두 허용한다."""
+    """지원하는 기존/신규 단일 나무 구조 mesh인지 판별한다."""
     normalized = str(path).lower().replace(".", "_")
-    return UNIFIED_TREE_STRUCTURE_NAME in normalized
+    prim_name = normalized.rsplit("/", 1)[-1]
+    return (
+        UNIFIED_TREE_STRUCTURE_NAMES[0] in normalized
+        or prim_name == UNIFIED_TREE_STRUCTURE_NAMES[1]
+        or prim_name.startswith(f"{UNIFIED_TREE_STRUCTURE_NAMES[1]}_")
+    )
+
+
+def _is_tree_foliage_path(path):
+    """구·신규 자산에서 시각 전용 잎/열매 crown을 판별한다."""
+    normalized = str(path).lower().replace(".", "_")
+    return (
+        "/foli/" in normalized
+        or "/foliage" in normalized
+        or "summertreecrown" in normalized
+    )
+
+
+def _is_tree_ground_path(path):
+    """나무 FBX에 함께 포함된 지면 mesh를 나무 구조에서 제외한다."""
+    normalized = str(path).lower().replace(".", "_")
+    return "summerground" in normalized
+
+
+def _is_tree_visual_only_path(path):
+    return _is_tree_foliage_path(path) or _is_tree_ground_path(path)
 
 
 def _is_scene_01_path(path):
@@ -1237,7 +1264,7 @@ def _rotation_from_z_axis(direction):
 
 
 def configure_unified_tree_physx_colliders(stage):
-    """structure_004_7의 큰 성분만 정적 PhysX capsule로 생성한다."""
+    """단일 나무 구조 mesh의 큰 성분만 정적 PhysX capsule로 생성한다."""
     meshes = _unified_tree_structure_meshes(stage)
     if not meshes:
         return 0, 0, 0
@@ -1286,14 +1313,14 @@ def configure_unified_tree_physx_colliders(stage):
 
 
 def disable_leaf_colliders(stage):
-    """잎 visual은 유지하고 authored PhysX collision만 비활성화한다."""
+    """잎·열매·동봉 지면 visual은 유지하고 PhysX collision만 비활성화한다."""
     disabled_paths = set()
     for root_path in (TREE_ROOT_PATH, *BRANCH_BODY_PATHS):
         root = require_prim(stage, root_path)
         for prim in Usd.PrimRange(root):
             if _is_scene_01_path(prim.GetPath()):
                 continue
-            if "/foli/" not in str(prim.GetPath()).lower():
+            if not _is_tree_visual_only_path(prim.GetPath()):
                 continue
             if prim.HasAPI(UsdPhysics.CollisionAPI):
                 UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
@@ -1303,7 +1330,9 @@ def disable_leaf_colliders(stage):
 
 def disable_scene_01_colliders(stage):
     """scene_01은 렌더링만 유지하고 authored PhysX collision을 끈다."""
-    root = require_prim(stage, SCENE_01_ROOT_PATH)
+    root = stage.GetPrimAtPath(SCENE_01_ROOT_PATH)
+    if not root.IsValid():
+        return 0
     disabled_paths = set()
     for prim in Usd.PrimRange(root):
         if not prim.HasAPI(UsdPhysics.CollisionAPI):
@@ -1743,12 +1772,10 @@ def approach_direction_candidates(stage, robot_position, apple_position):
     minimums = []
     maximums = []
     for prim in Usd.PrimRange(tree_root):
-        path_text = str(prim.GetPath()).lower()
         if (
             not prim.IsA(UsdGeom.Mesh)
             or _is_scene_01_path(prim.GetPath())
-            or "/foli/" in path_text
-            or "/foliage" in path_text
+            or _is_tree_visual_only_path(prim.GetPath())
         ):
             continue
         box = bbox_cache.ComputeWorldBound(prim).ComputeAlignedBox()
@@ -2135,6 +2162,8 @@ class AppleHarvestFSM:
         self.state = 0
         self.frame = 0
         self.settle_frame = 0
+        self.last_position_error_m = 0.0
+        self.last_orientation_error_deg = 0.0
         self.start_position = np.asarray(current_tcp, dtype=float)
         self.start_quat = rot_matrix_to_quat(current_palm_rotation)
         self._print_state()
@@ -2189,6 +2218,8 @@ class AppleHarvestFSM:
 
         position_error = float(np.linalg.norm(goal_position - actual_position))
         orientation_error = rotation_error_deg(actual_rotation, goal_rotation)
+        self.last_position_error_m = position_error
+        self.last_orientation_error_deg = orientation_error
         if (
             position_error > TARGET_POSITION_TOLERANCE_M
             or orientation_error > TARGET_ORIENTATION_TOLERANCE_DEG
@@ -2456,7 +2487,7 @@ def _visual_cuboid(stage, path, position, size):
 
 
 def _collect_tree_planning_geometry(stage, xform_cache):
-    """기존 분리 asset과 structure_004_7 단일 mesh를 같은 형식으로 수집한다."""
+    """기존 분리 asset과 지원 단일 구조 mesh를 같은 형식으로 수집한다."""
     branch_points = []
     trunk_meshes = []
     unified_meshes = []
@@ -2471,7 +2502,7 @@ def _collect_tree_planning_geometry(stage, xform_cache):
             if _is_unified_tree_structure_path(prim.GetPath()):
                 branch_points.append(_mesh_world_points(prim, xform_cache))
                 unified_meshes.append(prim)
-            elif "/foli/" in path_text or "/foliage" in path_text:
+            elif _is_tree_visual_only_path(prim.GetPath()):
                 continue
             elif "/trunk/" in path_text:
                 trunk_meshes.append(prim)

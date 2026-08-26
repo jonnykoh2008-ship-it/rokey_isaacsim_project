@@ -1,0 +1,38 @@
+# Blender 3.5.0 MTL File: 'summerTree.blend'
+# www.blender.org
+
+newmtl summerGround
+Ka 1.000000 1.000000 1.000000
+Ks 0.500000 0.500000 0.500000
+Ke 0.000000 0.000000 0.000000
+Ni 1.450000
+d 1.000000
+illum 2
+map_Kd textures4k/summerGround_BaseColor.png
+map_Ns textures4k/summerGround_Roughness.png
+map_refl textures4k/summerGround_Metallic.png
+map_Bump -bm 1.000000 textures4k/summerGround_Normal.png
+
+newmtl summerTree
+Ka 1.000000 1.000000 1.000000
+Ks 0.500000 0.500000 0.500000
+Ke 0.000000 0.000000 0.000000
+Ni 1.450000
+d 1.000000
+illum 2
+map_Kd textures4k/summerTree_BaseColor.png
+map_Ns textures4k/summerTree_Roughness.png
+map_refl textures4k/summerTree_Metallic.png
+map_Bump -bm 1.000000 textures4k/summerTree_Normal.png
+
+newmtl summerTreeCrown
+Ka 1.000000 1.000000 1.000000
+Ks 0.500000 0.500000 0.500000
+Ni 1.450000
+illum 2
+map_Kd textures4k/summerTreeCrown_BaseColorAlpha.png
+map_Ns textures4k/summerTreeCrown_Roughness.png
+map_refl textures4k/summerTreeCrown_Metallic.png
+map_Ke textures4k/summerTreeCrown_Emission.png
+map_d textures4k/summerTreeCrown_BaseColorAlpha.png
+map_Bump -bm 1.000000 textures4k/summerTreeCrown_Normal.png
