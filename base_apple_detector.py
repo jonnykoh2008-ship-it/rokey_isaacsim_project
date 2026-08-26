@@ -208,7 +208,10 @@ class BaseAppleDetector(Node):
         self.target_tracks = {}
         self.tracking_initialized = False
 
-        self.tf_buffer = Buffer()
+        # node clock을 연결해야 /clock이 과거로 점프할 때 tf2_ros.Buffer가
+        # 이전 Isaac Sim 실행의 transform을 자동으로 폐기한다. Buffer()만
+        # 사용하면 system clock을 감시하므로 simulation restart를 놓친다.
+        self.tf_buffer = Buffer(node=self)
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.create_subscription(
@@ -258,6 +261,15 @@ class BaseAppleDetector(Node):
         self.target_tracks.clear()
         self.tracking_initialized = False
 
+    def clear_generation_caches(self):
+        """이전 Isaac Sim 실행에서 생성된 영상·TF·ID 상태를 폐기한다."""
+        self.latest_rgb = None
+        self.latest_depth = None
+        self.last_processed_rgb_stamp = -1
+        self.last_tf_warning_ns = -1
+        self.tf_buffer.clear()
+        self.reset_tracking()
+
     def simulation_state_callback(self, message: SimulationState):
         """최신 Timeline 상태를 보관하고 reset 세대가 바뀌면 입력 캐시를 버린다."""
         previous_reset_id = (
@@ -265,13 +277,10 @@ class BaseAppleDetector(Node):
         )
         self.simulation_state = message
         if previous_reset_id is not None and previous_reset_id != message.reset_id:
-            self.latest_rgb = None
-            self.latest_depth = None
-            self.last_processed_rgb_stamp = -1
-            self.reset_tracking()
+            self.clear_generation_caches()
             self.get_logger().info(
                 f"simulation reset_id 변경: {previous_reset_id} -> "
-                f"{message.reset_id}; RGB-D 캐시와 사과 ID track 폐기"
+                f"{message.reset_id}; RGB-D, TF와 사과 ID track 폐기"
             )
 
     def camera_info_callback(self, message: CameraInfo):
@@ -297,6 +306,18 @@ class BaseAppleDetector(Node):
 
         rgb_stamp = stamp_to_nanoseconds(self.latest_rgb.header.stamp)
         depth_stamp = stamp_to_nanoseconds(self.latest_depth.header.stamp)
+        if (
+            self.last_processed_rgb_stamp >= 0
+            and rgb_stamp < self.last_processed_rgb_stamp
+        ):
+            previous_stamp = self.last_processed_rgb_stamp
+            self.clear_generation_caches()
+            self.get_logger().warning(
+                "RGB simulation timestamp 역행 감지: "
+                f"{previous_stamp / 1e9:.6f}s -> {rgb_stamp / 1e9:.6f}s; "
+                "이전 실행의 RGB-D, TF와 사과 ID track을 폐기했습니다."
+            )
+            return
         if rgb_stamp == self.last_processed_rgb_stamp:
             return
         if abs(rgb_stamp - depth_stamp) > self.maximum_sync_error_ns:
