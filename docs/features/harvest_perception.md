@@ -55,24 +55,25 @@ threshold 및 재검출 정책은 통합 시험 전까지 `TBD`다. 조건을 �
 
 - 굵은 가지: 로봇 전체 링크의 회피 대상
 - 작은 가지: 그리퍼와 손목의 회피 대상
-- 잎: PhysX collision과 planning obstacle에서 모두 제외하며, 시각적 가림
-  (occlusion)과 confidence 판단에만 사용
+- 잎: visual-only로 유지하고 PhysX collision과 planning obstacle에서 모두
+  제외한다. `leaf occlusion` 모델링·보정 및 잎 가림 기반 confidence 판단은
+  사용하지 않는다.
 - v2.0 MVP에서는 GPU PC 1이 ground-truth collider 또는 proxy로 planning scene을
   생성한다. 개인 PC 1은 장애물의 최종 판정을 하지 않는다.
 - 실무 비전 단계에서 개인 PC 1이 굵은 가지 segmentation 또는 depth 기반
   obstacle 후보를 계산할 수 있지만, GPU PC 1이 수신 후 `world` 좌표·세대·안전
   거리를 검증하고 planner 입력으로 채택한다. 해당 보조 obstacle 메시지는
   `TBD`다.
-- 잎은 PhysX collision과 planning obstacle에서 모두 제외한다. 개인 PC 1은 잎을
-  occlusion/confidence 판단에만 사용하고, GPU PC 1 planner는 잎을 충돌 형상으로
-  받지 않는다.
+- 잎은 인식·계획·물리 안전 판단의 입력으로 사용하지 않는다. 개인 PC 1은 잎
+  가림을 보정하거나 잎 전용 confidence를 계산하지 않으며, GPU PC 1 planner는
+  잎을 충돌 형상으로 받지 않는다.
 - 개인 PC 1은 접근 방향 주변의 관측 신뢰도가 낮거나 depth가 부족한 후보를
   발행하지 않는다. free-space의 최종 판정과 대체 접근 탐색은 GPU PC 1의
   planner가 수행한다.
 
 작은 가지의 물리 collision 사용 여부는 perception 결과를 planning obstacle에
-포함할지와 독립적으로 결정한다. 잎은 PhysX와 planning obstacle 양쪽에서
-제외한다. MVP의 몸통·가지 obstacle은 USD visual mesh에서 생성한 ground-truth
+포함할지와 독립적으로 결정한다. 잎은 PhysX, planning obstacle 및 leaf occlusion
+처리에서 제외한다. MVP의 몸통·가지 obstacle은 USD visual mesh에서 생성한 ground-truth
 proxy를 사용하고, D455 obstacle point cloud 전환 시에도 동일한 안전거리와
 실패 규약을 유지한다.
 

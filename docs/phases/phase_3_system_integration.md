@@ -1,4 +1,4 @@
-# 3차 개발: 멀티로봇·레일 및 시스템 통합
+# 3차 개발: 멀티로봇·시스템 통합
 
 ## 목표
 
@@ -21,6 +21,11 @@ robot_02 ↔ tree_02 ↔ conveyor place station 02
   후속 품질 검사다.
 - 로봇 간 협조 planning은 수확 구간의 기본 요구사항이 아니다. 다만 전체
   Isaac Sim PhysX safety monitor는 두 로봇과 공용 설비를 모두 감시한다.
+- 레일은 로봇을 장착하는 고정 마운트로만 사용한다. 각 `rail_joint`는 USD에
+  저장된 초기 위치를 유지하며, 이번 단계에는 레일 이동 명령·레일 경로 계획·
+  동적 레일 TF를 구현하지 않는다.
+- 잎은 visual-only로 유지한다. `leaf occlusion` 모델링·보정과 잎 가림에 따른
+  별도 confidence 처리는 이번 단계에서 제외한다.
 
 현재 저장된 USD의 구체적인 자산 매핑은 다음과 같다.
 
@@ -34,7 +39,7 @@ robot_02 ↔ tree_02 ↔ conveyor place station 02
 각 로봇의 Articulation root는 해당 `m0617_rail/root_joint`이고, M0617 본체는
 본체 Prim 내부 `FixedJoint`로 rail mount에 연결된다.
 
-## 배치 및 레일
+## 배치 및 고정 마운트
 
 - `robot_01`과 `robot_02`를 공용 컨베이어의 서로 반대편에 배치한다.
 - 로봇별 최상위 ROS namespace는 다음으로 확정한다.
@@ -48,10 +53,10 @@ robot_02 ↔ tree_02 ↔ conveyor place station 02
   `robot_01/base_link`, `robot_02/base_link`처럼 robot prefix로 구분한다.
 - 각 로봇의 base, camera, gripper 및 관절 상태는 고유한 robot namespace와
   TF frame을 사용한다.
-- 레일을 사용하는 경우 각 로봇은 자신의 레일/base 이동 상태를 갖는다.
-  동적 TF는 로봇별로 분리된 `odom → base_link` 체계로 확장한다.
-- 레일 이동은 담당 나무의 작업영역 안에서만 수행한다. 다른 나무로 이동해
-  작업을 넘기는 cross-tree reassignment는 사용하지 않는다.
+- 각 `m0617_rail`은 고정 마운트로 취급하고 `rail_joint`를 authored initial
+  position에 고정한다. 따라서 Phase 3에는 rail trajectory, rail limit tuning,
+  rail command 및 동적 `odom → base_link` 변환이 없다.
+- 다른 나무로 이동해 작업을 넘기는 cross-tree reassignment도 사용하지 않는다.
 - 하나의 Isaac Sim이 두 로봇, 두 나무, 컨베이어, 센서, `/clock` 및 PhysX를
   단일 권위로 관리한다.
 
@@ -70,8 +75,8 @@ robot_02 ↔ tree_02 ↔ conveyor place station 02
 
 ### 컨베이어 투입 조정
 
-수확은 병렬로 허용하되, 컨베이어 투입은 `Conveyor Place Coordinator`를 통해
-조정한다.
+수확은 병렬로 허용하되, 컨베이어 투입은 GPU PC 1의 `System Coordinator` 안에
+있는 `Conveyor Place Coordinator` 기능을 통해 조정한다.
 
 ```text
 HARVEST_COMPLETE
@@ -101,7 +106,7 @@ Isaac Sim world
   ├─ robot_01 controller / planner / RobotMotion / safety
   ├─ robot_02 controller / planner / RobotMotion / safety
   ├─ global planning-scene publisher
-  ├─ Conveyor Place Coordinator
+  ├─ System Coordinator (status / Place lock / reset)
   └─ global safety monitor
 ```
 
@@ -109,8 +114,10 @@ Isaac Sim world
   실행한다.
 - 각 planner는 담당 로봇의 현재 관절 상태와 담당 나무의 obstacle proxy를
   사용한다.
-- GPU PC 1의 Fleet Supervisor는 작업 재할당보다 로봇별 실행 상태, Place
-  lock, 컨베이어 투입 순서 및 전체 reset을 조정하는 역할을 우선한다.
+- Phase 3에는 작업 재할당, fleet-level route planning, rail scheduling을
+  수행하는 `Fleet Supervisor`를 두지 않는다.
+- `System Coordinator`는 로봇별 실행 상태 집계, Place lock, 컨베이어 투입
+  순서, 전체 reset 및 공용 설비 안전 인터록만 조정한다.
 - 로봇별 안전 정지와 전체 안전 정지를 구분한다. 한 로봇의 수확 실패는 해당
   로봇을 정지시키고 다른 로봇은 계속할 수 있지만, 컨베이어 jam, world reset,
   `/clock` 장애 또는 전체 PhysX 안전 문제는 두 로봇을 함께 정지시킨다.
@@ -119,7 +126,7 @@ Isaac Sim world
 
 - **GPU PC 1**: 두 로봇·두 나무·공용 컨베이어를 포함한 Isaac Sim, 단일
   `/clock`, robot별 TF와 센서, planning scene, Lula RRT/trajectory/RMPflow,
-  RobotMotion 실행, Place Coordinator, PhysX safety monitor 및 계획
+  RobotMotion 실행, System Coordinator의 Place/상태/reset 조정, PhysX safety monitor 및 계획
   visualization을 담당한다.
 - **개인 PC 1**: 로봇별 RGB-D 영상을 수신해 담당 나무의 사과 target을 만들고
   robot별 target namespace로 발행한다. 로봇별 계획 결과는 RViz에서 구분해
@@ -136,7 +143,7 @@ Isaac Sim world
 
 ```text
 개인 PC 2 운영 화면
-  → GPU PC 1 Fleet Supervisor
+  → GPU PC 1 System Coordinator
   → robot_01/robot_02 controller 또는 Place Coordinator
 ```
 
@@ -198,7 +205,7 @@ Isaac Sim world
 
 | 구분 | TBD 항목 | 확정 기준 또는 담당 |
 |---|---|---|
-| 배치 | 두 robot/tree의 정확한 world pose, 컨베이어 양쪽 Place station pose, 레일 사용 여부와 rail limit | GPU PC 1 자산·배치 시험 |
+| 배치 | 두 robot/tree의 정확한 world pose, 컨베이어 양쪽 Place station pose, 고정 rail mount의 authored initial pose 확인 | GPU PC 1 자산·배치 시험 |
 | ID | `robot_id`, `tree_id`, `apple_id`, `target_id`/`task_id`의 필드와 전역 문자열 규칙 | 네 PC 공동 interface 승인 |
 | ROS | leaf topic/action/service 이름, QoS, `PlanningScene` 세부 표현 및 namespace remap | `ros2_interfaces.md`와 연동해 확정. root namespace `/robot_01`, `/robot_02`와 global/shared topic 경계는 확정 |
 | Target | 카메라별 target 입력 방식과 담당 나무 판정, stale age, confidence/depth/TF threshold | 개인 PC 1·GPU PC 1 통합 시험 |
@@ -207,7 +214,7 @@ Isaac Sim world
 | 병렬성 | 초기 단일 Place lock 유지 여부와 좌우 Place 병렬 허용 조건 | 충돌·사과 간격 시험 후 결정 |
 | 컨베이어 | 최소 투입 시간 간격, 최소 중심 간격, buffer 용량, jam/추월 처리 및 checkpoint debounce | GPU PC 1·GPU PC 2 통합 시험 |
 | 장애 격리 | robot별 fault가 다른 로봇에 미치는 영향, conveyor fault의 전체 정지 조건 | safety review 후 확정 |
-| 관제 | Fleet Supervisor의 high-level command, operator 권한, 알람 acknowledgement 및 이력 보존 | 개인 PC 2·GPU PC 1 운영 설계 |
+| 관제 | System Coordinator의 high-level command, operator 권한, 알람 acknowledgement 및 이력 보존 | 개인 PC 2·GPU PC 1 운영 설계 |
 | 성능 | robot별 수확시간 P95, Place 대기시간, 전체 throughput, target-to-plan 및 품질 latency 목표 | 통합 측정 후 확정 |
 | 복구 | ID 유실, 네트워크 단절, Place 실패, jam, reset 이후 재개/폐기 정책 | 연속 운용 시험 후 확정 |
 | 완료 기준 | 멀티로봇 연속 운용 시간, 허용 message loss, 충돌 0건 및 품질 연결 성공률 | 통합 검증 결과와 사용자 승인 |

@@ -62,6 +62,11 @@ parser.add_argument(
     default="robot_01",
     help="수확을 실행할 USD 로봇 프로파일 (기본값: robot_01)",
 )
+parser.add_argument(
+    "--show-colliders",
+    action="store_true",
+    help="로봇·나무 collision proxy를 화면에 표시 (기본값: 숨김)",
+)
 args, _unknown = parser.parse_known_args()
 
 simulation_app = SimulationApp(
@@ -1702,7 +1707,11 @@ def configure_unified_tree_physx_colliders(stage):
         capsule.CreateAxisAttr().Set(UsdGeom.Tokens.z)
         capsule.CreateRadiusAttr().Set(float(radius))
         capsule.CreateHeightAttr().Set(float(height))
-        capsule.CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+        capsule.CreateVisibilityAttr().Set(
+            UsdGeom.Tokens.inherited
+            if args.show_colliders
+            else UsdGeom.Tokens.invisible
+        )
         xform = UsdGeom.Xformable(capsule.GetPrim())
         xform.AddTranslateOp().Set(Gf.Vec3d(*(float(value) for value in center)))
         quaternion = _rotation_from_z_axis(axis)
@@ -2070,6 +2079,39 @@ def compute_direct_neutral_transfer(tree_clear_position, conveyor_outside_high):
     return neutral
 
 
+def select_conveyor_surface_layer(surface_candidates):
+    """대표 운반면과 같은 높이인 Mesh만 합쳐 상판 경계를 반환한다.
+
+    ``surface_candidates`` 항목은 ``(score, prim, box, mesh_size)``이다.
+    가장 넓고 얇은 대표 Mesh가 실제 운반면의 Z를 결정한다. 같은 높이에
+    분할된 Mesh는 X/Y 폭에 합치되, 상단 프레임처럼 더 높은 Mesh는 제외한다.
+    """
+    if not surface_candidates:
+        raise ValueError("컨베이어 surface candidate가 비어 있습니다.")
+
+    anchor = max(surface_candidates, key=lambda item: item[0])
+    anchor_minimum = np.array(anchor[2].GetMin(), dtype=float)
+    anchor_maximum = np.array(anchor[2].GetMax(), dtype=float)
+    anchor_thickness = max(float(anchor[3][2]), 1e-4)
+    # 같은 상판으로 authoring된 분할 Mesh의 미세한 bbox 편차만 허용한다.
+    # 허용치는 대표 Mesh 두께에 비례하되 상·하 프레임까지 합쳐지지 않게 제한한다.
+    layer_tolerance = max(1e-4, min(0.01, 0.1 * anchor_thickness))
+    layer = [
+        item
+        for item in surface_candidates
+        if abs(float(item[2].GetMax()[2]) - anchor_maximum[2])
+        <= layer_tolerance
+    ]
+
+    layer_minima = np.array([item[2].GetMin() for item in layer], dtype=float)
+    layer_maxima = np.array([item[2].GetMax() for item in layer], dtype=float)
+    minimum = anchor_minimum.copy()
+    maximum = anchor_maximum.copy()
+    minimum[:2] = np.min(layer_minima[:, :2], axis=0)
+    maximum[:2] = np.max(layer_maxima[:, :2], axis=0)
+    return minimum, maximum, layer, anchor, layer_tolerance
+
+
 def compute_conveyor_start(stage, robot_position, apple_size):
     """컨베이어 시작점과 그 바깥쪽의 안전 접근점을 계산한다.
 
@@ -2113,25 +2155,56 @@ def compute_conveyor_start(stage, robot_position, apple_size):
             if "belt" in item[1].GetName().lower()
         ]
         if named_belts:
-            # 폭 변경 자산은 상판이 여러 belt Mesh로 나뉠 수 있다. 하나만 고르면
-            # 부분 폭을 전체 폭으로 오인하므로 모든 belt Mesh의 월드 경계를 합친다.
-            belt_minima = np.array(
-                [item[2].GetMin() for item in named_belts], dtype=float
+            # 폭 변경 자산은 상판이 여러 belt Mesh로 나뉠 수 있다. 실제 운반면과
+            # 같은 높이인 Mesh만 X/Y로 합쳐 프레임 상단을 상판으로 오인하지 않는다.
+            (
+                minimum,
+                maximum,
+                selected_layer,
+                anchor,
+                layer_tolerance,
+            ) = select_conveyor_surface_layer(named_belts)
+            surface_path = ", ".join(
+                str(item[1].GetPath()) for item in selected_layer
             )
-            belt_maxima = np.array(
-                [item[2].GetMax() for item in named_belts], dtype=float
+            rejected_high = [
+                item
+                for item in named_belts
+                if float(item[2].GetMax()[2])
+                > float(maximum[2]) + layer_tolerance
+            ]
+            if rejected_high:
+                rejected_text = ", ".join(
+                    f"{item[1].GetPath()}(top={float(item[2].GetMax()[2]):.4f})"
+                    for item in rejected_high
+                )
+                print(
+                    "   Conveyor     higher non-surface belt Mesh excluded: "
+                    f"{rejected_text}"
+                )
+            print(
+                "   Conveyor     surface anchor "
+                f"{anchor[1].GetPath()}, top {float(maximum[2]):.4f} m, "
+                f"layer tolerance {layer_tolerance:.4f} m"
             )
-            minimum = np.min(belt_minima, axis=0)
-            maximum = np.max(belt_maxima, axis=0)
-            surface_path = ", ".join(str(item[1].GetPath()) for item in named_belts)
         else:
-            _score, surface_prim, box, _surface_size = max(
+            (
+                minimum,
+                maximum,
+                selected_layer,
+                anchor,
+                layer_tolerance,
+            ) = select_conveyor_surface_layer(
                 surface_candidates,
-                key=lambda item: item[0],
             )
-            minimum = np.array(box.GetMin(), dtype=float)
-            maximum = np.array(box.GetMax(), dtype=float)
-            surface_path = str(surface_prim.GetPath())
+            surface_path = ", ".join(
+                str(item[1].GetPath()) for item in selected_layer
+            )
+            print(
+                "   Conveyor     surface anchor "
+                f"{anchor[1].GetPath()}, top {float(maximum[2]):.4f} m, "
+                f"layer tolerance {layer_tolerance:.4f} m"
+            )
     else:
         # 자산이 하나의 결합 Mesh인 경우에만 전체 경계를 최후 수단으로 쓴다.
         minimum = np.array(root_box.GetMin(), dtype=float)
@@ -3510,15 +3583,20 @@ class CollisionAwareMotion:
         return instancer
 
     def _initialize_collision_sphere_visualization(self, joint_positions):
-        """나무와 현재 로봇 collision sphere를 Stage에 지속 표시한다."""
+        """나무와 현재 로봇 collision sphere를 선택적으로 Stage에 표시한다."""
         root = self.stage.GetPrimAtPath(
             COLLISION_SPHERE_VISUALIZATION_ROOT_PATH
         )
         if root.IsValid():
             self.stage.RemovePrim(COLLISION_SPHERE_VISUALIZATION_ROOT_PATH)
-        UsdGeom.Xform.Define(
+        visualization_root = UsdGeom.Xform.Define(
             self.stage,
             COLLISION_SPHERE_VISUALIZATION_ROOT_PATH,
+        )
+        visualization_root.CreateVisibilityAttr().Set(
+            UsdGeom.Tokens.inherited
+            if args.show_colliders
+            else UsdGeom.Tokens.invisible
         )
 
         tree_radii = np.full(
@@ -3550,7 +3628,7 @@ class CollisionAwareMotion:
             )
             robot_count = len(centers)
         print(
-            "   Collision spheres visible: "
+            f"   Collision spheres {'visible' if args.show_colliders else 'hidden'}: "
             f"robot {robot_count}, tree {len(self.full_branch_centers)}, "
             f"root={COLLISION_SPHERE_VISUALIZATION_ROOT_PATH}"
         )
@@ -3771,6 +3849,8 @@ class CollisionAwareMotion:
     def show_collision_debug(self, collision):
         """가장 가까운 robot sphere와 나무 proxy를 Stage에 시각화한다."""
         self.clear_collision_debug()
+        if not args.show_colliders:
+            return
         UsdGeom.Xform.Define(self.stage, COLLISION_DEBUG_ROOT_PATH)
         robot_center = collision.get("closest_robot_center")
         obstacle_center = collision.get("closest_obstacle_center")

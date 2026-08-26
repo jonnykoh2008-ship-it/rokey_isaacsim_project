@@ -24,8 +24,9 @@ GPU PC 1 실행 코드는 `--robot-id`로 한 수확 프로파일을 선택한�
 
 각 로봇은 `m0617_rail/root_joint`를 Articulation root로 사용한다. M0617 본체는
 각 본체 Prim의 `FixedJoint`로 rail mount에 연결되며, `rail_joint`는 저장된 초기
-위치를 유지한다. 직접 M0617 Prim 아래의 `root_joint`는 별도 Articulation root로
-사용하지 않는다.
+위치를 유지하는 고정 마운트로 사용한다. Phase 3에는 레일 이동 명령·레일 경로
+계획·동적 레일 TF를 구현하지 않는다. 직접 M0617 Prim 아래의 `root_joint`는
+별도 Articulation root로 사용하지 않는다.
 
 사과의 `PhysicsFixedJoint`는 각 `apple_branch_xx` 내부에서
 `branchbody → applebody`를 연결한다. 수확 코드는 Stage의 joint relationship을
@@ -74,7 +75,8 @@ singularity 기준과 joint step 제한은 시뮬레이션 시험 후 튜닝한�
 그리퍼 닫기·비틀기·당기기는 접촉을 제어하는 **정밀 동작**으로 별도 실행한다.
 
 - GPU PC 1은 reset마다 전체 몸통 box와 가지 sphere planning proxy snapshot을
-  `world` 좌표로 발행한다. 잎과 목표 사과는 정적 snapshot에서 제외한다.
+  `world` 좌표로 발행한다. 잎과 목표 사과는 정적 snapshot에서 제외하며,
+  leaf occlusion은 계획 입력이나 인식 보정에 사용하지 않는다.
 - GPU PC 1은 현재 관절 configuration과 target/pre-grasp pose로 Lula RRT의
   전역 c-space 경로를 계획한다. RRT는 정적 snapshot에서 실행하며 seed,
   step size, iteration limit 및 sampling limit은 로봇 시험 후 `TBD`로

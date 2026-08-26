@@ -25,6 +25,7 @@ def load_geometry_helpers():
         elif isinstance(node, ast.FunctionDef) and node.name in {
             "compute_conveyor_target_geometry",
             "compute_direct_neutral_transfer",
+            "select_conveyor_surface_layer",
         }:
             nodes.append(node)
     namespace = {"np": np}
@@ -32,10 +33,31 @@ def load_geometry_helpers():
     return (
         namespace["compute_conveyor_target_geometry"],
         namespace["compute_direct_neutral_transfer"],
+        namespace["select_conveyor_surface_layer"],
     )
 
 
-compute_geometry, compute_neutral_transfer = load_geometry_helpers()
+compute_geometry, compute_neutral_transfer, select_surface_layer = (
+    load_geometry_helpers()
+)
+
+
+class FakeBox:
+    def __init__(self, minimum, maximum):
+        self.minimum = np.asarray(minimum, dtype=float)
+        self.maximum = np.asarray(maximum, dtype=float)
+
+    def GetMin(self):
+        return self.minimum
+
+    def GetMax(self):
+        return self.maximum
+
+
+def surface_candidate(score, minimum, maximum):
+    box = FakeBox(minimum, maximum)
+    size = box.maximum - box.minimum
+    return score, object(), box, size
 
 
 def test_wider_belt_uses_nearest_valid_edge_instead_of_center_band():
@@ -84,3 +106,35 @@ def test_tree_clear_pose_bypasses_fixed_exit_offset():
     np.testing.assert_allclose(neutral[:2], [1.09425, 0.0351])
     assert neutral[2] == pytest.approx(1.3558)
     assert np.linalg.norm(neutral[:2] - retreat[:2]) < 0.45
+
+
+def test_surface_layer_keeps_changed_width_without_using_high_frame_plane():
+    left_surface = surface_candidate(
+        100.0,
+        [-0.75, -0.40, 0.50],
+        [0.75, 0.00, 0.56],
+    )
+    right_surface = surface_candidate(
+        95.0,
+        [-0.75, 0.00, 0.50],
+        [0.75, 0.40, 0.56],
+    )
+    high_frame = surface_candidate(
+        20.0,
+        [-0.90, -0.50, 0.45],
+        [0.90, 0.50, 0.92],
+    )
+
+    minimum, maximum, layer, anchor, _tolerance = select_surface_layer(
+        [left_surface, right_surface, high_frame]
+    )
+
+    np.testing.assert_allclose(minimum, [-0.75, -0.40, 0.50])
+    np.testing.assert_allclose(maximum, [0.75, 0.40, 0.56])
+    assert layer == [left_surface, right_surface]
+    assert anchor is left_surface
+
+
+def test_surface_layer_rejects_empty_candidates():
+    with pytest.raises(ValueError, match="비어"):
+        select_surface_layer([])
