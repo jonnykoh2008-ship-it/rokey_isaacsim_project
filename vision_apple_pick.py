@@ -68,7 +68,7 @@ from appleproj_interfaces.msg import (
     PlanningScene,
     SimulationState,
 )
-from appleproj_interfaces.srv import GetPlanningScene, PlaceCommand
+from appleproj_interfaces.srv import GetPlanningScene, PlaceCommand, RetryInspection
 from geometry_msgs.msg import PoseStamped
 from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.core.prims import SingleArticulation
@@ -160,6 +160,28 @@ FIXED_CAMERA_RUNTIME_PATHS = (
 PLACE_STATUS_TOPIC = "/conveyor/place_coordinator_status"
 PLACE_COMMAND_SERVICE = "/conveyor/place_command"
 CHECKPOINT_TOPIC = "/conveyor/checkpoint_events"
+RETRY_INSPECTION_SERVICE = "/quality/retry_inspection"
+
+
+def evaluate_retry_inspection_request(
+    inspection_id, apple_id, reason, simulation_ready
+):
+    """Return a truthful retry response until a GPU PC 2 handoff exists."""
+    identifiers = {
+        "inspection_id": str(inspection_id).strip(),
+        "apple_id": str(apple_id).strip(),
+        "reason": str(reason).strip(),
+    }
+    missing = [name for name, value in identifiers.items() if not value]
+    if missing:
+        return False, "", f"필수 필드가 비어 있습니다: {', '.join(missing)}"
+    if not simulation_ready:
+        return False, "", "Isaac Sim이 READY 또는 PLAYING 상태가 아닙니다."
+    return (
+        False,
+        "",
+        "GPU PC 2 재검사 실행 전달 계약이 아직 없어 요청을 접수할 수 없습니다.",
+    )
 
 
 def apply_runtime_diagnostic_overrides(stage):
@@ -649,6 +671,11 @@ class RobotMotionNode(Node):
         self.scene_service = self.create_service(
             GetPlanningScene, "/planning_scene/get_snapshot", self.get_scene
         )
+        self.retry_inspection_service = self.create_service(
+            RetryInspection,
+            RETRY_INSPECTION_SERVICE,
+            self.retry_inspection,
+        )
         status_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -731,6 +758,29 @@ class RobotMotionNode(Node):
             f"state={message.current_state}, code={message.error_code}, "
             f"message={message.message}"
         )
+
+    def retry_inspection(self, request, response):
+        """Reject promptly instead of leaving Personal PC 2 to time out."""
+        with self.lock:
+            simulation_ready = self.simulation_state in (
+                SimulationState.READY,
+                SimulationState.PLAYING,
+            )
+        accepted, new_inspection_id, message = evaluate_retry_inspection_request(
+            request.inspection_id,
+            request.apple_id,
+            request.reason,
+            simulation_ready,
+        )
+        response.accepted = accepted
+        response.new_inspection_id = new_inspection_id
+        response.message = message
+        self.get_logger().warning(
+            "RetryInspection 거절: "
+            f"inspection={request.inspection_id}, apple={request.apple_id}, "
+            f"message={message}"
+        )
+        return response
 
     def on_place_status(self, message):
         with self.lock:
