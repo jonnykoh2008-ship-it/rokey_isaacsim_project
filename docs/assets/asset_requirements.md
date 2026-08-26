@@ -12,6 +12,17 @@
 
 - 6DOF Doosan M0617
 - fixed-base MVP 구성
+- 3차 USD 배치에서는 다음 두 Prim을 각각 독립 로봇으로 사용한다.
+
+  | robot ID | USD Prim | 초기 관절 자세 (deg) |
+  |---|---|---|
+  | `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` |
+  | `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` |
+
+- 각 로봇은 `m0617_rail/root_joint`를 Articulation root로 사용한다. M0617 본체는
+  `/World/Xform_01/m0617_01/FixedJoint` 또는
+  `/World/Xform_02/m0617_02/FixedJoint`로 rail mount에 연결한다. `rail_joint`는
+  저장된 초기 위치를 유지한다.
 - LulaKinematicsSolver에서 사용할 robot description과 URDF/USD 관절 이름을 일치시킨다.
 - GPU PC 1의 Lula RRT·trajectory·RMPflow가 동일한 URDF, robot description,
   collision sphere 및 joint limit를 사용해야 한다.
@@ -54,6 +65,10 @@ v2.0에서 GPU PC 1은 raw RGB, raw depth 및 `CameraInfo`를 발행하고 개�
 같은 simulation-time 기준을 사용해야 한다. 해상도, FPS 및 허용 timestamp 오차는
 `TBD`다.
 
+3차 USD의 수확용 base D455 Prim은 `robot_01 → /World/base_rsd455_01`,
+`robot_02 → /World/base_rsd455_02`로 구분한다. 두 카메라의 최종 ROS topic 및
+namespace는 `TBD`다.
+
 ## 사과
 
 모든 사과에 다음을 적용한다.
@@ -70,15 +85,20 @@ v2.0에서 GPU PC 1은 raw RGB, raw depth 및 `CameraInfo`를 발행하고 개�
 - 작업영역 밖으로 이탈하면 삭제하지 않고 physics, collision 및 visibility를 비활성화한다.
 - reset 시 다시 활성화할 수 있도록 object pool 방식 사용을 우선한다.
 
+사과 FixedJoint는 전역 `/World/FixedJoint`가 아니라 각
+`/World/Xform/apple_branch_xx` 또는 `/World/Xform_03/apple_branch_xx` 내부에
+두며, `branchbody`를 body0, `applebody`를 body1로 연결한다.
+
 ## 나무
 
-- 나무 1그루를 수확 대상 3D asset으로 사용한다.
-- 단일 구조 mesh는 연결 성분별 PCA 추정 반경으로 분류한다. 반경 `20mm` 이상인
-  굵은 가지와 줄기 성분에는 rigid capsule collider를 활성화하고 로봇 전체 링크의
-  planning obstacle로도 사용한다.
-- PCA 추정 반경 `20mm` 미만인 작은 가지 성분은 물리 collision과 RRT/RMPflow
-  planning proxy에서 모두 제외한다. 이 `20mm` 기준은 새 `summerTree` 자산의
-  굵기 분포를 반영한 시뮬레이션 임시값이다.
+- 3차 USD에서는 `/World/Xform/tree`와 `/World/Xform_03/tree`를 각각 담당
+  로봇의 수확 대상 tree로 사용한다.
+- 단일 구조 mesh는 연결 성분을 장축 방향 `40mm` 구간으로 나누고 각 구간의
+  로컬 PCA 반경으로 분류한다. 로컬 반경 `20mm` 이상인 굵은 구간에만 짧은 rigid
+  capsule collider를 활성화하고 로봇 전체 링크의 planning obstacle로도 사용한다.
+- 같은 가지 안에서도 로컬 PCA 반경 `20mm` 미만인 가는 구간은 물리 collision과
+  RRT/RMPflow planning proxy에서 모두 제외한다. `40mm` 구간과 `20mm` 반경 기준은
+  새 `summerTree` 자산의 굵기 분포를 반영한 시뮬레이션 임시값이다.
 - 잎은 visual-only로 유지한다. 물리 collision을 비활성화하고 Lula/RMPflow
   planning obstacle에도 전달하지 않는다.
 - visual mesh, PhysX collision mesh, planning collision proxy를 서로 분리한다.
@@ -91,7 +111,7 @@ GPU PC 1은 reset마다 planning proxy snapshot을 생성하고 Lula RRT와 RMPf
 동일한 proxy 및 safety margin을 적용한다. 개인 PC 1은 proxy를 재생성하지 않고
 필요할 때 RViz 표시용으로만 사용한다.
 
-planning 대상 구조 성분은 `20mm` voxel sphere로 단순화하고, 같은 snapshot을
+planning 대상 로컬 굵은 구간은 `20mm` voxel sphere로 단순화하고, 같은 snapshot을
 Lula RRT와 RMPflow에 적용한다. 잎은 최신 수확 동작 규약에 따라 PhysX와
 Lula/RMPflow 양쪽에서 제외한다.
 - 자산 라이선스 정보는 현재 없음. 외부 배포 전 출처와 사용 권한을 확인해야 한다.

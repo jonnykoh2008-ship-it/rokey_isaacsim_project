@@ -56,6 +56,12 @@ parser.add_argument(
     default=1.5,
     help="torque/both 진단 모드의 break torque (기본값: 1.5 N·m)",
 )
+parser.add_argument(
+    "--robot-id",
+    choices=("robot_01", "robot_02"),
+    default="robot_01",
+    help="수확을 실행할 USD 로봇 프로파일 (기본값: robot_01)",
+)
 args, _unknown = parser.parse_known_args()
 
 simulation_app = SimulationApp(
@@ -104,20 +110,95 @@ URDF_PATH = (
     / "m0617.urdf"
 )
 
-ARTICULATION_PRIM_PATH = "/World/Xform_01/m0617_rail"
-ARTICULATION_ROOT_JOINT_PATH = "/World/Xform_01/m0617_rail/root_joint"
-RAIL_JOINT_PATH = "/World/Xform_01/m0617_rail/joints/rail_joint"
-ROBOT_MOUNT_JOINT_PATH = "/World/FixedJoint"
-ROBOT_PRIM_PATH = "/World/Xform_01/m0617"
-ROBOT_BASE_PATH = "/World/Xform_01/m0617/base_link"
-LINK6_PATH = "/World/Xform_01/m0617/link_6"
-GRIPPER_ROOT_PATH = "/World/Xform_01/m0617/robotiq_3f_gripper_articulated"
-PALM_PATH = "/World/Xform_01/m0617/robotiq_3f_gripper_articulated/palm"
-APPLE_ASSEMBLY_ROOT_PATHS = (
-    "/World/Xform/apple_branch",
-    "/World/Xform/apple_branch_1",
-    "/World/Xform/apple_branch_2",
-)
+@dataclass(frozen=True)
+class RobotRuntimeProfile:
+    """저장된 USD에서 한 로봇이 소유하는 실행 자산 경로 모음."""
+
+    robot_id: str
+    xform_root_path: str
+    articulation_prim_path: str
+    robot_prim_path: str
+    apple_parent_path: str
+    tree_root_path: str
+    camera_root_path: str
+    initial_arm_joints_deg: tuple[float, ...]
+
+    @property
+    def articulation_root_joint_path(self):
+        return f"{self.articulation_prim_path}/root_joint"
+
+    @property
+    def rail_joint_path(self):
+        return f"{self.articulation_prim_path}/joints/rail_joint"
+
+    @property
+    def robot_mount_joint_path(self):
+        return f"{self.robot_prim_path}/FixedJoint"
+
+    @property
+    def base_path(self):
+        return f"{self.robot_prim_path}/base_link"
+
+    @property
+    def link6_path(self):
+        return f"{self.robot_prim_path}/link_6"
+
+    @property
+    def gripper_root_path(self):
+        return f"{self.robot_prim_path}/robotiq_3f_gripper_articulated"
+
+    @property
+    def palm_path(self):
+        return f"{self.gripper_root_path}/palm"
+
+    @property
+    def camera_prim_path(self):
+        return f"{self.camera_root_path}/RSD455/Camera_OmniVision_OV9782_Color"
+
+    @property
+    def apple_assembly_root_paths(self):
+        return tuple(
+            f"{self.apple_parent_path}/apple_branch{suffix}"
+            for suffix in ("", "_1", "_2")
+        )
+
+
+ROBOT_RUNTIME_PROFILES = {
+    "robot_01": RobotRuntimeProfile(
+        robot_id="robot_01",
+        xform_root_path="/World/Xform_01",
+        articulation_prim_path="/World/Xform_01/m0617_rail",
+        robot_prim_path="/World/Xform_01/m0617_01",
+        apple_parent_path="/World/Xform",
+        tree_root_path="/World/Xform/tree",
+        camera_root_path="/World/base_rsd455_01",
+        initial_arm_joints_deg=(0.0, 0.0, -90.0, 0.0, 90.0, 0.0),
+    ),
+    "robot_02": RobotRuntimeProfile(
+        robot_id="robot_02",
+        xform_root_path="/World/Xform_02",
+        articulation_prim_path="/World/Xform_02/m0617_rail",
+        robot_prim_path="/World/Xform_02/m0617_02",
+        apple_parent_path="/World/Xform_03",
+        tree_root_path="/World/Xform_03/tree",
+        camera_root_path="/World/base_rsd455_02",
+        initial_arm_joints_deg=(0.0, 0.0, 90.0, 0.0, -90.0, 0.0),
+    ),
+}
+ROBOT_PROFILE = ROBOT_RUNTIME_PROFILES[args.robot_id]
+
+ARTICULATION_PRIM_PATH = ROBOT_PROFILE.articulation_prim_path
+ARTICULATION_ROOT_JOINT_PATH = ROBOT_PROFILE.articulation_root_joint_path
+# 저장된 USD의 m0617_rail root_joint가 Articulation root로 기능하고,
+# M0617 본체는 자신의 FixedJoint로 rail mount에 연결된다.
+ROBOT_PRIM_PATH = ROBOT_PROFILE.robot_prim_path
+RAIL_JOINT_PATH = ROBOT_PROFILE.rail_joint_path
+ROBOT_MOUNT_JOINT_PATH = ROBOT_PROFILE.robot_mount_joint_path
+ROBOT_BASE_PATH = ROBOT_PROFILE.base_path
+LINK6_PATH = ROBOT_PROFILE.link6_path
+GRIPPER_ROOT_PATH = ROBOT_PROFILE.gripper_root_path
+PALM_PATH = ROBOT_PROFILE.palm_path
+APPLE_ASSEMBLY_ROOT_PATHS = ROBOT_PROFILE.apple_assembly_root_paths
 APPLE_PATHS = tuple(f"{root}/applebody/apple1" for root in APPLE_ASSEMBLY_ROOT_PATHS)
 APPLE_BODY_PATHS = tuple(f"{root}/applebody" for root in APPLE_ASSEMBLY_ROOT_PATHS)
 BRANCH_BODY_PATHS = tuple(f"{root}/branchbody" for root in APPLE_ASSEMBLY_ROOT_PATHS)
@@ -128,9 +209,9 @@ APPLE_ASSEMBLIES = ()
 # 기존 단일 사과 실행 코드는 이 세 active 경로를 사용한다. 비전 Action은
 # target 중심과 가장 가까운 assembly를 선택한 뒤 값을 함께 전환한다.
 APPLE_PATH = APPLE_PATHS[0]
-FIXED_JOINT_PATH = "/World/Xform/FixedJoint"
+FIXED_JOINT_PATH = f"{APPLE_ASSEMBLY_ROOT_PATHS[0]}/FixedJoint"
 BRANCH_BODY_PATH = BRANCH_BODY_PATHS[0]
-TREE_ROOT_PATH = "/World/Xform/tree"
+TREE_ROOT_PATH = ROBOT_PROFILE.tree_root_path
 SCENE_01_ROOT_PATH = f"{TREE_ROOT_PATH}/scene_01"
 PLANNING_OBSTACLE_ROOT_PATH = "/World/RuntimeHarvestPlanningObstacles"
 RUNTIME_TREE_COLLIDER_ROOT_PATH = "/World/RuntimeHarvestTreeColliders"
@@ -140,15 +221,19 @@ COLLISION_SPHERE_VISUALIZATION_ROOT_PATH = (
 )
 CONVEYOR_PATH = "/World/ConveyorTrack_01"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
-FIXED_CAMERA_ROOT_PATHS = ["/World/base_rsd455"]
+# 두 base D455는 고정 asset이므로 선택한 로봇과 관계없이 물리적으로 고정한다.
+FIXED_CAMERA_ROOT_PATHS = [
+    "/World/base_rsd455_01",
+    "/World/base_rsd455_02",
+]
 
 EE_FRAME_NAME = "link_6"
 _LINK6_TO_PALM_TRANSLATION = None
 _LINK6_TO_PALM_ROTATION = None
-RAIL_JOINT = "rail_joint"
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
+RAIL_JOINT = "rail_joint"
 INITIAL_ARM_JOINTS_DEG = np.array(
-    [0.0, 0.0, -90.0, 0.0, 90.0, 0.0],
+    ROBOT_PROFILE.initial_arm_joints_deg,
     dtype=float,
 )
 INITIAL_ARM_JOINTS_RAD = np.deg2rad(INITIAL_ARM_JOINTS_DEG)
@@ -252,18 +337,15 @@ APPLE_GRASP_MAX_DISTANCE_M = 0.14
 # obstacle 반경/크기에 더하며, 실제 시뮬레이션 충돌 시험 후 튜닝한다.
 THICK_BRANCH_CLEARANCE_M = 0.010
 SMALL_BRANCH_CLEARANCE_M = 0.000
-# PCA 반경 20 mm 이상인 구조 성분만 20 mm voxel proxy로 변환한다.
+# 로컬 PCA 반경 20 mm 이상인 40 mm 구조 구간만 20 mm voxel proxy로 변환한다.
 # voxel sphere의 형상 반경 10 mm만 사용하며 추가 clearance는 없다.
 BRANCH_PROXY_VOXEL_M = 0.020
 UNIFIED_TREE_STRUCTURE_NAMES = ("structure_004_7", "summertree")
 # 새 summerTree 자산의 굵기 분포를 기준으로 승인된 시뮬레이션 임시값이다.
-# 이 값 이상인 성분에만 PhysX와 RRT/RMPflow proxy를 모두 적용한다.
+# 연결 성분 전체의 전역 반경이 아니라 아래 길이의 로컬 구간별 반경에 적용한다.
 TREE_PHYSX_MIN_BRANCH_RADIUS_M = 0.020
+TREE_LOCAL_SEGMENT_LENGTH_M = 0.040
 TREE_PHYSX_MIN_CAPSULE_HEIGHT_M = 0.001
-# summerTree의 large_030은 휘어진 줄기 연결 성분을 단일 PCA capsule로
-# 근사하면서 반경이 221 mm로 과대 계산된다. 최소 PCA 횡축 반경이자 인접
-# large_031과 같은 수준인 63.5 mm로 PhysX 표시/충돌 capsule만 제한한다.
-TREE_PHYSX_CAPSULE_RADIUS_OVERRIDES_M = {30: 0.0635}
 # RMPflow local-minimum을 피하기 위한 시뮬레이션 튜닝 임시값이다. 실제
 # 안전거리는 각 proxy 반경에 별도로 포함되므로 아래 값은 후보의 범위와 수만
 # 제한한다.
@@ -617,7 +699,7 @@ def activate_nearest_apple(stage, target_center):
 
 
 def validate_articulation_setup(stage):
-    """레일과 M0617이 하나의 Articulation으로 연결됐는지 검사한다."""
+    """m0617_rail root_joint와 M0617 mount 연결을 검사한다."""
     root_prim = require_prim(stage, ARTICULATION_ROOT_JOINT_PATH)
     if not root_prim.HasAPI(UsdPhysics.ArticulationRootAPI):
         raise RuntimeError(
@@ -625,7 +707,7 @@ def validate_articulation_setup(stage):
         )
 
     root_joint = UsdPhysics.Joint(root_prim)
-    if not root_joint.GetJointEnabledAttr().Get():
+    if root_joint.GetJointEnabledAttr().Get() is not True:
         raise RuntimeError(
             f"Articulation Root Joint가 비활성화되었습니다: "
             f"{ARTICULATION_ROOT_JOINT_PATH}"
@@ -634,12 +716,12 @@ def validate_articulation_setup(stage):
     mount_joint = UsdPhysics.Joint(require_prim(stage, ROBOT_MOUNT_JOINT_PATH))
     body0 = [str(path) for path in mount_joint.GetBody0Rel().GetTargets()]
     body1 = [str(path) for path in mount_joint.GetBody1Rel().GetTargets()]
-    expected0 = ["/World/Xform_01/m0617_rail/rail_robot_mount_link"]
+    expected0 = [f"{ARTICULATION_PRIM_PATH}/rail_robot_mount_link"]
     expected1 = [ROBOT_BASE_PATH]
     if body0 != expected0 or body1 != expected1:
         raise RuntimeError(
-            "레일-M0617 FixedJoint 대상이 예상과 다릅니다: "
-            f"Body0={body0}, Body1={body1}"
+            "rail-M0617 FixedJoint 대상이 예상과 다릅니다: "
+            f"joint={ROBOT_MOUNT_JOINT_PATH}, Body0={body0}, Body1={body1}"
         )
 
 
@@ -668,6 +750,8 @@ def open_project_stage():
     for prim_path in (
         ARTICULATION_PRIM_PATH,
         ARTICULATION_ROOT_JOINT_PATH,
+        RAIL_JOINT_PATH,
+        ROBOT_MOUNT_JOINT_PATH,
         ROBOT_PRIM_PATH,
         ROBOT_BASE_PATH,
         LINK6_PATH,
@@ -683,6 +767,11 @@ def open_project_stage():
     if not np.isclose(meters_per_unit, 1.0):
         raise RuntimeError(f"Stage 단위가 meter가 아닙니다: {meters_per_unit}")
 
+    print(f"   Robot ID     {ROBOT_PROFILE.robot_id}")
+    print(f"   Articulation {ARTICULATION_PRIM_PATH}")
+    print(f"   Robot Prim   {ROBOT_PRIM_PATH}")
+    print(f"   Camera Root  {ROBOT_PROFILE.camera_root_path}")
+    print(f"   Tree Root    {TREE_ROOT_PATH}")
     print(f"   Stage        {STAGE_PATH}")
     print("   Stage units  1.0 meter")
     print(f"   Apples       {len(APPLE_ASSEMBLIES)} assemblies")
@@ -1046,9 +1135,8 @@ def configure_joint_drives(stage):
             camera_body_count = 1
         fixed_camera_bodies += camera_body_count
 
-    # 저장된 rail_joint는 초기 state=0.0 m인데 drive target=1.283 m라서 Play
-    # 직후 오른쪽으로 이동한다. 임의의 튜닝값 대신 authored 초기 state를
-    # 그대로 위치 유지 target으로 사용한다.
+    # rail_joint는 저장된 초기 위치를 유지한다. 수확 동작은 M0617 팔과
+    # 그리퍼만 변경하고, rail root가 제공하는 설치 위치는 이동시키지 않는다.
     rail_joint_prim = require_prim(stage, RAIL_JOINT_PATH)
     rail_drive = UsdPhysics.DriveAPI.Get(rail_joint_prim, "linear")
     if not rail_drive:
@@ -1261,6 +1349,95 @@ def _component_capsule_spec(points):
     return center, axis, radius, height
 
 
+def _component_local_slices(points):
+    """연결 성분을 장축 방향으로 나누고 구간별 중심선과 반경을 계산한다."""
+    points = np.asarray(points, dtype=float)
+    _center, global_axis, _radius, _height = _component_capsule_spec(points)
+    mean = np.mean(points, axis=0)
+    projection = (points - mean) @ global_axis
+    minimum = float(np.min(projection))
+    maximum = float(np.max(projection))
+    span = maximum - minimum
+    bin_count = max(1, int(np.ceil(span / TREE_LOCAL_SEGMENT_LENGTH_M)))
+    # 마지막에 아주 짧은 잔여 bin이 생기지 않도록 동일 폭으로 분할한다.
+    normalized_projection = (projection - minimum) / max(span, 1e-12)
+    bin_indices = np.minimum(
+        (normalized_projection * bin_count).astype(np.int64),
+        bin_count - 1,
+    )
+    slices = []
+    for bin_index in range(bin_count):
+        selected = points[bin_indices == bin_index]
+        if len(selected) < 3:
+            continue
+        slices.append(
+            {
+                "bin_index": bin_index,
+                "points": selected,
+                "center": np.mean(selected, axis=0),
+            }
+        )
+
+    for index, item in enumerate(slices):
+        if len(slices) == 1:
+            tangent = global_axis
+        elif index == 0:
+            tangent = slices[1]["center"] - item["center"]
+        elif index == len(slices) - 1:
+            tangent = item["center"] - slices[index - 1]["center"]
+        else:
+            tangent = slices[index + 1]["center"] - slices[index - 1]["center"]
+        if float(np.linalg.norm(tangent)) < 1e-9:
+            tangent = global_axis
+        tangent = normalized(tangent)
+        centered = item["points"] - item["center"]
+        radial = centered - np.outer(centered @ tangent, tangent)
+        item["axis"] = tangent
+        item["radius"] = float(
+            np.sqrt(np.mean(np.sum(radial * radial, axis=1)))
+        )
+        item["thick"] = item["radius"] >= TREE_PHYSX_MIN_BRANCH_RADIUS_M
+    return slices
+
+
+def _component_local_capsule_specs(points):
+    """로컬 반경 기준을 통과한 각 구간을 짧은 capsule로 반환한다."""
+    slices = _component_local_slices(points)
+    specs = []
+    for item in slices:
+        if not item["thick"]:
+            continue
+        centered = item["points"] - item["center"]
+        axial_projection = centered @ item["axis"]
+        total_length = float(np.max(axial_projection) - np.min(axial_projection))
+        radius = float(item["radius"])
+        height = max(
+            TREE_PHYSX_MIN_CAPSULE_HEIGHT_M,
+            total_length - 2.0 * radius,
+        )
+        specs.append(
+            (
+                item["center"],
+                item["axis"],
+                radius,
+                height,
+            )
+        )
+    return specs
+
+
+def _component_thick_local_points(points):
+    """PhysX와 planning proxy가 공유할 굵은 로컬 구간의 표면점을 반환한다."""
+    selected = [
+        item["points"]
+        for item in _component_local_slices(points)
+        if item["thick"]
+    ]
+    if not selected:
+        return np.empty((0, 3), dtype=float)
+    return np.concatenate(selected, axis=0)
+
+
 def _rotation_from_z_axis(direction):
     """local +Z가 direction을 향하는 Isaac 형식 quaternion을 반환한다."""
     z_axis = normalized(direction)
@@ -1273,7 +1450,7 @@ def _rotation_from_z_axis(direction):
 
 
 def configure_unified_tree_physx_colliders(stage):
-    """단일 나무 구조 mesh의 큰 성분만 정적 PhysX capsule로 생성한다."""
+    """단일 나무 mesh의 로컬 굵은 구간만 정적 PhysX capsule로 생성한다."""
     meshes = _unified_tree_structure_meshes(stage)
     if not meshes:
         return 0, 0, 0
@@ -1291,32 +1468,23 @@ def configure_unified_tree_physx_colliders(stage):
     xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
     component_specs = []
     component_count = 0
+    locally_thick_component_count = 0
     for mesh_prim in meshes:
         components = _mesh_connected_components_world(mesh_prim, xform_cache)
         component_count += len(components)
-        for points in components:
-            spec = _component_capsule_spec(points)
-            if spec[2] >= TREE_PHYSX_MIN_BRANCH_RADIUS_M:
-                component_specs.append(spec)
+        for component_index, points in enumerate(components):
+            local_specs = _component_local_capsule_specs(points)
+            if not local_specs:
+                continue
+            locally_thick_component_count += 1
+            for segment_index, spec in enumerate(local_specs):
+                component_specs.append((component_index, segment_index, *spec))
 
-    for index, (center, axis, radius, height) in enumerate(component_specs):
-        original_radius = float(radius)
-        radius = TREE_PHYSX_CAPSULE_RADIUS_OVERRIDES_M.get(
-            index,
-            original_radius,
+    for large_index, segment_index, center, axis, radius, height in component_specs:
+        path = (
+            f"{RUNTIME_TREE_COLLIDER_ROOT_PATH}/"
+            f"large_{large_index:03d}_segment_{segment_index:03d}"
         )
-        if radius != original_radius:
-            # 반경만 줄여 성분 장축 끝이 비지 않도록 기존 capsule의 전체
-            # tip-to-tip 길이는 유지한다.
-            height = max(
-                TREE_PHYSX_MIN_CAPSULE_HEIGHT_M,
-                float(height) + 2.0 * (original_radius - radius),
-            )
-            print(
-                f"   Tree collider large_{index:03d} radius override "
-                f"{original_radius:.4f} -> {radius:.4f} m"
-            )
-        path = f"{RUNTIME_TREE_COLLIDER_ROOT_PATH}/large_{index:03d}"
         capsule = UsdGeom.Capsule.Define(stage, path)
         capsule.CreateAxisAttr().Set(UsdGeom.Tokens.z)
         capsule.CreateRadiusAttr().Set(float(radius))
@@ -1334,6 +1502,12 @@ def configure_unified_tree_physx_colliders(stage):
         collision = UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
         collision.CreateCollisionEnabledAttr().Set(True)
 
+    print(
+        f"   Tree collider local segments {len(component_specs)} from "
+        f"{locally_thick_component_count} locally thick components, "
+        f"slice {TREE_LOCAL_SEGMENT_LENGTH_M:.3f} m, "
+        f"local radius >= {TREE_PHYSX_MIN_BRANCH_RADIUS_M:.3f} m"
+    )
     return component_count, len(component_specs), original_colliders_disabled
 
 
@@ -2299,12 +2473,12 @@ class AppleHarvestFSM:
 # 로봇과 IK 초기화
 # ══════════════════════════════════════════════════════════════
 def create_robot(world):
-    """레일, M0617, 3F 그리퍼로 연결된 단일 Articulation을 등록한다."""
+    """선택한 M0617 본체와 3F 그리퍼 Articulation을 등록한다."""
     robot = world.scene.add(
         SingleManipulator(
             prim_path=ARTICULATION_PRIM_PATH,
             end_effector_prim_path=PALM_PATH,
-            name="m0617_3f_robot",
+            name=f"m0617_3f_{ROBOT_PROFILE.robot_id}",
             gripper=None,
         )
     )
@@ -2344,8 +2518,7 @@ def create_ik_solver(robot, stage):
         robot_description_path=str(DESCRIPTION_PATH),
         urdf_path=str(URDF_PATH),
     )
-    # Articulation의 루트는 레일이므로 robot.get_world_pose()를 쓰면 Lula의
-    # 기준이 레일 원점으로 잘못 설정된다. 실제 M0617 base_link pose를 쓴다.
+    # 선택한 Articulation의 기준은 실제 M0617 base_link pose로 맞춘다.
     base_position, base_orientation = get_prim_world_pose(stage, ROBOT_BASE_PATH)
     lula.set_robot_base_pose(
         robot_position=np.asarray(base_position),
@@ -2525,15 +2698,10 @@ def _collect_tree_planning_geometry(stage, xform_cache):
             if _is_scene_01_path(prim.GetPath()):
                 continue
             if _is_unified_tree_structure_path(prim.GetPath()):
-                branch_points.extend(
-                    points
-                    for points in _mesh_connected_components_world(
-                        prim,
-                        xform_cache,
-                    )
-                    if _component_capsule_spec(points)[2]
-                    >= TREE_PHYSX_MIN_BRANCH_RADIUS_M
-                )
+                for points in _mesh_connected_components_world(prim, xform_cache):
+                    thick_points = _component_thick_local_points(points)
+                    if thick_points.size:
+                        branch_points.append(thick_points)
                 unified_meshes.append(prim)
             elif _is_tree_visual_only_path(prim.GetPath()):
                 continue
@@ -3708,7 +3876,7 @@ class CollisionAwareMotion:
                 applied_turns[waypoint_index, joint_index] = turn
         return unwrapped, applied_turns
 
-    def _nearest_equivalent_transfer_path(
+    def _collision_free_direct_cspace_path(
         self,
         active_positions,
         nearest_goal,
@@ -3716,11 +3884,12 @@ class CollisionAwareMotion:
         upper_limits,
         periodic_joints,
     ):
-        """NEUTRAL_TRANSFER의 짧은 등가 c-space 직결 경로를 검증한다.
+        """과도한 RRT 우회를 대신할 짧은 c-space 직결 경로를 검증한다.
 
         Task-space RRT가 관절 limit 경계 양쪽 표현을 섞어 장회전 경로를 반환한
-        경우에만 사용하는 제한적 fallback이다. 짧은 등가 종점이 limit 안에 있고
-        전체 링크가 나무 proxy와 겹치지 않을 때만 경로를 반환한다.
+        경우뿐 아니라 비주기 관절에서 π를 넘는 중간 detour가 생긴 경우에도
+        사용한다. 짧은 등가 종점이 limit 안에 있고 전체 링크가 나무 proxy와
+        겹치지 않을 때만 경로를 반환한다.
         """
         active_positions = np.asarray(active_positions, dtype=np.float64)
         nearest_goal = np.asarray(nearest_goal, dtype=np.float64)
@@ -3743,7 +3912,7 @@ class CollisionAwareMotion:
             if report["branch_indices"] or report["trunk_indices"]:
                 return (
                     None,
-                    "짧은 nearest-equivalent 직결 경로가 나무 proxy와 충돌합니다: "
+                    "짧은 c-space 직결 경로가 나무 proxy와 충돌합니다: "
                     f"waypoint={waypoint_index}/{waypoint_count - 1}, "
                     f"{self.collision_text(report)}",
                 )
@@ -3940,8 +4109,13 @@ class CollisionAwareMotion:
 
         joint_differences = np.diff(path, axis=0)
         maximum_per_joint_step = np.max(np.abs(joint_differences), axis=0)
+        # periodic 여부와 무관하게 한 RRT waypoint에서 π를 넘는 관절 이동은
+        # 영상에서 확인된 STAGING 대우회처럼 목표와 무관한 큰 workspace swing을
+        # 만들 수 있다. 동일 종점까지의 촘촘한 직결 c-space 경로가 전체 링크
+        # collision-free일 때만 그것으로 교체하고, 아니면 상위 route 재계획으로
+        # 실패를 반환한다.
         excessive_indices = np.flatnonzero(
-            periodic_joints & (maximum_per_joint_step > np.pi + 1.0e-3)
+            maximum_per_joint_step > np.pi + 1.0e-3
         )
         if excessive_indices.size:
             detail = ", ".join(
@@ -3949,47 +4123,31 @@ class CollisionAwareMotion:
                 f"{maximum_per_joint_step[index]:.3f}rad"
                 for index in excessive_indices
             )
-            if explicit_cspace_goal:
-                # _unwrap_periodic_path는 각 waypoint에서 관절 limit 안의 모든
-                # q±2π 표현 중 직전 값과 가장 가까운 것을 이미 선택했다. 그
-                # 결과도 π보다 크다면 limit 안에 더 짧은 등가 표현이 없는
-                # 경우다. RETURN_INITIAL처럼 목표 관절값이 명시된 경로는 아래
-                # 60 Hz trajectory limit·전체 링크 충돌 검증을 조건으로 이
-                # 연속 장거리 회전을 허용한다.
-                print(
-                    f"   [RRT LIMIT-CONSTRAINED ROTATION] {segment_name}: "
-                    f"short q±2π equivalent unavailable within limits; {detail}"
+            fallback_path, fallback_reason = (
+                self._collision_free_direct_cspace_path(
+                    active_positions,
+                    nearest_goal,
+                    lower_limits,
+                    upper_limits,
+                    periodic_joints,
                 )
-            elif segment_name == "NEUTRAL_TRANSFER":
-                fallback_path, fallback_reason = (
-                    self._nearest_equivalent_transfer_path(
-                        active_positions,
-                        nearest_goal,
-                        lower_limits,
-                        upper_limits,
-                        periodic_joints,
-                    )
-                )
-                if fallback_path is None:
-                    raise ApproachUnreachableError(
-                        "NEUTRAL_TRANSFER nearest-equivalent 경로를 안전하게 "
-                        f"생성하지 못했습니다: {detail}; {fallback_reason}"
-                    )
-                path = fallback_path
-                joint_differences = np.diff(path, axis=0)
-                maximum_per_joint_step = np.max(
-                    np.abs(joint_differences), axis=0
-                )
-                print(
-                    "   [NEAREST-EQUIVALENT TRANSFER] "
-                    f"{segment_name}: unsafe RRT rotation {detail} 대신 "
-                    f"collision-free c-space waypoints {len(path)}개 사용"
-                )
-            else:
+            )
+            if fallback_path is None:
                 raise ApproachUnreachableError(
-                    "RRT 경로가 2π 등가 관절의 짧은 회전을 사용하지 "
-                    f"않았습니다: {detail}"
+                    f"{segment_name} RRT가 π 초과 관절 우회를 사용했고 "
+                    "안전한 직접 c-space 대체 경로도 없습니다: "
+                    f"{detail}; {fallback_reason}"
                 )
+            path = fallback_path
+            joint_differences = np.diff(path, axis=0)
+            maximum_per_joint_step = np.max(
+                np.abs(joint_differences), axis=0
+            )
+            print(
+                "   [DIRECT CSPACE FALLBACK] "
+                f"{segment_name}: excessive RRT detour {detail} 대신 "
+                f"collision-free c-space waypoints {len(path)}개 사용"
+            )
         maximum_joint_step = float(
             np.max(np.linalg.norm(joint_differences, axis=1))
         )

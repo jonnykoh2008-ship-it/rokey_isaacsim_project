@@ -138,12 +138,13 @@ ERROR_CODES = {
     "INTERNAL_ERROR": "312:INTERNAL_ERROR",
 }
 
-CAMERA_PATH = "/World/base_rsd455/RSD455/Camera_OmniVision_OV9782_Color"
-CAMERA_GRAPH_PATH = "/BaseCameraRosGraph"
-ROBOT_TF_GRAPH_PATH = "/RobotTfRosGraph"
+CAMERA_PATH = harvest.ROBOT_PROFILE.camera_prim_path
+CAMERA_GRAPH_PATH = f"/BaseCameraRosGraph_{harvest.ROBOT_PROFILE.robot_id}"
+ROBOT_TF_GRAPH_PATH = f"/RobotTfRosGraph_{harvest.ROBOT_PROFILE.robot_id}"
 CONVEYOR_GRAPH_PATH = "/World/ConveyorTrack_01/ConveyorBeltGraph"
 FIXED_CAMERA_RUNTIME_PATHS = (
-    "/World/base_rsd455",
+    "/World/base_rsd455_01",
+    "/World/base_rsd455_02",
     "/World/conv_rsd455_01",
     "/World/conv_rsd455_02",
     "/World/ConveyorTrack_01/conv_rsd455",
@@ -484,19 +485,16 @@ def create_robot_tf_graph(stage):
     `world → odom`은 항등, `odom → base_link`는 MVP에서 로봇이 고정이므로
     USD에서 읽은 고정 변환이다. 로봇 링크만 Isaac이 동적으로 발행한다.
 
-    레일(`m0617_rail`)은 TF 대상에서 제외한다. 레일 URDF의 베이스 링크
-    이름이 `world`라서 ROS의 `world` 프레임과 충돌하기 때문이다. 그 prim은
-    참조 에셋에서 들어오고 articulation root joint와 rail_joint가 경로로
-    참조하고 있어 rename할 수 없다. MVP에서 레일은 고정이므로 TF에서 빠져도
-    무방하며, 3차 레일 도입 시 재설계한다.
+    현재 저장된 USD에서는 `m0617_rail/root_joint`가 Articulation root로
+    기능한다. TF link 범위는 `--robot-id`로 선택한 `m0617_01` 또는
+    `m0617_02` 본체와 그리퍼로 제한한다.
 
     같은 TF를 두 노드가 중복 발행하지 않도록 robot_state_publisher는 쓰지
     않는다.
     """
-    # ArticulationRootAPI는 Xform이 아니라 root_joint에 적용돼 있다
-    # (apple_pick.validate_articulation_setup 참고). SingleManipulator는
-    # 하위를 탐색해 찾아내지만 OmniGraph 노드는 정확한 prim을 요구하므로
-    # ARTICULATION_PRIM_PATH를 주면 "is not an articulation"으로 실패한다.
+    # open_project_stage()가 선택한 m0617_rail 아래의 root_joint와 M0617
+    # mount FixedJoint를 검증한다. OmniGraph 노드는 정확한 articulation root
+    # prim을 요구하므로 root_joint 경로를 직접 전달한다.
     articulation_path = harvest.ARTICULATION_ROOT_JOINT_PATH
     articulation = harvest.require_prim(stage, articulation_path)
     if not articulation.HasAPI(harvest.UsdPhysics.ArticulationRootAPI):
@@ -513,8 +511,8 @@ def create_robot_tf_graph(stage):
     base_world, _base_quat = harvest.get_prim_world_pose(
         stage, harvest.ROBOT_BASE_PATH
     )
-    # 레일의 `world` 링크를 피하려고 로봇 서브트리의 rigid body만 고른다.
-    # base_link는 parentPrim이므로 자기참조를 막기 위해 제외한다.
+    # 선택한 M0617 서브트리의 rigid body만 고른다. base_link는 parentPrim이므로
+    # 자기참조를 막기 위해 제외한다.
     robot_root = harvest.require_prim(stage, harvest.ROBOT_PRIM_PATH)
     link_paths = [
         str(prim.GetPath())
@@ -581,9 +579,9 @@ def create_robot_tf_graph(stage):
                     ("OdomBase.inputs:staticPublisher", True),
                     ("OdomBase.inputs:translation", list(base_world)),
                     ("OdomBase.inputs:rotation", base_quat),
-                    # base_link 기준으로 로봇 링크만 동적 발행한다.
-                    # articulation 전체를 주면 레일의 `world` 링크까지 딸려와
-                    # ROS world 프레임과 충돌하므로 링크를 명시한다.
+                    # base_link 기준으로 선택한 로봇 링크만 동적 발행한다.
+                    # articulation 전체를 주지 않고 링크를 명시해 robot별
+                    # TF 경계를 유지한다.
                     ("RobotTf.inputs:topicName", "/tf"),
                     ("RobotTf.inputs:parentPrim",
                      [usdrt.Sdf.Path(harvest.ROBOT_BASE_PATH)]),
@@ -1670,6 +1668,13 @@ class MotionEngine:
                     resume_callback=self._publish_resume,
                 )
             except harvest.ApproachUnreachableError as error:
+                if self.joint_break.broken:
+                    raise MotionExecutionError(
+                        "302:COLLISION_RISK",
+                        "RRT trajectory 실행 중 목표 사과 stem joint가 "
+                        f"파손됐습니다: candidate={candidate_name}, "
+                        f"state={self.joint_break.break_state}",
+                    ) from error
                 failures.append(f"{candidate_name}={error}")
                 print(f"   [APPROACH REPLAN] {candidate_name} 실패: {error}")
                 continue
