@@ -65,8 +65,11 @@ proxy를 사용하고, D455 obstacle point cloud 전환 시에도 동일한 안�
 ## 다중 사과
 
 - 같은 `reset_id`에서 최초로 모든 유효 후보가 확보된 프레임의 world 위치를
-  기준으로 `apple_001`, `apple_002`, ... ID를 부여한다. ID 부여 순서는 world
-  XYZ 오름차순으로 고정한다.
+  기준으로 `apple_001`, `apple_002`, ... ID를 부여한다. ID 부여 순서는 촬영
+  timestamp의 `world → base_link` TF로 구한 로봇 base 원점과 후보의 world 3D
+  거리 오름차순으로 고정하며, 거리가 같으면 world XYZ 오름차순으로 결정한다.
+  최초 ID 생성 시 `base_link` TF가 없으면 임의 순서로 대체하지 않고 초기화를
+  보류한다.
 - 이후 프레임은 기존 track의 마지막 world 위치에서 100mm 이내인 최근접 후보만
   같은 ID로 연결한다. 이 100mm는 명목 지름 80mm 사과의 시뮬레이션용 임시값이다.
 - 최초 ID 집합이 만들어진 뒤 같은 `reset_id`에서는 새 ID를 추가하지 않는다.

@@ -22,8 +22,11 @@
 1. `target_id` 단일 필수 parameter를 제거하고 기본 prefix `apple`을 사용한다.
 2. reset 후 최초로 유효 후보 집합을 확보한 프레임에서 각 후보를 camera 좌표에서
    world 좌표로 변환한다.
-3. 후보를 world `(x, y, z)` 오름차순으로 정렬해 `apple_001`, `apple_002`, ...
-   고정 ID를 부여한다.
+3. 촬영 timestamp의 `world → base_link` TF로 로봇 base 원점을 구하고, 후보를
+   로봇 base와의 world 3D 거리 오름차순으로 정렬해 `apple_001`,
+   `apple_002`, ... 고정 ID를 부여한다. 거리가 같으면 world `(x, y, z)`
+   오름차순으로 순서를 결정한다. 최초 ID 생성 시 `base_link` TF가 없으면
+   XYZ 순서로 대체하지 않고 ID 초기화를 보류한다.
 4. 이후 프레임에서는 마지막 world 위치에서 100mm 이내인 최근접 후보만 기존
    track에 연결한다. 한 후보를 두 track에 중복 할당하지 않는다.
 5. 최초 ID 집합을 만든 뒤 같은 `reset_id`에서는 신규 ID를 추가하지 않는다.
@@ -61,8 +64,8 @@
 
 ## 검증 요청
 
-1. 최소 3개 contour 입력에서 서로 다른 `apple_001`~`apple_003`이 발행되는지
-   단위 테스트한다.
+1. 최소 3개 contour 입력에서 로봇 base와 가까운 순서로 서로 다른
+   `apple_001`~`apple_003`이 발행되는지 단위 테스트한다.
 2. contour 열거 순서가 바뀌어도 100mm 이내 world 최근접 연결로 ID가 유지되는지
    확인한다.
 3. 수확된 사과가 100mm 밖으로 이동하거나 화면에서 사라져도 새 ID가 생기지
@@ -73,3 +76,5 @@
    ROS 2 Jazzy/Fast DDS 통합 시험한다.
 7. 개인 PC 1에서 `use_sim_time:=true`, `ROS_DOMAIN_ID=102` 및 world TF timestamp
    규약이 유지되는지 확인한다.
+8. 최초 ID 생성 시 `world → base_link` TF를 구할 수 없으면 target을 발행하지
+   않고 ID 초기화를 보류하는지 확인한다.
