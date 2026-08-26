@@ -22,9 +22,9 @@ GRADE_TO_PUSHER = {
     SortCommand.Request.LOW: SortCommand.Request.PUSHER_3,
 }
 PUSHER_TO_TRIGGER = {
-    SortCommand.Request.PUSHER_1: "CONVEYOR_4_PUSHER_1_TRIGGER",
-    SortCommand.Request.PUSHER_2: "CONVEYOR_4_PUSHER_2_TRIGGER",
-    SortCommand.Request.PUSHER_3: "CONVEYOR_4_PUSHER_3_TRIGGER",
+    SortCommand.Request.PUSHER_1: "CONVEYOR_PUSHER_1_TRIGGER",
+    SortCommand.Request.PUSHER_2: "CONVEYOR_PUSHER_2_TRIGGER",
+    SortCommand.Request.PUSHER_3: "CONVEYOR_PUSHER_3_TRIGGER",
 }
 VALID_ERROR_CODES = {
     "INVALID_COMMAND",
