@@ -1670,6 +1670,13 @@ class MotionEngine:
                     resume_callback=self._publish_resume,
                 )
             except harvest.ApproachUnreachableError as error:
+                if self.joint_break.broken:
+                    raise MotionExecutionError(
+                        "302:COLLISION_RISK",
+                        "RRT trajectory 실행 중 목표 사과 stem joint가 "
+                        f"파손됐습니다: candidate={candidate_name}, "
+                        f"state={self.joint_break.break_state}",
+                    ) from error
                 failures.append(f"{candidate_name}={error}")
                 print(f"   [APPROACH REPLAN] {candidate_name} 실패: {error}")
                 continue

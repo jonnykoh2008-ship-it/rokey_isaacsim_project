@@ -688,10 +688,19 @@ class HarvestCoordinator(Node):
             f"target_id={key[1]} 재시도 실패; 최종 실패 처리: {reason}"
         )
 
-    def _handle_active_failure(self, reason, allow_deferred_retry):
+    def _handle_active_failure(
+        self,
+        reason,
+        allow_deferred_retry,
+        error_code="301:APPROACH_UNREACHABLE",
+    ):
         candidate = self._active_candidate
         self._clear_run(remember_target=True)
-        if allow_deferred_retry:
+        # APPROACH 단계라는 이유만으로 실제 접촉까지 planning 실패로 재시도하면
+        # 접촉 자세에서 다음 사과의 RRT가 시작된다. 301의 순수 접근 불가만
+        # 후순위로 보내고 302는 접촉 이후 실패로 안전 정지한다.
+        normalized_error = self._normalize_error_code(error_code)
+        if allow_deferred_retry and normalized_error == "301:APPROACH_UNREACHABLE":
             self._defer_or_finish_failed_candidate(candidate, reason)
             self._start_next_target()
             return
@@ -998,6 +1007,7 @@ class HarvestCoordinator(Node):
             self._handle_active_failure(
                 result.message,
                 allow_deferred_retry=(self.index == 0),
+                error_code=error_code,
             )
             return
         self.index += 1

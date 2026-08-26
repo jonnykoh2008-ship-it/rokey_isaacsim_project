@@ -73,12 +73,12 @@ v2.0에서 GPU PC 1은 raw RGB, raw depth 및 `CameraInfo`를 발행하고 개�
 ## 나무
 
 - 나무 1그루를 수확 대상 3D asset으로 사용한다.
-- 단일 구조 mesh는 연결 성분별 PCA 추정 반경으로 분류한다. 반경 `20mm` 이상인
-  굵은 가지와 줄기 성분에는 rigid capsule collider를 활성화하고 로봇 전체 링크의
-  planning obstacle로도 사용한다.
-- PCA 추정 반경 `20mm` 미만인 작은 가지 성분은 물리 collision과 RRT/RMPflow
-  planning proxy에서 모두 제외한다. 이 `20mm` 기준은 새 `summerTree` 자산의
-  굵기 분포를 반영한 시뮬레이션 임시값이다.
+- 단일 구조 mesh는 연결 성분을 장축 방향 `40mm` 구간으로 나누고 각 구간의
+  로컬 PCA 반경으로 분류한다. 로컬 반경 `20mm` 이상인 굵은 구간에만 짧은 rigid
+  capsule collider를 활성화하고 로봇 전체 링크의 planning obstacle로도 사용한다.
+- 같은 가지 안에서도 로컬 PCA 반경 `20mm` 미만인 가는 구간은 물리 collision과
+  RRT/RMPflow planning proxy에서 모두 제외한다. `40mm` 구간과 `20mm` 반경 기준은
+  새 `summerTree` 자산의 굵기 분포를 반영한 시뮬레이션 임시값이다.
 - 잎은 visual-only로 유지한다. 물리 collision을 비활성화하고 Lula/RMPflow
   planning obstacle에도 전달하지 않는다.
 - visual mesh, PhysX collision mesh, planning collision proxy를 서로 분리한다.
@@ -91,7 +91,7 @@ GPU PC 1은 reset마다 planning proxy snapshot을 생성하고 Lula RRT와 RMPf
 동일한 proxy 및 safety margin을 적용한다. 개인 PC 1은 proxy를 재생성하지 않고
 필요할 때 RViz 표시용으로만 사용한다.
 
-planning 대상 구조 성분은 `20mm` voxel sphere로 단순화하고, 같은 snapshot을
+planning 대상 로컬 굵은 구간은 `20mm` voxel sphere로 단순화하고, 같은 snapshot을
 Lula RRT와 RMPflow에 적용한다. 잎은 최신 수확 동작 규약에 따라 PhysX와
 Lula/RMPflow 양쪽에서 제외한다.
 - 자산 라이선스 정보는 현재 없음. 외부 배포 전 출처와 사용 권한을 확인해야 한다.

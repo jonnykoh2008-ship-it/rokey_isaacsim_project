@@ -252,18 +252,15 @@ APPLE_GRASP_MAX_DISTANCE_M = 0.14
 # obstacle 반경/크기에 더하며, 실제 시뮬레이션 충돌 시험 후 튜닝한다.
 THICK_BRANCH_CLEARANCE_M = 0.010
 SMALL_BRANCH_CLEARANCE_M = 0.000
-# PCA 반경 20 mm 이상인 구조 성분만 20 mm voxel proxy로 변환한다.
+# 로컬 PCA 반경 20 mm 이상인 40 mm 구조 구간만 20 mm voxel proxy로 변환한다.
 # voxel sphere의 형상 반경 10 mm만 사용하며 추가 clearance는 없다.
 BRANCH_PROXY_VOXEL_M = 0.020
 UNIFIED_TREE_STRUCTURE_NAMES = ("structure_004_7", "summertree")
 # 새 summerTree 자산의 굵기 분포를 기준으로 승인된 시뮬레이션 임시값이다.
-# 이 값 이상인 성분에만 PhysX와 RRT/RMPflow proxy를 모두 적용한다.
+# 연결 성분 전체의 전역 반경이 아니라 아래 길이의 로컬 구간별 반경에 적용한다.
 TREE_PHYSX_MIN_BRANCH_RADIUS_M = 0.020
+TREE_LOCAL_SEGMENT_LENGTH_M = 0.040
 TREE_PHYSX_MIN_CAPSULE_HEIGHT_M = 0.001
-# summerTree의 large_030은 휘어진 줄기 연결 성분을 단일 PCA capsule로
-# 근사하면서 반경이 221 mm로 과대 계산된다. 최소 PCA 횡축 반경이자 인접
-# large_031과 같은 수준인 63.5 mm로 PhysX 표시/충돌 capsule만 제한한다.
-TREE_PHYSX_CAPSULE_RADIUS_OVERRIDES_M = {30: 0.0635}
 # RMPflow local-minimum을 피하기 위한 시뮬레이션 튜닝 임시값이다. 실제
 # 안전거리는 각 proxy 반경에 별도로 포함되므로 아래 값은 후보의 범위와 수만
 # 제한한다.
@@ -1261,6 +1258,95 @@ def _component_capsule_spec(points):
     return center, axis, radius, height
 
 
+def _component_local_slices(points):
+    """연결 성분을 장축 방향으로 나누고 구간별 중심선과 반경을 계산한다."""
+    points = np.asarray(points, dtype=float)
+    _center, global_axis, _radius, _height = _component_capsule_spec(points)
+    mean = np.mean(points, axis=0)
+    projection = (points - mean) @ global_axis
+    minimum = float(np.min(projection))
+    maximum = float(np.max(projection))
+    span = maximum - minimum
+    bin_count = max(1, int(np.ceil(span / TREE_LOCAL_SEGMENT_LENGTH_M)))
+    # 마지막에 아주 짧은 잔여 bin이 생기지 않도록 동일 폭으로 분할한다.
+    normalized_projection = (projection - minimum) / max(span, 1e-12)
+    bin_indices = np.minimum(
+        (normalized_projection * bin_count).astype(np.int64),
+        bin_count - 1,
+    )
+    slices = []
+    for bin_index in range(bin_count):
+        selected = points[bin_indices == bin_index]
+        if len(selected) < 3:
+            continue
+        slices.append(
+            {
+                "bin_index": bin_index,
+                "points": selected,
+                "center": np.mean(selected, axis=0),
+            }
+        )
+
+    for index, item in enumerate(slices):
+        if len(slices) == 1:
+            tangent = global_axis
+        elif index == 0:
+            tangent = slices[1]["center"] - item["center"]
+        elif index == len(slices) - 1:
+            tangent = item["center"] - slices[index - 1]["center"]
+        else:
+            tangent = slices[index + 1]["center"] - slices[index - 1]["center"]
+        if float(np.linalg.norm(tangent)) < 1e-9:
+            tangent = global_axis
+        tangent = normalized(tangent)
+        centered = item["points"] - item["center"]
+        radial = centered - np.outer(centered @ tangent, tangent)
+        item["axis"] = tangent
+        item["radius"] = float(
+            np.sqrt(np.mean(np.sum(radial * radial, axis=1)))
+        )
+        item["thick"] = item["radius"] >= TREE_PHYSX_MIN_BRANCH_RADIUS_M
+    return slices
+
+
+def _component_local_capsule_specs(points):
+    """로컬 반경 기준을 통과한 각 구간을 짧은 capsule로 반환한다."""
+    slices = _component_local_slices(points)
+    specs = []
+    for item in slices:
+        if not item["thick"]:
+            continue
+        centered = item["points"] - item["center"]
+        axial_projection = centered @ item["axis"]
+        total_length = float(np.max(axial_projection) - np.min(axial_projection))
+        radius = float(item["radius"])
+        height = max(
+            TREE_PHYSX_MIN_CAPSULE_HEIGHT_M,
+            total_length - 2.0 * radius,
+        )
+        specs.append(
+            (
+                item["center"],
+                item["axis"],
+                radius,
+                height,
+            )
+        )
+    return specs
+
+
+def _component_thick_local_points(points):
+    """PhysX와 planning proxy가 공유할 굵은 로컬 구간의 표면점을 반환한다."""
+    selected = [
+        item["points"]
+        for item in _component_local_slices(points)
+        if item["thick"]
+    ]
+    if not selected:
+        return np.empty((0, 3), dtype=float)
+    return np.concatenate(selected, axis=0)
+
+
 def _rotation_from_z_axis(direction):
     """local +Z가 direction을 향하는 Isaac 형식 quaternion을 반환한다."""
     z_axis = normalized(direction)
@@ -1273,7 +1359,7 @@ def _rotation_from_z_axis(direction):
 
 
 def configure_unified_tree_physx_colliders(stage):
-    """단일 나무 구조 mesh의 큰 성분만 정적 PhysX capsule로 생성한다."""
+    """단일 나무 mesh의 로컬 굵은 구간만 정적 PhysX capsule로 생성한다."""
     meshes = _unified_tree_structure_meshes(stage)
     if not meshes:
         return 0, 0, 0
@@ -1291,32 +1377,23 @@ def configure_unified_tree_physx_colliders(stage):
     xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
     component_specs = []
     component_count = 0
+    locally_thick_component_count = 0
     for mesh_prim in meshes:
         components = _mesh_connected_components_world(mesh_prim, xform_cache)
         component_count += len(components)
-        for points in components:
-            spec = _component_capsule_spec(points)
-            if spec[2] >= TREE_PHYSX_MIN_BRANCH_RADIUS_M:
-                component_specs.append(spec)
+        for component_index, points in enumerate(components):
+            local_specs = _component_local_capsule_specs(points)
+            if not local_specs:
+                continue
+            locally_thick_component_count += 1
+            for segment_index, spec in enumerate(local_specs):
+                component_specs.append((component_index, segment_index, *spec))
 
-    for index, (center, axis, radius, height) in enumerate(component_specs):
-        original_radius = float(radius)
-        radius = TREE_PHYSX_CAPSULE_RADIUS_OVERRIDES_M.get(
-            index,
-            original_radius,
+    for large_index, segment_index, center, axis, radius, height in component_specs:
+        path = (
+            f"{RUNTIME_TREE_COLLIDER_ROOT_PATH}/"
+            f"large_{large_index:03d}_segment_{segment_index:03d}"
         )
-        if radius != original_radius:
-            # 반경만 줄여 성분 장축 끝이 비지 않도록 기존 capsule의 전체
-            # tip-to-tip 길이는 유지한다.
-            height = max(
-                TREE_PHYSX_MIN_CAPSULE_HEIGHT_M,
-                float(height) + 2.0 * (original_radius - radius),
-            )
-            print(
-                f"   Tree collider large_{index:03d} radius override "
-                f"{original_radius:.4f} -> {radius:.4f} m"
-            )
-        path = f"{RUNTIME_TREE_COLLIDER_ROOT_PATH}/large_{index:03d}"
         capsule = UsdGeom.Capsule.Define(stage, path)
         capsule.CreateAxisAttr().Set(UsdGeom.Tokens.z)
         capsule.CreateRadiusAttr().Set(float(radius))
@@ -1334,6 +1411,12 @@ def configure_unified_tree_physx_colliders(stage):
         collision = UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
         collision.CreateCollisionEnabledAttr().Set(True)
 
+    print(
+        f"   Tree collider local segments {len(component_specs)} from "
+        f"{locally_thick_component_count} locally thick components, "
+        f"slice {TREE_LOCAL_SEGMENT_LENGTH_M:.3f} m, "
+        f"local radius >= {TREE_PHYSX_MIN_BRANCH_RADIUS_M:.3f} m"
+    )
     return component_count, len(component_specs), original_colliders_disabled
 
 
@@ -2525,15 +2608,10 @@ def _collect_tree_planning_geometry(stage, xform_cache):
             if _is_scene_01_path(prim.GetPath()):
                 continue
             if _is_unified_tree_structure_path(prim.GetPath()):
-                branch_points.extend(
-                    points
-                    for points in _mesh_connected_components_world(
-                        prim,
-                        xform_cache,
-                    )
-                    if _component_capsule_spec(points)[2]
-                    >= TREE_PHYSX_MIN_BRANCH_RADIUS_M
-                )
+                for points in _mesh_connected_components_world(prim, xform_cache):
+                    thick_points = _component_thick_local_points(points)
+                    if thick_points.size:
+                        branch_points.append(thick_points)
                 unified_meshes.append(prim)
             elif _is_tree_visual_only_path(prim.GetPath()):
                 continue
@@ -3708,7 +3786,7 @@ class CollisionAwareMotion:
                 applied_turns[waypoint_index, joint_index] = turn
         return unwrapped, applied_turns
 
-    def _nearest_equivalent_transfer_path(
+    def _collision_free_direct_cspace_path(
         self,
         active_positions,
         nearest_goal,
@@ -3716,11 +3794,12 @@ class CollisionAwareMotion:
         upper_limits,
         periodic_joints,
     ):
-        """NEUTRAL_TRANSFER의 짧은 등가 c-space 직결 경로를 검증한다.
+        """과도한 RRT 우회를 대신할 짧은 c-space 직결 경로를 검증한다.
 
         Task-space RRT가 관절 limit 경계 양쪽 표현을 섞어 장회전 경로를 반환한
-        경우에만 사용하는 제한적 fallback이다. 짧은 등가 종점이 limit 안에 있고
-        전체 링크가 나무 proxy와 겹치지 않을 때만 경로를 반환한다.
+        경우뿐 아니라 비주기 관절에서 π를 넘는 중간 detour가 생긴 경우에도
+        사용한다. 짧은 등가 종점이 limit 안에 있고 전체 링크가 나무 proxy와
+        겹치지 않을 때만 경로를 반환한다.
         """
         active_positions = np.asarray(active_positions, dtype=np.float64)
         nearest_goal = np.asarray(nearest_goal, dtype=np.float64)
@@ -3743,7 +3822,7 @@ class CollisionAwareMotion:
             if report["branch_indices"] or report["trunk_indices"]:
                 return (
                     None,
-                    "짧은 nearest-equivalent 직결 경로가 나무 proxy와 충돌합니다: "
+                    "짧은 c-space 직결 경로가 나무 proxy와 충돌합니다: "
                     f"waypoint={waypoint_index}/{waypoint_count - 1}, "
                     f"{self.collision_text(report)}",
                 )
@@ -3940,8 +4019,13 @@ class CollisionAwareMotion:
 
         joint_differences = np.diff(path, axis=0)
         maximum_per_joint_step = np.max(np.abs(joint_differences), axis=0)
+        # periodic 여부와 무관하게 한 RRT waypoint에서 π를 넘는 관절 이동은
+        # 영상에서 확인된 STAGING 대우회처럼 목표와 무관한 큰 workspace swing을
+        # 만들 수 있다. 동일 종점까지의 촘촘한 직결 c-space 경로가 전체 링크
+        # collision-free일 때만 그것으로 교체하고, 아니면 상위 route 재계획으로
+        # 실패를 반환한다.
         excessive_indices = np.flatnonzero(
-            periodic_joints & (maximum_per_joint_step > np.pi + 1.0e-3)
+            maximum_per_joint_step > np.pi + 1.0e-3
         )
         if excessive_indices.size:
             detail = ", ".join(
@@ -3949,47 +4033,31 @@ class CollisionAwareMotion:
                 f"{maximum_per_joint_step[index]:.3f}rad"
                 for index in excessive_indices
             )
-            if explicit_cspace_goal:
-                # _unwrap_periodic_path는 각 waypoint에서 관절 limit 안의 모든
-                # q±2π 표현 중 직전 값과 가장 가까운 것을 이미 선택했다. 그
-                # 결과도 π보다 크다면 limit 안에 더 짧은 등가 표현이 없는
-                # 경우다. RETURN_INITIAL처럼 목표 관절값이 명시된 경로는 아래
-                # 60 Hz trajectory limit·전체 링크 충돌 검증을 조건으로 이
-                # 연속 장거리 회전을 허용한다.
-                print(
-                    f"   [RRT LIMIT-CONSTRAINED ROTATION] {segment_name}: "
-                    f"short q±2π equivalent unavailable within limits; {detail}"
+            fallback_path, fallback_reason = (
+                self._collision_free_direct_cspace_path(
+                    active_positions,
+                    nearest_goal,
+                    lower_limits,
+                    upper_limits,
+                    periodic_joints,
                 )
-            elif segment_name == "NEUTRAL_TRANSFER":
-                fallback_path, fallback_reason = (
-                    self._nearest_equivalent_transfer_path(
-                        active_positions,
-                        nearest_goal,
-                        lower_limits,
-                        upper_limits,
-                        periodic_joints,
-                    )
-                )
-                if fallback_path is None:
-                    raise ApproachUnreachableError(
-                        "NEUTRAL_TRANSFER nearest-equivalent 경로를 안전하게 "
-                        f"생성하지 못했습니다: {detail}; {fallback_reason}"
-                    )
-                path = fallback_path
-                joint_differences = np.diff(path, axis=0)
-                maximum_per_joint_step = np.max(
-                    np.abs(joint_differences), axis=0
-                )
-                print(
-                    "   [NEAREST-EQUIVALENT TRANSFER] "
-                    f"{segment_name}: unsafe RRT rotation {detail} 대신 "
-                    f"collision-free c-space waypoints {len(path)}개 사용"
-                )
-            else:
+            )
+            if fallback_path is None:
                 raise ApproachUnreachableError(
-                    "RRT 경로가 2π 등가 관절의 짧은 회전을 사용하지 "
-                    f"않았습니다: {detail}"
+                    f"{segment_name} RRT가 π 초과 관절 우회를 사용했고 "
+                    "안전한 직접 c-space 대체 경로도 없습니다: "
+                    f"{detail}; {fallback_reason}"
                 )
+            path = fallback_path
+            joint_differences = np.diff(path, axis=0)
+            maximum_per_joint_step = np.max(
+                np.abs(joint_differences), axis=0
+            )
+            print(
+                "   [DIRECT CSPACE FALLBACK] "
+                f"{segment_name}: excessive RRT detour {detail} 대신 "
+                f"collision-free c-space waypoints {len(path)}개 사용"
+            )
         maximum_joint_step = float(
             np.max(np.linalg.norm(joint_differences, axis=1))
         )
