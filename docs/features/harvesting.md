@@ -13,6 +13,24 @@
   계산한다.
 - Lula/RMPflow 제어 frame: `link_6`
 
+## 멀티로봇 USD 프로파일
+
+GPU PC 1 실행 코드는 `--robot-id`로 한 수확 프로파일을 선택한다.
+
+| 프로파일 | M0617 Prim | 초기 관절 자세 (deg) | 담당 tree/사과 | 카메라 Prim |
+|---|---|---|---|---|
+| `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` | `/World/Xform/tree`, `/World/Xform/apple_branch[_1/_2]` | `/World/base_rsd455_01` |
+| `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` | `/World/Xform_03/tree`, `/World/Xform_03/apple_branch[_1/_2]` | `/World/base_rsd455_02` |
+
+각 로봇은 `m0617_rail/root_joint`를 Articulation root로 사용한다. M0617 본체는
+각 본체 Prim의 `FixedJoint`로 rail mount에 연결되며, `rail_joint`는 저장된 초기
+위치를 유지한다. 직접 M0617 Prim 아래의 `root_joint`는 별도 Articulation root로
+사용하지 않는다.
+
+사과의 `PhysicsFixedJoint`는 각 `apple_branch_xx` 내부에서
+`branchbody → applebody`를 연결한다. 수확 코드는 Stage의 joint relationship을
+검증한 뒤 실행 중 파손 한계를 적용한다.
+
 ## 상태 흐름
 
 ```text

@@ -14,15 +14,16 @@ GPU PC 1의 Isaac Sim Action Graph가 다음을 발행한다.
 - `world → odom`: MVP 항등 변환, `/tf_static`
 - `odom → base_link`: MVP 고정 설치 자세, `/tf_static`; 3차 레일에서 동적
   변환으로 확장
-- `base_link → robot links`: articulation 상태 기반 동적 변환, `/tf`
+- `base_link → robot links`: 선택한 로봇 articulation 상태 기반 동적 변환, `/tf`
 - `base_link → palm` 및 그리퍼 링크: articulation 상태 기반 동적 변환, `/tf`
 - 고정 카메라 TF: `/tf_static`
 - 카메라가 이동하는 경우 해당 articulation 상태 기반 TF: `/tf`
 - `/joint_states`: M0617 articulation 관절 상태
 
-`robot_state_publisher`는 사용하지 않는다. 레일(`m0617_rail`)은 URDF 베이스
-링크가 ROS `world`와 충돌하므로 MVP TF 대상에서 제외한다. 3차 레일 도입 시
-레일 프레임 명명과 동적 `odom → base_link`를 별도 설계한다.
+`robot_state_publisher`는 사용하지 않는다. 현재 USD 멀티로봇 실행은
+`m0617_rail/root_joint`를 Articulation root로 사용하고, TF link 범위는 각
+`m0617_01`·`m0617_02` 본체와 그리퍼로 제한한다. 로봇별 `odom → base_link`
+frame과 최종 ROS namespace는 통합 계약에서 `TBD`다.
 
 ## 좌표계
 
@@ -32,8 +33,10 @@ GPU PC 1의 Isaac Sim Action Graph가 다음을 발행한다.
 - M0617의 각 joint/link frame
 - `palm` (USD 그리퍼 palm 링크. 물리 수확 TCP의 기준 frame)
 - `gripper_frame`
-- `base_camera`
+- `base_camera` (v2.0 호환 이름)
 - `arm_camera`
+- `base_rsd455_01` (robot_01의 USD camera 이름)
+- `base_rsd455_02` (robot_02의 USD camera 이름)
 - `tree_<id>`
 - `apple_<id>`
 - `conveyor_<id>`
@@ -41,6 +44,11 @@ GPU PC 1의 Isaac Sim Action Graph가 다음을 발행한다.
 영상 target의 최종 `header.frame_id`는 `world`다. 개인 PC 1은 원본
 camera-frame 검출점과 촬영 timestamp를 보존한 뒤, 해당 timestamp에 가장 가까운
 TF로 `world` 변환을 수행한다. 허용 시간 차이와 보간 정책은 `TBD`다.
+
+멀티로봇 USD 매핑은 `robot_01 → /World/base_rsd455_01` 및
+`robot_02 → /World/base_rsd455_02`다. 카메라의 ROS frame/topic namespace를
+USD Prim 이름과 동일하게 확정할지는 `TBD`이며, GPU PC 1 코드는 현재 선택한
+camera Prim의 월드 pose를 사용한다.
 
 ## 수확 TCP와 Lula 제어 프레임
 

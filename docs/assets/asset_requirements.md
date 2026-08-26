@@ -12,6 +12,17 @@
 
 - 6DOF Doosan M0617
 - fixed-base MVP 구성
+- 3차 USD 배치에서는 다음 두 Prim을 각각 독립 로봇으로 사용한다.
+
+  | robot ID | USD Prim | 초기 관절 자세 (deg) |
+  |---|---|---|
+  | `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` |
+  | `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` |
+
+- 각 로봇은 `m0617_rail/root_joint`를 Articulation root로 사용한다. M0617 본체는
+  `/World/Xform_01/m0617_01/FixedJoint` 또는
+  `/World/Xform_02/m0617_02/FixedJoint`로 rail mount에 연결한다. `rail_joint`는
+  저장된 초기 위치를 유지한다.
 - LulaKinematicsSolver에서 사용할 robot description과 URDF/USD 관절 이름을 일치시킨다.
 - GPU PC 1의 Lula RRT·trajectory·RMPflow가 동일한 URDF, robot description,
   collision sphere 및 joint limit를 사용해야 한다.
@@ -54,6 +65,10 @@ v2.0에서 GPU PC 1은 raw RGB, raw depth 및 `CameraInfo`를 발행하고 개�
 같은 simulation-time 기준을 사용해야 한다. 해상도, FPS 및 허용 timestamp 오차는
 `TBD`다.
 
+3차 USD의 수확용 base D455 Prim은 `robot_01 → /World/base_rsd455_01`,
+`robot_02 → /World/base_rsd455_02`로 구분한다. 두 카메라의 최종 ROS topic 및
+namespace는 `TBD`다.
+
 ## 사과
 
 모든 사과에 다음을 적용한다.
@@ -70,9 +85,14 @@ v2.0에서 GPU PC 1은 raw RGB, raw depth 및 `CameraInfo`를 발행하고 개�
 - 작업영역 밖으로 이탈하면 삭제하지 않고 physics, collision 및 visibility를 비활성화한다.
 - reset 시 다시 활성화할 수 있도록 object pool 방식 사용을 우선한다.
 
+사과 FixedJoint는 전역 `/World/FixedJoint`가 아니라 각
+`/World/Xform/apple_branch_xx` 또는 `/World/Xform_03/apple_branch_xx` 내부에
+두며, `branchbody`를 body0, `applebody`를 body1로 연결한다.
+
 ## 나무
 
-- 나무 1그루를 수확 대상 3D asset으로 사용한다.
+- 3차 USD에서는 `/World/Xform/tree`와 `/World/Xform_03/tree`를 각각 담당
+  로봇의 수확 대상 tree로 사용한다.
 - 단일 구조 mesh는 연결 성분을 장축 방향 `40mm` 구간으로 나누고 각 구간의
   로컬 PCA 반경으로 분류한다. 로컬 반경 `20mm` 이상인 굵은 구간에만 짧은 rigid
   capsule collider를 활성화하고 로봇 전체 링크의 planning obstacle로도 사용한다.

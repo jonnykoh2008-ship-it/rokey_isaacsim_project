@@ -2,7 +2,7 @@
 
 ## 목적
 
-Isaac Sim에서 단일 사과나무의 사과를 협동로봇으로 수확하고 컨베이어에 배치한 뒤, 영상 기반 품질 등급을 산출한다. 수확 위치 인식과 품질 검사는 기능적으로 분리한다.
+Isaac Sim에서 두 수확 영역의 사과를 각 담당 협동로봇으로 수확하고 컨베이어에 배치한 뒤, 영상 기반 품질 등급을 산출한다. 수확 위치 인식과 품질 검사는 기능적으로 분리한다. v2.0 단일 로봇 실행과 3차 멀티로봇 실행은 동일한 USD를 로봇 프로파일로 선택한다.
 
 ## 전체 흐름
 
@@ -21,18 +21,30 @@ GPU PC 1 카메라 RGB-D 발행
 
 ## 주요 구성
 
-- 로봇: Doosan M0617, 6DOF
+- 로봇: Doosan M0617, 6DOF × 2
 - 그리퍼: Robotiq AGS-001-MTCP 3-finger soft gripper의 rigid finger + compliant contact 근사
 - 카메라: 베이스, arm, 컨베이어 상단에 Intel RealSense D455
-- 환경: 사과나무 1그루, 사과 1개, 로봇 1개, 1차 MVP용 컨베이어 3모듈
+- 환경: 두 수확 영역, 각 영역의 `tree`·사과 가지 assembly, M0617 2개, 1차 MVP용 컨베이어 3모듈
 - 모션: GPU PC 1의 Lula RRT 전역 계획 + Lula trajectory generation + RMPflow 실행
 - 통신: ROS 2 Jazzy, Fast DDS, `/clock` 기반 simulation time
+
+## USD 로봇·카메라 매핑
+
+| 로봇 | USD 로봇 Prim | 초기 관절 자세 (deg) | 담당 tree/사과 영역 | 담당 D455 |
+|---|---|---|---|---|
+| `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` | `/World/Xform/tree`, `/World/Xform/apple_branch[_1/_2]` | `/World/base_rsd455_01` |
+| `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` | `/World/Xform_03/tree`, `/World/Xform_03/apple_branch[_1/_2]` | `/World/base_rsd455_02` |
+
+각 M0617의 Articulation root는 해당 `m0617_rail/root_joint`다. M0617 본체는
+`m0617_01/FixedJoint` 또는 `m0617_02/FixedJoint`로 rail mount에 연결되고,
+`rail_joint`는 저장된 초기 위치를 유지한다. 사과 FixedJoint는 각
+`apple_branch_xx` 내부에 위치하며 `branchbody`와 `applebody`를 연결한다.
 
 RRT는 정적 planning scene에서 transit/staging/pre-grasp/retract의 전역적으로 충돌 없는 c-space 경로를 찾는 용도다. RRT waypoint를 단순 선형 보간해 실행하지 않고 시간 매개화된 궤적으로 변환한 뒤 RMPflow로 추종한다. palm 접촉 이후의 twist·pull은 접촉 의도가 있는 결정론적 task-space 동작으로 유지한다. RMPflow는 실행 중 world view를 매 simulation step 갱신하는 반응형 실행 계층이며, PhysX contact monitor가 별도의 최종 안전 정지 계층이다.
 
 ## PC 역할
 
-- GPU PC 1: Isaac Sim, 물리, 센서·TF·`/clock`, planning scene 발행, Lula RRT 및
+- GPU PC 1: Isaac Sim, 두 M0617의 물리, 센서·TF·`/clock`, planning scene 발행, Lula RRT 및
   trajectory planning, RMPflow 기반 로봇 실행, 실제 PhysX collider 기반 최종 안전
   감시, motion planning 시각화 토픽 발행
 - GPU PC 2: 컨베이어 카메라 영상 수신, ROI/tracker, 후보 프레임 수집·대표 프레임

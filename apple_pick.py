@@ -56,6 +56,12 @@ parser.add_argument(
     default=1.5,
     help="torque/both 진단 모드의 break torque (기본값: 1.5 N·m)",
 )
+parser.add_argument(
+    "--robot-id",
+    choices=("robot_01", "robot_02"),
+    default="robot_01",
+    help="수확을 실행할 USD 로봇 프로파일 (기본값: robot_01)",
+)
 args, _unknown = parser.parse_known_args()
 
 simulation_app = SimulationApp(
@@ -104,20 +110,95 @@ URDF_PATH = (
     / "m0617.urdf"
 )
 
-ARTICULATION_PRIM_PATH = "/World/Xform_01/m0617_rail"
-ARTICULATION_ROOT_JOINT_PATH = "/World/Xform_01/m0617_rail/root_joint"
-RAIL_JOINT_PATH = "/World/Xform_01/m0617_rail/joints/rail_joint"
-ROBOT_MOUNT_JOINT_PATH = "/World/FixedJoint"
-ROBOT_PRIM_PATH = "/World/Xform_01/m0617"
-ROBOT_BASE_PATH = "/World/Xform_01/m0617/base_link"
-LINK6_PATH = "/World/Xform_01/m0617/link_6"
-GRIPPER_ROOT_PATH = "/World/Xform_01/m0617/robotiq_3f_gripper_articulated"
-PALM_PATH = "/World/Xform_01/m0617/robotiq_3f_gripper_articulated/palm"
-APPLE_ASSEMBLY_ROOT_PATHS = (
-    "/World/Xform/apple_branch",
-    "/World/Xform/apple_branch_1",
-    "/World/Xform/apple_branch_2",
-)
+@dataclass(frozen=True)
+class RobotRuntimeProfile:
+    """저장된 USD에서 한 로봇이 소유하는 실행 자산 경로 모음."""
+
+    robot_id: str
+    xform_root_path: str
+    articulation_prim_path: str
+    robot_prim_path: str
+    apple_parent_path: str
+    tree_root_path: str
+    camera_root_path: str
+    initial_arm_joints_deg: tuple[float, ...]
+
+    @property
+    def articulation_root_joint_path(self):
+        return f"{self.articulation_prim_path}/root_joint"
+
+    @property
+    def rail_joint_path(self):
+        return f"{self.articulation_prim_path}/joints/rail_joint"
+
+    @property
+    def robot_mount_joint_path(self):
+        return f"{self.robot_prim_path}/FixedJoint"
+
+    @property
+    def base_path(self):
+        return f"{self.robot_prim_path}/base_link"
+
+    @property
+    def link6_path(self):
+        return f"{self.robot_prim_path}/link_6"
+
+    @property
+    def gripper_root_path(self):
+        return f"{self.robot_prim_path}/robotiq_3f_gripper_articulated"
+
+    @property
+    def palm_path(self):
+        return f"{self.gripper_root_path}/palm"
+
+    @property
+    def camera_prim_path(self):
+        return f"{self.camera_root_path}/RSD455/Camera_OmniVision_OV9782_Color"
+
+    @property
+    def apple_assembly_root_paths(self):
+        return tuple(
+            f"{self.apple_parent_path}/apple_branch{suffix}"
+            for suffix in ("", "_1", "_2")
+        )
+
+
+ROBOT_RUNTIME_PROFILES = {
+    "robot_01": RobotRuntimeProfile(
+        robot_id="robot_01",
+        xform_root_path="/World/Xform_01",
+        articulation_prim_path="/World/Xform_01/m0617_rail",
+        robot_prim_path="/World/Xform_01/m0617_01",
+        apple_parent_path="/World/Xform",
+        tree_root_path="/World/Xform/tree",
+        camera_root_path="/World/base_rsd455_01",
+        initial_arm_joints_deg=(0.0, 0.0, -90.0, 0.0, 90.0, 0.0),
+    ),
+    "robot_02": RobotRuntimeProfile(
+        robot_id="robot_02",
+        xform_root_path="/World/Xform_02",
+        articulation_prim_path="/World/Xform_02/m0617_rail",
+        robot_prim_path="/World/Xform_02/m0617_02",
+        apple_parent_path="/World/Xform_03",
+        tree_root_path="/World/Xform_03/tree",
+        camera_root_path="/World/base_rsd455_02",
+        initial_arm_joints_deg=(0.0, 0.0, 90.0, 0.0, -90.0, 0.0),
+    ),
+}
+ROBOT_PROFILE = ROBOT_RUNTIME_PROFILES[args.robot_id]
+
+ARTICULATION_PRIM_PATH = ROBOT_PROFILE.articulation_prim_path
+ARTICULATION_ROOT_JOINT_PATH = ROBOT_PROFILE.articulation_root_joint_path
+# 저장된 USD의 m0617_rail root_joint가 Articulation root로 기능하고,
+# M0617 본체는 자신의 FixedJoint로 rail mount에 연결된다.
+ROBOT_PRIM_PATH = ROBOT_PROFILE.robot_prim_path
+RAIL_JOINT_PATH = ROBOT_PROFILE.rail_joint_path
+ROBOT_MOUNT_JOINT_PATH = ROBOT_PROFILE.robot_mount_joint_path
+ROBOT_BASE_PATH = ROBOT_PROFILE.base_path
+LINK6_PATH = ROBOT_PROFILE.link6_path
+GRIPPER_ROOT_PATH = ROBOT_PROFILE.gripper_root_path
+PALM_PATH = ROBOT_PROFILE.palm_path
+APPLE_ASSEMBLY_ROOT_PATHS = ROBOT_PROFILE.apple_assembly_root_paths
 APPLE_PATHS = tuple(f"{root}/applebody/apple1" for root in APPLE_ASSEMBLY_ROOT_PATHS)
 APPLE_BODY_PATHS = tuple(f"{root}/applebody" for root in APPLE_ASSEMBLY_ROOT_PATHS)
 BRANCH_BODY_PATHS = tuple(f"{root}/branchbody" for root in APPLE_ASSEMBLY_ROOT_PATHS)
@@ -128,9 +209,9 @@ APPLE_ASSEMBLIES = ()
 # 기존 단일 사과 실행 코드는 이 세 active 경로를 사용한다. 비전 Action은
 # target 중심과 가장 가까운 assembly를 선택한 뒤 값을 함께 전환한다.
 APPLE_PATH = APPLE_PATHS[0]
-FIXED_JOINT_PATH = "/World/Xform/FixedJoint"
+FIXED_JOINT_PATH = f"{APPLE_ASSEMBLY_ROOT_PATHS[0]}/FixedJoint"
 BRANCH_BODY_PATH = BRANCH_BODY_PATHS[0]
-TREE_ROOT_PATH = "/World/Xform/tree"
+TREE_ROOT_PATH = ROBOT_PROFILE.tree_root_path
 SCENE_01_ROOT_PATH = f"{TREE_ROOT_PATH}/scene_01"
 PLANNING_OBSTACLE_ROOT_PATH = "/World/RuntimeHarvestPlanningObstacles"
 RUNTIME_TREE_COLLIDER_ROOT_PATH = "/World/RuntimeHarvestTreeColliders"
@@ -140,15 +221,19 @@ COLLISION_SPHERE_VISUALIZATION_ROOT_PATH = (
 )
 CONVEYOR_PATH = "/World/ConveyorTrack_01"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
-FIXED_CAMERA_ROOT_PATHS = ["/World/base_rsd455"]
+# 두 base D455는 고정 asset이므로 선택한 로봇과 관계없이 물리적으로 고정한다.
+FIXED_CAMERA_ROOT_PATHS = [
+    "/World/base_rsd455_01",
+    "/World/base_rsd455_02",
+]
 
 EE_FRAME_NAME = "link_6"
 _LINK6_TO_PALM_TRANSLATION = None
 _LINK6_TO_PALM_ROTATION = None
-RAIL_JOINT = "rail_joint"
 ARM_JOINTS = [f"joint_{index}" for index in range(1, 7)]
+RAIL_JOINT = "rail_joint"
 INITIAL_ARM_JOINTS_DEG = np.array(
-    [0.0, 0.0, -90.0, 0.0, 90.0, 0.0],
+    ROBOT_PROFILE.initial_arm_joints_deg,
     dtype=float,
 )
 INITIAL_ARM_JOINTS_RAD = np.deg2rad(INITIAL_ARM_JOINTS_DEG)
@@ -614,7 +699,7 @@ def activate_nearest_apple(stage, target_center):
 
 
 def validate_articulation_setup(stage):
-    """레일과 M0617이 하나의 Articulation으로 연결됐는지 검사한다."""
+    """m0617_rail root_joint와 M0617 mount 연결을 검사한다."""
     root_prim = require_prim(stage, ARTICULATION_ROOT_JOINT_PATH)
     if not root_prim.HasAPI(UsdPhysics.ArticulationRootAPI):
         raise RuntimeError(
@@ -622,7 +707,7 @@ def validate_articulation_setup(stage):
         )
 
     root_joint = UsdPhysics.Joint(root_prim)
-    if not root_joint.GetJointEnabledAttr().Get():
+    if root_joint.GetJointEnabledAttr().Get() is not True:
         raise RuntimeError(
             f"Articulation Root Joint가 비활성화되었습니다: "
             f"{ARTICULATION_ROOT_JOINT_PATH}"
@@ -631,12 +716,12 @@ def validate_articulation_setup(stage):
     mount_joint = UsdPhysics.Joint(require_prim(stage, ROBOT_MOUNT_JOINT_PATH))
     body0 = [str(path) for path in mount_joint.GetBody0Rel().GetTargets()]
     body1 = [str(path) for path in mount_joint.GetBody1Rel().GetTargets()]
-    expected0 = ["/World/Xform_01/m0617_rail/rail_robot_mount_link"]
+    expected0 = [f"{ARTICULATION_PRIM_PATH}/rail_robot_mount_link"]
     expected1 = [ROBOT_BASE_PATH]
     if body0 != expected0 or body1 != expected1:
         raise RuntimeError(
-            "레일-M0617 FixedJoint 대상이 예상과 다릅니다: "
-            f"Body0={body0}, Body1={body1}"
+            "rail-M0617 FixedJoint 대상이 예상과 다릅니다: "
+            f"joint={ROBOT_MOUNT_JOINT_PATH}, Body0={body0}, Body1={body1}"
         )
 
 
@@ -665,6 +750,8 @@ def open_project_stage():
     for prim_path in (
         ARTICULATION_PRIM_PATH,
         ARTICULATION_ROOT_JOINT_PATH,
+        RAIL_JOINT_PATH,
+        ROBOT_MOUNT_JOINT_PATH,
         ROBOT_PRIM_PATH,
         ROBOT_BASE_PATH,
         LINK6_PATH,
@@ -680,6 +767,11 @@ def open_project_stage():
     if not np.isclose(meters_per_unit, 1.0):
         raise RuntimeError(f"Stage 단위가 meter가 아닙니다: {meters_per_unit}")
 
+    print(f"   Robot ID     {ROBOT_PROFILE.robot_id}")
+    print(f"   Articulation {ARTICULATION_PRIM_PATH}")
+    print(f"   Robot Prim   {ROBOT_PRIM_PATH}")
+    print(f"   Camera Root  {ROBOT_PROFILE.camera_root_path}")
+    print(f"   Tree Root    {TREE_ROOT_PATH}")
     print(f"   Stage        {STAGE_PATH}")
     print("   Stage units  1.0 meter")
     print(f"   Apples       {len(APPLE_ASSEMBLIES)} assemblies")
@@ -1043,9 +1135,8 @@ def configure_joint_drives(stage):
             camera_body_count = 1
         fixed_camera_bodies += camera_body_count
 
-    # 저장된 rail_joint는 초기 state=0.0 m인데 drive target=1.283 m라서 Play
-    # 직후 오른쪽으로 이동한다. 임의의 튜닝값 대신 authored 초기 state를
-    # 그대로 위치 유지 target으로 사용한다.
+    # rail_joint는 저장된 초기 위치를 유지한다. 수확 동작은 M0617 팔과
+    # 그리퍼만 변경하고, rail root가 제공하는 설치 위치는 이동시키지 않는다.
     rail_joint_prim = require_prim(stage, RAIL_JOINT_PATH)
     rail_drive = UsdPhysics.DriveAPI.Get(rail_joint_prim, "linear")
     if not rail_drive:
@@ -2382,12 +2473,12 @@ class AppleHarvestFSM:
 # 로봇과 IK 초기화
 # ══════════════════════════════════════════════════════════════
 def create_robot(world):
-    """레일, M0617, 3F 그리퍼로 연결된 단일 Articulation을 등록한다."""
+    """선택한 M0617 본체와 3F 그리퍼 Articulation을 등록한다."""
     robot = world.scene.add(
         SingleManipulator(
             prim_path=ARTICULATION_PRIM_PATH,
             end_effector_prim_path=PALM_PATH,
-            name="m0617_3f_robot",
+            name=f"m0617_3f_{ROBOT_PROFILE.robot_id}",
             gripper=None,
         )
     )
@@ -2427,8 +2518,7 @@ def create_ik_solver(robot, stage):
         robot_description_path=str(DESCRIPTION_PATH),
         urdf_path=str(URDF_PATH),
     )
-    # Articulation의 루트는 레일이므로 robot.get_world_pose()를 쓰면 Lula의
-    # 기준이 레일 원점으로 잘못 설정된다. 실제 M0617 base_link pose를 쓴다.
+    # 선택한 Articulation의 기준은 실제 M0617 base_link pose로 맞춘다.
     base_position, base_orientation = get_prim_world_pose(stage, ROBOT_BASE_PATH)
     lula.set_robot_base_pose(
         robot_position=np.asarray(base_position),

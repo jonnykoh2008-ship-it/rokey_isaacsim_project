@@ -43,6 +43,22 @@
 
 Action과 Service 표에서 서버는 요청을 실행하는 쪽이고 클라이언트는 요청을 보내는 쪽이다.
 
+## USD 멀티로봇 센서·자산 매핑
+
+GPU PC 1은 실행 시 `--robot-id`로 다음 USD 수확 프로파일을 선택한다.
+
+| robot ID | 로봇 Prim | 초기 관절 자세 (deg) | 담당 tree/사과 영역 | D455 Prim |
+|---|---|---|---|---|
+| `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` | `/World/Xform` | `/World/base_rsd455_01` |
+| `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` | `/World/Xform_03` | `/World/base_rsd455_02` |
+
+각 M0617은 `m0617_rail/root_joint`를 Articulation root로 사용하며, 본체의
+`FixedJoint`로 rail mount에 연결된다. 사과 fixed joint는 각
+`apple_branch_xx` 내부에서 `branchbody`와 `applebody`를 연결한다. 현재 표의
+`/base_camera/...` 센서 topic은 v2.0 호환 계약으로 유지한다. 두 카메라를
+동시에 운용하기 위한 robot별 topic/action/service namespace와 `HarvestTarget`
+내부의 최종 robot/tree 식별 필드는 아직 `TBD`다.
+
 ## 공통 표준 인터페이스
 
 | 토픽 | 타입 | 의미 |
