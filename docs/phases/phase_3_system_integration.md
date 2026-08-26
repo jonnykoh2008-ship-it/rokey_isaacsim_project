@@ -37,6 +37,15 @@ robot_02 ↔ tree_02 ↔ conveyor place station 02
 ## 배치 및 레일
 
 - `robot_01`과 `robot_02`를 공용 컨베이어의 서로 반대편에 배치한다.
+- 로봇별 최상위 ROS namespace는 다음으로 확정한다.
+  - `robot_01`: `/robot_01`
+  - `robot_02`: `/robot_02`
+- 각 namespace 아래에 해당 로봇의 target, camera, joint state, motion action,
+  motion status 및 planning visualization을 둔다.
+- `/clock`, `/simulation/state`, `/planning_scene`, `/quality/*` 및
+  `/conveyor/*`는 두 로봇이 공유하는 global interface로 유지한다.
+- TF transport topic은 `/tf`와 `/tf_static`을 global로 유지하고, frame ID는
+  `robot_01/base_link`, `robot_02/base_link`처럼 robot prefix로 구분한다.
 - 각 로봇의 base, camera, gripper 및 관절 상태는 고유한 robot namespace와
   TF frame을 사용한다.
 - 레일을 사용하는 경우 각 로봇은 자신의 레일/base 이동 상태를 갖는다.
@@ -144,8 +153,10 @@ Isaac Sim world
 - `PlanningScene`은 두 robot pose와 두 tree obstacle을 일관되게 참조해야
   한다. 로봇별 snapshot을 사용할 경우 동일한 global `scene_version`으로
   동기화한다.
-- 정확한 메시지 필드, topic/action/service 이름, QoS 및 namespace 표기는
-  `docs/architecture/ros2_interfaces.md`와 함께 확정한다.
+- 정확한 메시지 필드, leaf topic/action/service 이름 및 QoS는
+  `docs/architecture/ros2_interfaces.md`와 함께 관리한다. 로봇별 root
+  namespace(`/robot_01`, `/robot_02`)와 global/shared topic 경계는 확정하며,
+  leaf 이름·QoS·추가 메시지 필드는 해당 인터페이스 계약의 `TBD`를 따른다.
 
 ## 복구
 
@@ -189,7 +200,7 @@ Isaac Sim world
 |---|---|---|
 | 배치 | 두 robot/tree의 정확한 world pose, 컨베이어 양쪽 Place station pose, 레일 사용 여부와 rail limit | GPU PC 1 자산·배치 시험 |
 | ID | `robot_id`, `tree_id`, `apple_id`, `target_id`/`task_id`의 필드와 전역 문자열 규칙 | 네 PC 공동 interface 승인 |
-| ROS | robot별 namespace, topic/action/service 이름, QoS, `PlanningScene` global/per-robot 표현 | `ros2_interfaces.md`와 연동해 확정 |
+| ROS | leaf topic/action/service 이름, QoS, `PlanningScene` 세부 표현 및 namespace remap | `ros2_interfaces.md`와 연동해 확정. root namespace `/robot_01`, `/robot_02`와 global/shared topic 경계는 확정 |
 | Target | 카메라별 target 입력 방식과 담당 나무 판정, stale age, confidence/depth/TF threshold | 개인 PC 1·GPU PC 1 통합 시험 |
 | Place | Place lock/lease 계약, reservation timeout, 안착 확인 방법, Place 실패 후 재시작 조건 | GPU PC 1 안전 시험 |
 | 충돌 | 두 Place station의 swept-volume 최소 여유, 로봇-로봇 및 로봇-컨베이어 접촉 판정 | GPU PC 1 PhysX 시험 |
