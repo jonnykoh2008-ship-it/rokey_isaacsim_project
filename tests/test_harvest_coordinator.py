@@ -7,15 +7,75 @@ import numpy as np
 
 from appleproj_interfaces.msg import HarvestTarget, PlanningScene, SimulationState
 from geometry_msgs.msg import PoseStamped
-from harvest_coordinator import HarvestCoordinator, PendingTarget
+from harvest_coordinator import (
+    DEFAULT_MOTION_STATUS_TOPIC,
+    DEFAULT_ROBOT_ID,
+    HarvestCoordinator,
+    PendingTarget,
+    assign_apple_ids_by_distance,
+    validate_runtime_identity,
+)
 from harvest_route_planner import RoutePlanningError
 
 
 class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
+    def test_dual_robot_motion_status_runtime_identity(self):
+        self.assertEqual(
+            ("robot_01", "/robot_01/harvest/motion_status"),
+            validate_runtime_identity(
+                "robot_01", "/robot_01/harvest/motion_status"
+            ),
+        )
+        self.assertEqual(
+            ("robot_02", "/robot_02/harvest/motion_status"),
+            validate_runtime_identity(
+                "robot_02", "/robot_02/harvest/motion_status"
+            ),
+        )
+
+    def test_motion_status_default_remains_backward_compatible(self):
+        self.assertEqual(
+            (DEFAULT_ROBOT_ID, DEFAULT_MOTION_STATUS_TOPIC),
+            validate_runtime_identity(
+                DEFAULT_ROBOT_ID, DEFAULT_MOTION_STATUS_TOPIC
+            ),
+        )
+
+    def test_runtime_identity_rejects_invalid_values(self):
+        for robot_id, topic in (
+            ("", "/robot_01/harvest/motion_status"),
+            ("/robot/01", "/robot_01/harvest/motion_status"),
+            ("robot_01", "robot_01/harvest/motion_status"),
+        ):
+            with self.subTest(robot_id=robot_id, topic=topic):
+                with self.assertRaises(ValueError):
+                    validate_runtime_identity(robot_id, topic)
+
+    def test_apple_ids_are_frozen_by_robot_distance(self):
+        candidates = [
+            self.candidate("far", [3.0, 0.0, 0.0]),
+            self.candidate("near", [1.0, 0.0, 0.0]),
+            self.candidate("middle", [2.0, 0.0, 0.0]),
+        ]
+
+        robot_01 = assign_apple_ids_by_distance(
+            "robot_01", np.zeros(3), candidates
+        )
+        robot_02 = assign_apple_ids_by_distance(
+            "robot_02", np.zeros(3), candidates
+        )
+
+        self.assertEqual("apple_001", robot_01[candidates[1].key])
+        self.assertEqual("apple_002", robot_01[candidates[2].key])
+        self.assertEqual("apple_003", robot_01[candidates[0].key])
+        self.assertEqual("apple_004", robot_02[candidates[1].key])
+        self.assertEqual("apple_006", robot_02[candidates[0].key])
+
     @staticmethod
     def make_coordinator():
         coordinator = HarvestCoordinator.__new__(HarvestCoordinator)
         coordinator.simulation_state = None
+        coordinator.robot_id = "robot_01"
         coordinator.planning_scene = None
         coordinator.failed_target = None
         coordinator.execute_enabled = True
@@ -28,6 +88,15 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator._active_candidate = None
         coordinator._latest_target_stamps = {}
         coordinator._started_target_keys = set()
+        coordinator.target_apple_ids = {}
+        coordinator.active_apple_id = ""
+        coordinator.active_reservation_id = ""
+        coordinator.place_status = None
+        coordinator.place_command_pending = False
+        coordinator.place_reservation_submitted = False
+        coordinator.place_ready = False
+        coordinator.safety_stopped = False
+        coordinator.safety_stop_reason = None
         coordinator.target_samples = {}
         coordinator.pending_targets = {}
         coordinator.retry_targets = {}
@@ -59,8 +128,11 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
             )
         )
         coordinator.request_snapshot = Mock()
+        coordinator.place_client = Mock()
+        coordinator.place_client.service_is_ready.return_value = True
         coordinator._publish_status = Mock()
         coordinator.get_logger = Mock(return_value=Mock())
+        coordinator.queue_dispatch_timer = Mock()
         return coordinator
 
     @staticmethod
@@ -394,6 +466,103 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
 
         self.assertIn((2, "apple-2"), coordinator.pending_targets)
         self.assertTrue(coordinator.running)
+        coordinator.queue_dispatch_timer.reset.assert_not_called()
+
+    def test_new_target_ids_restart_batch_debounce(self):
+        coordinator = self.make_coordinator()
+        coordinator.simulation_state = self.state(SimulationState.PLAYING)
+        coordinator.planning_scene = self.scene()
+        coordinator._planning_inputs_synchronized = Mock(return_value=True)
+
+        coordinator.on_target(self.target_message(target_id="apple-3"))
+        coordinator.on_target(self.target_message(target_id="apple-1"))
+        coordinator.on_target(self.target_message(target_id="apple-2"))
+
+        self.assertEqual(coordinator.queue_dispatch_timer.reset.call_count, 3)
+        self.assertFalse(coordinator.running)
+        self.assertEqual(len(coordinator.pending_targets), 3)
+
+    def test_batch_dispatch_selects_nearest_after_all_ids_arrive(self):
+        coordinator = self.make_coordinator()
+        coordinator.planning_scene = PlanningScene()
+        far = self.candidate("apple-3", [1.5, 0.0, 0.0])
+        near = self.candidate("apple-1", [0.6, 0.0, 0.0])
+        middle = self.candidate("apple-2", [1.0, 0.0, 0.0])
+        coordinator.pending_targets = {
+            far.key: far,
+            near.key: near,
+            middle.key: middle,
+        }
+        coordinator._prepare_approach_goal = Mock(
+            return_value=(2, 3, np.array([0.0, 0.0, 0.0, 1.0]))
+        )
+        coordinator.send_next = Mock()
+
+        coordinator._dispatch_pending_targets()
+
+        self.assertEqual(coordinator._active_target_key, near.key)
+        self.assertEqual("apple_001", coordinator.active_apple_id)
+        self.assertEqual(
+            "robot_01:2:apple_001", coordinator.active_reservation_id
+        )
+        self.assertIn(far.key, coordinator.pending_targets)
+        self.assertIn(middle.key, coordinator.pending_targets)
+        coordinator.queue_dispatch_timer.cancel.assert_called()
+
+    def test_batch_dispatch_waits_for_all_three_camera_targets(self):
+        coordinator = self.make_coordinator()
+        coordinator.planning_scene = PlanningScene()
+        first = self.candidate("apple-1", [0.6, 0.0, 0.0])
+        second = self.candidate("apple-2", [1.0, 0.0, 0.0])
+        coordinator.pending_targets = {first.key: first, second.key: second}
+        coordinator._start_next_target = Mock()
+
+        coordinator._dispatch_pending_targets()
+
+        coordinator._start_next_target.assert_not_called()
+        self.assertFalse(coordinator.running)
+
+    def test_place_reservation_request_keeps_active_apple_id(self):
+        coordinator = self.make_coordinator()
+        coordinator.active_apple_id = "apple_001"
+        coordinator.active_reservation_id = "robot_01:2:apple_001"
+        coordinator.plan_reset_id = 2
+        coordinator.plan_scene_version = 3
+        future = Mock()
+        coordinator.place_client.call_async.return_value = future
+
+        self.assertFalse(coordinator._ensure_place_ready())
+
+        request = coordinator.place_client.call_async.call_args.args[0]
+        self.assertEqual(1, request.command)
+        self.assertEqual("robot_01", request.robot_id)
+        self.assertEqual("apple_001", request.apple_id)
+        self.assertEqual("robot_01:2:apple_001", request.reservation_id)
+        self.assertEqual("CONVEYOR_PLACE_01_LANDING", request.place_position_id)
+        self.assertEqual((2, 3), (request.reset_id, request.scene_version))
+        future.add_done_callback.assert_called_once()
+
+    def test_reserved_owner_requests_start_placing(self):
+        coordinator = self.make_coordinator()
+        coordinator.active_apple_id = "apple_001"
+        coordinator.active_reservation_id = "robot_01:2:apple_001"
+        coordinator.plan_reset_id = 2
+        coordinator.plan_scene_version = 3
+        coordinator.place_reservation_submitted = True
+        coordinator.place_status = SimpleNamespace(
+            state=1,
+            lock_owner_robot_id="robot_01",
+            reservation_id="robot_01:2:apple_001",
+            apple_id="apple_001",
+        )
+        future = Mock()
+        coordinator.place_client.call_async.return_value = future
+
+        self.assertFalse(coordinator._ensure_place_ready())
+
+        request = coordinator.place_client.call_async.call_args.args[0]
+        self.assertEqual(2, request.command)
+        future.add_done_callback.assert_called_once()
 
     def test_first_precontact_failure_moves_target_to_retry_queue(self):
         coordinator = self.make_coordinator()
@@ -453,10 +622,12 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
     def test_postcontact_failure_stops_without_starting_next(self):
         coordinator = self.make_coordinator()
         candidate = self.candidate("apple-1", [0.8, 0.1, 1.2])
+        queued = self.candidate("apple-2", [0.9, 0.1, 1.2])
         coordinator.running = True
         coordinator.target = PoseStamped()
         coordinator._active_candidate = candidate
         coordinator._active_target_key = candidate.key
+        coordinator.pending_targets[queued.key] = queued
         coordinator._start_next_target = Mock()
 
         coordinator._handle_active_failure(
@@ -465,8 +636,51 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         )
 
         self.assertFalse(coordinator.running)
+        self.assertTrue(coordinator.safety_stopped)
+        self.assertEqual(coordinator.pending_targets, {})
+        self.assertEqual(coordinator.retry_targets, {})
         self.assertIn(candidate.key, coordinator.final_failed_target_keys)
         coordinator._start_next_target.assert_not_called()
+        coordinator._publish_status.assert_called_once_with(
+            "SAFETY_STOPPED",
+            False,
+            0.0,
+            "302:COLLISION_RISK",
+            "접촉 이후 실패로 reset 전까지 연속 수확을 중단합니다: GRASP 이후 실패",
+        )
+
+    def test_safety_stop_rejects_new_target(self):
+        coordinator = self.make_coordinator()
+        coordinator.safety_stopped = True
+        coordinator.safety_stop_reason = "운반 실패"
+
+        coordinator.on_target(self.target_message(target_id="apple-2"))
+
+        self.assertEqual(coordinator.pending_targets, {})
+        coordinator._publish_status.assert_called_once()
+        status = coordinator._publish_status.call_args.args
+        self.assertEqual(status[0], "TARGET_RECEIVED")
+        self.assertEqual(status[3], "302:COLLISION_RISK")
+        self.assertIn("SAFETY_STOPPED", status[4])
+
+    def test_safety_stop_is_released_only_by_reset_id_change(self):
+        coordinator = self.make_coordinator()
+        coordinator.safety_stopped = True
+        coordinator.safety_stop_reason = "운반 실패"
+        coordinator.simulation_state = self.state(
+            SimulationState.PLAYING, reset_id=2, scene_version=3
+        )
+
+        coordinator.on_state(
+            self.state(SimulationState.READY, reset_id=2, scene_version=4)
+        )
+        self.assertTrue(coordinator.safety_stopped)
+
+        coordinator.on_state(
+            self.state(SimulationState.READY, reset_id=3, scene_version=1)
+        )
+        self.assertFalse(coordinator.safety_stopped)
+        self.assertIsNone(coordinator.safety_stop_reason)
 
 
 if __name__ == "__main__":

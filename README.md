@@ -1,6 +1,6 @@
 # Isaac Sim 기반 사과 수확·품질 분류 시스템
 
-디지털 트윈 환경에서 Doosan M0617 협동로봇과 Robotiq AGS-001-MTCP 3-finger soft gripper를 이용해 사과를 수확하고, MVP의 3모듈 컨베이어에서 품질을 판정하는 프로젝트다. v2.0에서는 개인 PC 1이 영상에서 사과의 3D 좌표를 계산하고, GPU PC 1이 해당 좌표를 받아 Lula 기반 경로 계획과 로봇 실행을 전담한다.
+디지털 트윈 환경에서 Doosan M0617 협동로봇 두 대와 Robotiq AGS-001-MTCP 3-finger soft gripper를 이용해 사과를 수확하고, MVP의 3모듈 컨베이어에서 품질을 판정하는 프로젝트다. v2.0에서는 개인 PC 1이 영상에서 사과의 3D 좌표를 계산하고, GPU PC 1이 해당 좌표를 받아 Lula 기반 경로 계획과 로봇 실행을 전담한다. 3차 통합에서는 저장된 USD의 두 M0617과 두 수확 영역을 로봇별 프로파일로 선택한다.
 
 ## 개발 목표
 
@@ -8,7 +8,7 @@
 2. 컨베이어 투입 및 검사 구간 이송
 3. 상단 카메라 영상 기반 상·중·하 품질 판정
 4. 2차 개발에서 컨베이어 4와 푸셔 3개를 추가해 물리 분류
-5. 3차 개발에서 레일, 다중 나무 및 전체 파이프라인 통합
+5. 3차 개발에서 두 M0617, 다중 나무 및 전체 파이프라인 통합
 
 ## 기준 환경
 
@@ -18,6 +18,23 @@
 - Isaac Sim Python 3.11 / ROS 2 Python 3.12
 - GPU 노트북 2대, 개인 노트북 2대
 - 2.5Gbps 5포트 스위치 중 4포트 사용
+
+## 저장된 USD 멀티로봇 매핑
+
+현재 실행 자산의 기준 경로와 초기 관절 자세는 다음과 같다.
+
+| 로봇 프로파일 | 로봇 Prim | 초기 관절 자세 (deg) | 수확 자산 영역 | 인식 카메라 Prim |
+|---|---|---|---|---|
+| `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` | `/World/Xform`의 `tree`·`apple_branch[_1/_2]` | `/World/base_rsd455_01` |
+| `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` | `/World/Xform_03`의 `tree`·`apple_branch[_1/_2]` | `/World/base_rsd455_02` |
+
+사과의 `PhysicsFixedJoint`는 각 `apple_branch_xx` 내부에 있으며,
+`branchbody → applebody` 관계를 사용한다. GPU PC 1 코드는 실행 시 이 관계를
+검증하고 파손 한계를 Session Layer에 적용한다. 각 로봇의 Articulation root는
+`/World/Xform_01/m0617_rail/root_joint` 또는
+`/World/Xform_02/m0617_rail/root_joint`이며, M0617 본체는 각각의
+`m0617_01/FixedJoint`·`m0617_02/FixedJoint`로 rail mount에 연결된다. ROS topic/action namespace는
+3차 통합 계약에서 `TBD`로 유지한다.
 
 ## v2.0 실행 구조
 
@@ -37,6 +54,15 @@ GPU PC 1: Isaac Sim RGB-D/TF/장애물 발행
 
 쉽게 말하면 개인 PC 1은 카메라로 보는 **눈**, GPU PC 1은 경로를 결정하고 로봇을
 움직이는 **두뇌와 팔**, 개인 PC 1의 RViz는 결과를 보는 **화면**이다.
+
+## 3차 멀티로봇 실행 선택
+
+GPU PC 1의 standalone 수확·통합 실행은 `--robot-id robot_01` 또는
+`--robot-id robot_02`로 USD 로봇 프로파일을 선택한다. 두 프로파일은 각각의
+`m0617_rail` Articulation root, M0617 본체, 나무/사과 영역, D455 Prim 및
+초기 관절 자세를 사용한다.
+두 로봇을 동시에 운용할 ROS topic/action namespace와 target의 최종 robot ID
+필드는 아직 `TBD`다.
 
 ## PC별 개발 범위
 
