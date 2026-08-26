@@ -1806,12 +1806,30 @@ class MotionEngine:
         self.apple_contact.reset()
         self.apple_contact.set_state("APPROACH")
         self.feedback(handle, "APPROACH", 0.1)
+
         def contact_guard():
             if self.tree_contact.detected:
                 raise MotionExecutionError(
                     "302:COLLISION_RISK",
                     "APPROACH 중 실제 로봇 collider가 나무 collider에 접촉했습니다: "
                     f"robot={self.tree_contact.robot_path}, tree={self.tree_contact.tree_path}",
+                )
+            if (
+                self.apple_contact.finger_contacted
+                or self.apple_contact.palm_contacted
+            ):
+                contact_type = (
+                    "finger" if self.apple_contact.finger_contacted else "palm"
+                )
+                contact_path = (
+                    self.apple_contact.finger_path
+                    if self.apple_contact.finger_contacted
+                    else self.apple_contact.palm_path
+                )
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    "STAGING/PREGRASP 이전 APPROACH 중 목표 사과에 조기 "
+                    f"접촉했습니다: type={contact_type}, robot={contact_path}",
                 )
             return self.joint_break.broken
 
