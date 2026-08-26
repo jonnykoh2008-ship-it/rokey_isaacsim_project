@@ -482,7 +482,7 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         self.assertFalse(coordinator.running)
         self.assertEqual(len(coordinator.pending_targets), 3)
 
-    def test_batch_dispatch_selects_nearest_after_all_ids_arrive(self):
+    def test_batch_dispatch_selects_nearest_and_keeps_personal_pc1_id(self):
         coordinator = self.make_coordinator()
         coordinator.planning_scene = PlanningScene()
         far = self.candidate("apple-3", [1.5, 0.0, 0.0])
@@ -501,15 +501,15 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator._dispatch_pending_targets()
 
         self.assertEqual(coordinator._active_target_key, near.key)
-        self.assertEqual("apple_001", coordinator.active_apple_id)
+        self.assertEqual("apple-1", coordinator.active_apple_id)
         self.assertEqual(
-            "robot_01:2:apple_001", coordinator.active_reservation_id
+            "robot_01:2:apple-1", coordinator.active_reservation_id
         )
         self.assertIn(far.key, coordinator.pending_targets)
         self.assertIn(middle.key, coordinator.pending_targets)
         coordinator.queue_dispatch_timer.cancel.assert_called()
 
-    def test_batch_dispatch_waits_for_all_three_camera_targets(self):
+    def test_batch_dispatch_starts_with_two_camera_targets(self):
         coordinator = self.make_coordinator()
         coordinator.planning_scene = PlanningScene()
         first = self.candidate("apple-1", [0.6, 0.0, 0.0])
@@ -519,8 +519,18 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
 
         coordinator._dispatch_pending_targets()
 
-        coordinator._start_next_target.assert_not_called()
-        self.assertFalse(coordinator.running)
+        coordinator._start_next_target.assert_called_once_with()
+
+    def test_batch_dispatch_starts_with_one_camera_target(self):
+        coordinator = self.make_coordinator()
+        coordinator.planning_scene = PlanningScene()
+        first = self.candidate("apple-2", [0.6, 0.0, 0.0])
+        coordinator.pending_targets = {first.key: first}
+        coordinator._start_next_target = Mock()
+
+        coordinator._dispatch_pending_targets()
+
+        coordinator._start_next_target.assert_called_once_with()
 
     def test_place_reservation_request_keeps_active_apple_id(self):
         coordinator = self.make_coordinator()

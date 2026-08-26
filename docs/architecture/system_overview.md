@@ -26,6 +26,8 @@ GPU PC 1 카메라 RGB-D 발행
 - 카메라: 베이스, arm, 컨베이어 상단에 Intel RealSense D455
 - 환경: 두 수확 영역, 각 영역의 `tree`·사과 가지 assembly, M0617 2개, 1차 MVP용 컨베이어 3모듈
 - 모션: GPU PC 1의 Lula RRT 전역 계획 + Lula trajectory generation + RMPflow 실행
+- 3차 레일 범위: `m0617_rail`은 고정 마운트로만 사용하며 레일 이동 계획·실행은 제외
+- 수확 인식 범위: 잎은 visual-only이고 `leaf occlusion` 모델링·보정은 제외
 - 통신: ROS 2 Jazzy, Fast DDS, `/clock` 기반 simulation time
 
 ## USD 로봇·카메라 매핑
@@ -45,8 +47,8 @@ RRT는 정적 planning scene에서 transit/staging/pre-grasp/retract의 전역�
 ## PC 역할
 
 - GPU PC 1: Isaac Sim, 두 M0617의 물리, 센서·TF·`/clock`, planning scene 발행, Lula RRT 및
-  trajectory planning, RMPflow 기반 로봇 실행, 실제 PhysX collider 기반 최종 안전
-  감시, motion planning 시각화 토픽 발행
+  trajectory planning, RMPflow 기반 로봇 실행, System Coordinator의 로봇 상태·Place·reset
+  조정, 실제 PhysX collider 기반 최종 안전 감시, motion planning 시각화 토픽 발행
 - GPU PC 2: 컨베이어 카메라 영상 수신, ROI/tracker, 후보 프레임 수집·대표 프레임
   선택, 품질 영상 추론 및 사과 단위 결과 통합
 - 개인 PC 1: GPU PC 1의 RGB-D/CameraInfo/TF를 받아 사과 검출과 3D world 좌표를

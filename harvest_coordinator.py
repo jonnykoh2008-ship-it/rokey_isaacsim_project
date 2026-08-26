@@ -754,8 +754,7 @@ class HarvestCoordinator(Node):
         return float(np.linalg.norm(candidate.center - robot_base))
 
     def _assign_pending_apple_ids(self):
-        if self.planning_scene is None:
-            return
+        """Personal PC 1이 확정해 보낸 target_id를 apple_id로 고정한다."""
         unassigned = [
             candidate
             for candidate in self.pending_targets.values()
@@ -763,30 +762,14 @@ class HarvestCoordinator(Node):
         ]
         if not unassigned:
             return
-        robot_base = self._xyz(
-            self.planning_scene.robot_base_pose.pose.position
-        )
-        used_ids = set(self.target_apple_ids.values())
-        available_ids = [
-            value for value in APPLE_IDS_BY_ROBOT[self.robot_id]
-            if value not in used_ids
-        ]
-        ordered = sorted(
-            unassigned,
-            key=lambda candidate: (
-                float(np.linalg.norm(candidate.center - robot_base)),
-                str(candidate.key),
-            ),
-        )
-        if len(ordered) > len(available_ids):
-            raise RoutePlanningError(
-                f"{self.robot_id} apple_id 범위를 초과했습니다: "
-                f"targets={len(ordered)}, available={len(available_ids)}"
-            )
-        for apple_id, candidate in zip(available_ids, ordered):
+        for candidate in unassigned:
+            apple_id = str(candidate.message.target_id).strip()
+            if not apple_id:
+                raise RoutePlanningError("Personal PC 1 target_id가 비어 있습니다.")
             self.target_apple_ids[candidate.key] = apple_id
             self.get_logger().info(
-                f"target_id={candidate.key[1]} → apple_id={apple_id} 고정"
+                f"Personal PC 1 target_id={candidate.key[1]}를 "
+                f"apple_id={apple_id}로 유지"
             )
 
     def _defer_or_finish_failed_candidate(self, candidate, reason):
@@ -926,13 +909,9 @@ class HarvestCoordinator(Node):
             return
 
     def _dispatch_pending_targets(self):
-        """마지막 신규 target ID 이후 모인 전체 후보를 한 번만 dispatch한다."""
+        """마지막 신규 target 이후 모인 후보가 하나라도 있으면 dispatch한다."""
         self.queue_dispatch_timer.cancel()
-        if not self.target_apple_ids and len(self.pending_targets) < 3:
-            self.get_logger().info(
-                f"{self.robot_id} 거리순 apple_id 확정을 위해 3개 target을 기다립니다: "
-                f"현재 {len(self.pending_targets)}개"
-            )
+        if not self.pending_targets:
             return
         self._start_next_target()
 

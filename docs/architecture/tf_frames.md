@@ -12,8 +12,8 @@
 GPU PC 1의 Isaac Sim Action Graph가 다음을 발행한다.
 
 - `world → odom`: MVP 항등 변환, `/tf_static`
-- `odom → base_link`: MVP 고정 설치 자세, `/tf_static`; 3차 레일에서 동적
-  변환으로 확장
+- 각 로봇의 `odom → base_link`: 고정 설치 자세, `/tf_static`; Phase 3에는
+  레일 이동에 따른 동적 변환을 구현하지 않는다.
 - `base_link → robot links`: 선택한 로봇 articulation 상태 기반 동적 변환, `/tf`
 - `base_link → palm` 및 그리퍼 링크: articulation 상태 기반 동적 변환, `/tf`
 - 고정 카메라 TF: `/tf_static`
@@ -23,7 +23,9 @@ GPU PC 1의 Isaac Sim Action Graph가 다음을 발행한다.
 `robot_state_publisher`는 사용하지 않는다. 현재 USD 멀티로봇 실행은
 `m0617_rail/root_joint`를 Articulation root로 사용하고, TF link 범위는 각
 `m0617_01`·`m0617_02` 본체와 그리퍼로 제한한다. 로봇별 `odom → base_link`
-frame과 최종 ROS namespace는 통합 계약에서 `TBD`다.
+frame은 고정 마운트 자세를 나타내며, ROS 최상위 namespace는
+`/robot_01`, `/robot_02`로 사용한다. frame ID도 `robot_01/...`,
+`robot_02/...`처럼 robot prefix로 구분한다.
 
 ## 좌표계
 

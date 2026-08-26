@@ -62,6 +62,11 @@ parser.add_argument(
     default="robot_01",
     help="수확을 실행할 USD 로봇 프로파일 (기본값: robot_01)",
 )
+parser.add_argument(
+    "--show-colliders",
+    action="store_true",
+    help="로봇·나무 collision proxy를 화면에 표시 (기본값: 숨김)",
+)
 args, _unknown = parser.parse_known_args()
 
 simulation_app = SimulationApp(
@@ -199,12 +204,18 @@ LINK6_PATH = ROBOT_PROFILE.link6_path
 GRIPPER_ROOT_PATH = ROBOT_PROFILE.gripper_root_path
 PALM_PATH = ROBOT_PROFILE.palm_path
 APPLE_ASSEMBLY_ROOT_PATHS = ROBOT_PROFILE.apple_assembly_root_paths
+ALL_APPLE_ASSEMBLY_ROOT_PATHS = tuple(
+    root_path
+    for profile in ROBOT_RUNTIME_PROFILES.values()
+    for root_path in profile.apple_assembly_root_paths
+)
 APPLE_PATHS = tuple(f"{root}/applebody/apple1" for root in APPLE_ASSEMBLY_ROOT_PATHS)
 APPLE_BODY_PATHS = tuple(f"{root}/applebody" for root in APPLE_ASSEMBLY_ROOT_PATHS)
 BRANCH_BODY_PATHS = tuple(f"{root}/branchbody" for root in APPLE_ASSEMBLY_ROOT_PATHS)
 # Stage를 연 뒤 relationship을 검사해 실제 joint 경로로 채운다.
 FIXED_JOINT_PATHS = ()
 APPLE_ASSEMBLIES = ()
+ALL_APPLE_ASSEMBLIES = ()
 
 # 기존 단일 사과 실행 코드는 이 세 active 경로를 사용한다. 비전 Action은
 # target 중심과 가장 가까운 assembly를 선택한 뒤 값을 함께 전환한다.
@@ -219,7 +230,7 @@ COLLISION_DEBUG_ROOT_PATH = "/World/RuntimeHarvestCollisionDebug"
 COLLISION_SPHERE_VISUALIZATION_ROOT_PATH = (
     "/World/RuntimeHarvestCollisionSpheres"
 )
-CONVEYOR_PATH = "/World/ConveyorTrack_01"
+CONVEYOR_PATH = "/World/ConveyorTrack"
 RUNTIME_CONVEYOR_COLLIDER_PATH = "/World/RuntimeConveyorBeltSurface"
 # 두 base D455는 고정 asset이므로 선택한 로봇과 관계없이 물리적으로 고정한다.
 FIXED_CAMERA_ROOT_PATHS = [
@@ -306,6 +317,10 @@ MAX_MOVE_STEPS = 900
 # 작은 여유이며, 실제 접촉 후 그리퍼를 서서히 여는 동안 중력으로 안착한다.
 CONVEYOR_END_INSET_M = 0.45
 CONVEYOR_OUTSIDE_OFFSET_M = 0.30
+# 사과 중심을 벨트 가장자리 쪽에 놓을 때 사과 외곽과 상판 끝 사이에 남길
+# 최소 여유다. 폭이 바뀌어도 중심선 근처로 강제하지 않고 로봇에 가까운 유효
+# 상판 위를 사용한다.
+CONVEYOR_EDGE_CLEARANCE_M = 0.03
 SAFE_CARRY_CLEARANCE_M = 0.15
 # 이 로봇 배치에서는 하향 그리퍼 자세로 상판 25 cm 위를 요구하면 손목이
 # 작업반경을 벗어난다. 실제 IK 결과에서 LOWER는 성공했으므로 12 cm 상공에서
@@ -331,6 +346,11 @@ TARGET_ORIENTATION_TOLERANCE_DEG = 6.0
 PREGRASP_POSITION_TOLERANCE_M = 0.005
 PREGRASP_ORIENTATION_TOLERANCE_DEG = 2.0
 MAX_TARGET_SETTLE_STEPS = 180
+# 시간 궤적이 끝난 직후 실제 관절이 아직 뒤처져 있으면 task-space 직선
+# 보정으로 전환하지 않는다. 검증된 RRT 종점의 c-space 목표를 먼저 유지한다.
+RRT_CSPACE_SETTLE_TOLERANCE_RAD = 0.03
+RRT_TASK_SETTLE_MAX_POSITION_ERROR_M = 0.05
+RRT_TASK_SETTLE_MAX_ORIENTATION_ERROR_DEG = 10.0
 APPLE_GRASP_MAX_DISTANCE_M = 0.14
 
 # RMPflow planning proxy와 재계획의 초기값이다. 문서의 최소 안전거리를
@@ -353,6 +373,10 @@ PLANNING_CORRIDOR_RADIUS_M = 0.25
 START_PROXY_EXCLUSION_RADIUS_M = 0.18
 MAX_BRANCH_PROXIES = 48
 TARGET_APPLE_OBSTACLE_RADIUS_M = 0.060
+# RRT waypoint 자체는 목표 사과를 피하더라도 waypoint를 잇는 시간 spline이
+# 안쪽으로 휘어 실제 finger/palm collider가 먼저 닿을 수 있다. 최종 60 Hz
+# trajectory 검증에서는 planning 반경 바깥으로 이 여유까지 확보한다.
+TARGET_APPLE_APPROACH_CLEARANCE_M = 0.010
 RMPFLOW_MAXIMUM_SUBSTEP_S = 1.0 / 300.0
 RMPFLOW_SEGMENT_STEPS = 360
 COLLISION_VISUALIZATION_UPDATE_STEPS = 4
@@ -625,8 +649,8 @@ def resolve_unique_named_prim_path(stage, prim_name):
 
 
 def discover_apple_assemblies(stage):
-    """세 apple_branch assembly와 각각을 연결하는 FixedJoint를 검증한다."""
-    global APPLE_ASSEMBLIES, FIXED_JOINT_PATHS
+    """두 나무의 apple_branch assembly와 FixedJoint를 모두 검증한다."""
+    global ALL_APPLE_ASSEMBLIES, APPLE_ASSEMBLIES, FIXED_JOINT_PATHS
 
     joints_by_bodies = {}
     for prim in stage.Traverse():
@@ -638,12 +662,10 @@ def discover_apple_assemblies(stage):
         joints_by_bodies.setdefault((body0, body1), []).append(str(prim.GetPath()))
 
     assemblies = []
-    for root_path, apple_path, apple_body_path, branch_body_path in zip(
-        APPLE_ASSEMBLY_ROOT_PATHS,
-        APPLE_PATHS,
-        APPLE_BODY_PATHS,
-        BRANCH_BODY_PATHS,
-    ):
+    for root_path in ALL_APPLE_ASSEMBLY_ROOT_PATHS:
+        apple_path = f"{root_path}/applebody/apple1"
+        apple_body_path = f"{root_path}/applebody"
+        branch_body_path = f"{root_path}/branchbody"
         for prim_path in (root_path, apple_path, apple_body_path, branch_body_path):
             require_prim(stage, prim_path)
         matches = joints_by_bodies.get(
@@ -665,8 +687,16 @@ def discover_apple_assemblies(stage):
             }
         )
 
-    APPLE_ASSEMBLIES = tuple(assemblies)
-    FIXED_JOINT_PATHS = tuple(item["joint_path"] for item in APPLE_ASSEMBLIES)
+    ALL_APPLE_ASSEMBLIES = tuple(assemblies)
+    selected_roots = set(APPLE_ASSEMBLY_ROOT_PATHS)
+    APPLE_ASSEMBLIES = tuple(
+        assembly
+        for assembly in ALL_APPLE_ASSEMBLIES
+        if assembly["root_path"] in selected_roots
+    )
+    FIXED_JOINT_PATHS = tuple(
+        item["joint_path"] for item in ALL_APPLE_ASSEMBLIES
+    )
     return APPLE_ASSEMBLIES
 
 
@@ -774,7 +804,10 @@ def open_project_stage():
     print(f"   Tree Root    {TREE_ROOT_PATH}")
     print(f"   Stage        {STAGE_PATH}")
     print("   Stage units  1.0 meter")
-    print(f"   Apples       {len(APPLE_ASSEMBLIES)} assemblies")
+    print(
+        f"   Apples       selected {len(APPLE_ASSEMBLIES)}, "
+        f"total {len(ALL_APPLE_ASSEMBLIES)} assemblies"
+    )
     for assembly in APPLE_ASSEMBLIES:
         print(
             f"                 {assembly['root_path']} -> "
@@ -784,9 +817,9 @@ def open_project_stage():
 
 
 def configure_breakable_joint(stage):
-    """USD에 저장된 세 사과-가지 FixedJoint를 검증하고 활성화한다."""
+    """두 나무의 모든 사과 FixedJoint에 동일한 파손 한계를 적용한다."""
     break_force, break_torque = configured_break_limits()
-    for assembly in APPLE_ASSEMBLIES:
+    for assembly in ALL_APPLE_ASSEMBLIES:
         joint = UsdPhysics.Joint(require_prim(stage, assembly["joint_path"]))
         body0 = [str(path) for path in joint.GetBody0Rel().GetTargets()]
         body1 = [str(path) for path in joint.GetBody1Rel().GetTargets()]
@@ -819,7 +852,8 @@ def configure_breakable_joint(stage):
             f"body1 {assembly['apple_body_path']}"
         )
     print(
-        f"   Apple joints break test {args.break_test}: "
+        f"   Apple joints {len(ALL_APPLE_ASSEMBLIES)}개 break test "
+        f"{args.break_test}: "
         f"force {break_force:.3g} N, torque {break_torque:.3g} N·m"
     )
 
@@ -1004,6 +1038,7 @@ class RobotAppleContactMonitor:
         self.state = "IDLE"
         self.palm_contacted = False
         self.finger_contacted = False
+        self.contacted_fingers = set()
         self.palm_path = None
         self.finger_path = None
         articulation = require_prim(stage, ARTICULATION_PRIM_PATH)
@@ -1035,9 +1070,21 @@ class RobotAppleContactMonitor:
 
     def reset(self):
         self.palm_contacted = False
-        self.finger_contacted = False
         self.palm_path = None
+        self.reset_finger_contacts()
+
+    def reset_finger_contacts(self):
+        """palm 접촉은 유지하고 GRASP용 손가락 접촉 기록만 비운다."""
+        self.finger_contacted = False
         self.finger_path = None
+        self.contacted_fingers.clear()
+
+    @staticmethod
+    def _finger_name(path):
+        for name in ("finger_1", "finger_2", "finger_middle"):
+            if f"/{name}_" in path or f"/{name}/" in path:
+                return name
+        return None
 
     def close(self):
         self._subscription = None
@@ -1065,12 +1112,22 @@ class RobotAppleContactMonitor:
                         f"   [APPLE CONTACT] state={self.state}, "
                         f"type=palm, robot={gripper_path}"
                     )
-            elif not self.finger_contacted:
+            else:
+                finger_name = self._finger_name(gripper_path)
+                if finger_name is None:
+                    continue
+                first_finger_contact = not self.finger_contacted
+                new_finger = finger_name not in self.contacted_fingers
                 self.finger_contacted = True
-                self.finger_path = gripper_path
+                self.contacted_fingers.add(finger_name)
+                if first_finger_contact:
+                    self.finger_path = gripper_path
+                if not new_finger:
+                    continue
                 print(
                     f"   [APPLE CONTACT] state={self.state}, "
-                    f"type=finger, robot={gripper_path}"
+                    f"type={finger_name}, contacts="
+                    f"{len(self.contacted_fingers)}/3, robot={gripper_path}"
                 )
 
 
@@ -1104,6 +1161,75 @@ def find_robot_tree_physx_overlap(stage):
     return None
 
 
+def compute_authored_rail_position(stage, rail_joint_path):
+    """Play 전 USD body pose를 prismatic joint 좌표로 환산한다."""
+    joint_prim = require_prim(stage, rail_joint_path)
+    prismatic_joint = UsdPhysics.PrismaticJoint(joint_prim)
+    if not prismatic_joint:
+        raise RuntimeError(f"Prismatic rail joint가 아닙니다: {rail_joint_path}")
+
+    joint = UsdPhysics.Joint(joint_prim)
+    body0_targets = joint.GetBody0Rel().GetTargets()
+    body1_targets = joint.GetBody1Rel().GetTargets()
+    if len(body0_targets) != 1 or len(body1_targets) != 1:
+        raise RuntimeError(
+            "레일 joint body 관계가 잘못되었습니다: "
+            f"{rail_joint_path}, body0={body0_targets}, body1={body1_targets}"
+        )
+
+    body0 = require_prim(stage, str(body0_targets[0]))
+    body1 = require_prim(stage, str(body1_targets[0]))
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    body0_world = xform_cache.GetLocalToWorldTransform(body0)
+    body1_world = xform_cache.GetLocalToWorldTransform(body1)
+    frame0_world = body0_world.Transform(
+        Gf.Vec3d(joint.GetLocalPos0Attr().Get())
+    )
+    frame1_world = body1_world.Transform(
+        Gf.Vec3d(joint.GetLocalPos1Attr().Get())
+    )
+
+    axis_name = str(prismatic_joint.GetAxisAttr().Get())
+    axis_by_name = {
+        "X": Gf.Vec3d(1.0, 0.0, 0.0),
+        "Y": Gf.Vec3d(0.0, 1.0, 0.0),
+        "Z": Gf.Vec3d(0.0, 0.0, 1.0),
+    }
+    if axis_name not in axis_by_name:
+        raise RuntimeError(
+            f"지원하지 않는 rail joint axis입니다: {axis_name}"
+        )
+
+    local_rotation = joint.GetLocalRot0Attr().Get()
+    local_rotation_d = Gf.Quatd(
+        float(local_rotation.GetReal()),
+        Gf.Vec3d(local_rotation.GetImaginary()),
+    )
+    axis_body0 = Gf.Rotation(local_rotation_d).TransformDir(
+        axis_by_name[axis_name]
+    )
+    axis_world = body0_world.TransformDir(axis_body0)
+    axis_length = float(axis_world.GetLength())
+    if not np.isfinite(axis_length) or axis_length <= 1e-9:
+        raise RuntimeError(f"레일 joint axis가 유효하지 않습니다: {axis_world}")
+    axis_world /= axis_length
+
+    authored_position = float(Gf.Dot(frame1_world - frame0_world, axis_world))
+    lower_limit = prismatic_joint.GetLowerLimitAttr().Get()
+    upper_limit = prismatic_joint.GetUpperLimitAttr().Get()
+    if lower_limit is not None and authored_position < float(lower_limit) - 1e-6:
+        raise RuntimeError(
+            f"USD rail 위치가 lower limit 밖입니다: {authored_position:.6f} < "
+            f"{float(lower_limit):.6f}, joint={rail_joint_path}"
+        )
+    if upper_limit is not None and authored_position > float(upper_limit) + 1e-6:
+        raise RuntimeError(
+            f"USD rail 위치가 upper limit 밖입니다: {authored_position:.6f} > "
+            f"{float(upper_limit):.6f}, joint={rail_joint_path}"
+        )
+    return authored_position
+
+
 def configure_joint_drives(stage):
     """팔은 위치를 잘 추종하고, 손가락은 과도한 충격 없이 닫히게 한다."""
     # 고정 설치된 base/conv D455 payload에 포함된 RigidBodyAPI를 실행
@@ -1135,20 +1261,65 @@ def configure_joint_drives(stage):
             camera_body_count = 1
         fixed_camera_bodies += camera_body_count
 
-    # rail_joint는 저장된 초기 위치를 유지한다. 수확 동작은 M0617 팔과
-    # 그리퍼만 변경하고, rail root가 제공하는 설치 위치는 이동시키지 않는다.
-    rail_joint_prim = require_prim(stage, RAIL_JOINT_PATH)
-    rail_drive = UsdPhysics.DriveAPI.Get(rail_joint_prim, "linear")
-    if not rail_drive:
-        raise RuntimeError(f"레일 linear Drive가 없습니다: {RAIL_JOINT_PATH}")
-    initial_rail_position = rail_joint_prim.GetAttribute(
-        "state:linear:physics:position"
-    ).Get()
-    if initial_rail_position is None or not np.isfinite(initial_rail_position):
-        raise RuntimeError(
-            f"레일 초기 위치가 유효하지 않습니다: {initial_rail_position}"
+    # Play 전 USD에서 보이는 carriage 위치를 각 prismatic joint 좌표로
+    # 환산해 고정한다. 선택되지 않은 로봇도 PhysX가 시뮬레이션하므로 두 rail
+    # 모두 state와 drive target을 같은 authored 위치로 맞춘다.
+    rail_holds = []
+    for profile in ROBOT_RUNTIME_PROFILES.values():
+        try:
+            rail_joint_prim = require_prim(stage, profile.rail_joint_path)
+            initial_rail_position = compute_authored_rail_position(
+                stage, profile.rail_joint_path
+            )
+        except RuntimeError as error:
+            if profile.robot_id == ROBOT_PROFILE.robot_id:
+                raise
+            print(
+                f"   Rail hold skip {profile.robot_id}: {error}"
+            )
+            continue
+
+        rail_drive = UsdPhysics.DriveAPI.Get(rail_joint_prim, "linear")
+        target_position = (
+            rail_drive.GetTargetPositionAttr()
+            if rail_drive
+            else rail_joint_prim.GetAttribute(
+                "drive:linear:physics:targetPosition"
+            )
         )
-    rail_drive.GetTargetPositionAttr().Set(float(initial_rail_position))
+        if not target_position.IsValid():
+            raise RuntimeError(
+                f"레일 linear Drive가 없습니다: {profile.rail_joint_path}"
+            )
+
+        state_position = rail_joint_prim.GetAttribute(
+            "state:linear:physics:position"
+        )
+        if not state_position.IsValid():
+            raise RuntimeError(
+                f"레일 초기 state 속성이 없습니다: {profile.rail_joint_path}"
+            )
+        state_position.Set(initial_rail_position)
+
+        state_velocity = rail_joint_prim.GetAttribute(
+            "state:linear:physics:velocity"
+        )
+        if state_velocity.IsValid():
+            state_velocity.Set(0.0)
+
+        target_position.Set(initial_rail_position)
+        target_velocity = (
+            rail_drive.GetTargetVelocityAttr()
+            if rail_drive
+            else rail_joint_prim.GetAttribute(
+                "drive:linear:physics:targetVelocity"
+            )
+        )
+        if target_velocity.IsValid():
+            target_velocity.Set(0.0)
+        rail_holds.append(
+            f"{profile.robot_id}={initial_rail_position:.3f} m"
+        )
 
     arm_count = 0
     gripper_count = 0
@@ -1184,7 +1355,7 @@ def configure_joint_drives(stage):
         raise RuntimeError(f"그리퍼 Drive 수가 잘못되었습니다: {gripper_count}")
 
     print(
-        f"   Drives       rail hold {float(initial_rail_position):.3f} m, "
+        f"   Drives       rail hold {', '.join(rail_holds)}, "
         f"arm {arm_count}, gripper {gripper_count}"
     )
     print(
@@ -1349,6 +1520,52 @@ def _component_capsule_spec(points):
     return center, axis, radius, height
 
 
+def _robust_local_cross_section(points, tangent):
+    """갈림점 outlier에 끌려가지 않는 로컬 단면 중심과 반경을 계산한다.
+
+    기존 radial RMS는 한 40 mm slab 안에 굽은 가지나 갈림점의 먼 점이 조금만
+    섞여도 그 거리를 capsule 반경으로 직접 반영했다. 로컬 축에 수직인 두 축의
+    좌표 중앙값으로 중심선을 잡고, 그 중심선까지 거리의 중앙값을 사용하면
+    정상 원통 표면의 반경은 유지하면서 한쪽으로 뻗은 갈림점의 영향은 제한된다.
+    """
+    points = np.asarray(points, dtype=float)
+    tangent = np.asarray(tangent, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or len(points) < 3:
+        raise ValueError("로컬 단면에는 3개 이상의 3차원 점이 필요합니다.")
+    tangent_norm = float(np.linalg.norm(tangent))
+    if not np.isfinite(tangent_norm) or tangent_norm <= 1e-9:
+        raise ValueError("로컬 단면 축이 유효하지 않습니다.")
+    tangent = tangent / tangent_norm
+
+    reference = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(reference, tangent))) > 0.9:
+        reference = np.array([0.0, 1.0, 0.0], dtype=float)
+    radial_u = np.cross(tangent, reference)
+    radial_u /= np.linalg.norm(radial_u)
+    radial_v = np.cross(tangent, radial_u)
+    radial_v /= np.linalg.norm(radial_v)
+
+    axial_coordinates = points @ tangent
+    radial_u_coordinates = points @ radial_u
+    radial_v_coordinates = points @ radial_v
+    axial_center = float(np.median(axial_coordinates))
+    radial_u_center = float(np.median(radial_u_coordinates))
+    radial_v_center = float(np.median(radial_v_coordinates))
+    center = (
+        tangent * axial_center
+        + radial_u * radial_u_center
+        + radial_v * radial_v_center
+    )
+    radial_distances = np.hypot(
+        radial_u_coordinates - radial_u_center,
+        radial_v_coordinates - radial_v_center,
+    )
+    radius = float(np.median(radial_distances))
+    if not np.isfinite(radius):
+        raise ValueError("로컬 단면 반경이 유효하지 않습니다.")
+    return center, radius
+
+
 def _component_local_slices(points):
     """연결 성분을 장축 방향으로 나누고 구간별 중심선과 반경을 계산한다."""
     points = np.asarray(points, dtype=float)
@@ -1390,12 +1607,12 @@ def _component_local_slices(points):
         if float(np.linalg.norm(tangent)) < 1e-9:
             tangent = global_axis
         tangent = normalized(tangent)
-        centered = item["points"] - item["center"]
-        radial = centered - np.outer(centered @ tangent, tangent)
-        item["axis"] = tangent
-        item["radius"] = float(
-            np.sqrt(np.mean(np.sum(radial * radial, axis=1)))
+        robust_center, robust_radius = _robust_local_cross_section(
+            item["points"], tangent
         )
+        item["center"] = robust_center
+        item["axis"] = tangent
+        item["radius"] = robust_radius
         item["thick"] = item["radius"] >= TREE_PHYSX_MIN_BRANCH_RADIUS_M
     return slices
 
@@ -1480,16 +1697,21 @@ def configure_unified_tree_physx_colliders(stage):
             for segment_index, spec in enumerate(local_specs):
                 component_specs.append((component_index, segment_index, *spec))
 
-    for large_index, segment_index, center, axis, radius, height in component_specs:
+    segment_radii = []
+    for component_index, segment_index, center, axis, radius, height in component_specs:
         path = (
             f"{RUNTIME_TREE_COLLIDER_ROOT_PATH}/"
-            f"large_{large_index:03d}_segment_{segment_index:03d}"
+            f"thick_component_{component_index:03d}_segment_{segment_index:03d}"
         )
         capsule = UsdGeom.Capsule.Define(stage, path)
         capsule.CreateAxisAttr().Set(UsdGeom.Tokens.z)
         capsule.CreateRadiusAttr().Set(float(radius))
         capsule.CreateHeightAttr().Set(float(height))
-        capsule.CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+        capsule.CreateVisibilityAttr().Set(
+            UsdGeom.Tokens.inherited
+            if args.show_colliders
+            else UsdGeom.Tokens.invisible
+        )
         xform = UsdGeom.Xformable(capsule.GetPrim())
         xform.AddTranslateOp().Set(Gf.Vec3d(*(float(value) for value in center)))
         quaternion = _rotation_from_z_axis(axis)
@@ -1501,12 +1723,19 @@ def configure_unified_tree_physx_colliders(stage):
         )
         collision = UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
         collision.CreateCollisionEnabledAttr().Set(True)
+        segment_radii.append(float(radius))
+        print(
+            f"   Tree collider {path}: radius {radius:.4f} m, "
+            f"height {height:.4f} m, center {vec(center)}"
+        )
 
+    maximum_radius = max(segment_radii, default=0.0)
     print(
         f"   Tree collider local segments {len(component_specs)} from "
         f"{locally_thick_component_count} locally thick components, "
         f"slice {TREE_LOCAL_SEGMENT_LENGTH_M:.3f} m, "
-        f"local radius >= {TREE_PHYSX_MIN_BRANCH_RADIUS_M:.3f} m"
+        f"local radius >= {TREE_PHYSX_MIN_BRANCH_RADIUS_M:.3f} m, "
+        f"maximum radius {maximum_radius:.4f} m"
     )
     return component_count, len(component_specs), original_colliders_disabled
 
@@ -1781,6 +2010,108 @@ def compute_apple_center(stage):
     return center, size
 
 
+def compute_conveyor_target_geometry(minimum, maximum, robot_position, apple_size):
+    """상판 경계에서 로봇에 가까우면서 사과 전체가 올라가는 배치점을 계산한다."""
+    minimum = np.asarray(minimum, dtype=float)
+    maximum = np.asarray(maximum, dtype=float)
+    robot_position = np.asarray(robot_position, dtype=float)
+    apple_size = np.asarray(apple_size, dtype=float)
+    size = maximum - minimum
+    if minimum.shape != (3,) or maximum.shape != (3,) or np.any(size <= 1e-4):
+        raise ValueError("컨베이어 상판 경계가 유효하지 않습니다.")
+
+    center = 0.5 * (minimum + maximum)
+    travel_axis = int(np.argmax(size[:2]))
+    side_axis = 1 - travel_axis
+    inset = min(CONVEYOR_END_INSET_M, 0.25 * size[travel_axis])
+
+    negative_end = center.copy()
+    positive_end = center.copy()
+    negative_end[travel_axis] = minimum[travel_axis] + inset
+    positive_end[travel_axis] = maximum[travel_axis] - inset
+    robot_xy = robot_position[:2]
+    near_end = min(
+        (negative_end, positive_end),
+        key=lambda point: np.linalg.norm(point[:2] - robot_xy),
+    ).copy()
+    start = near_end.copy()
+
+    # 예전의 중심 ±20% 제한은 폭이 커지면 로봇에서 불필요하게 먼 점을 만든다.
+    # 사과 반폭과 가장자리 여유만 확보한 전체 유효 폭에서 가장 가까운 점을 쓴다.
+    side_inset = 0.5 * float(apple_size[side_axis]) + CONVEYOR_EDGE_CLEARANCE_M
+    usable_min = minimum[side_axis] + side_inset
+    usable_max = maximum[side_axis] - side_inset
+    if usable_min > usable_max:
+        raise RuntimeError(
+            "컨베이어 유효 폭이 사과와 가장자리 여유보다 좁습니다: "
+            f"width={size[side_axis]:.4f} m, required={2.0 * side_inset:.4f} m"
+        )
+    start[side_axis] = np.clip(robot_xy[side_axis], usable_min, usable_max)
+
+    outside_direction = np.zeros(3, dtype=float)
+    outside_direction[side_axis] = np.sign(robot_xy[side_axis] - center[side_axis])
+    if abs(outside_direction[side_axis]) < 0.5:
+        distance_to_min = abs(robot_xy[side_axis] - minimum[side_axis])
+        distance_to_max = abs(robot_xy[side_axis] - maximum[side_axis])
+        outside_direction[side_axis] = -1.0 if distance_to_min <= distance_to_max else 1.0
+    outside = start.copy()
+    outside[side_axis] = (
+        minimum[side_axis] - CONVEYOR_OUTSIDE_OFFSET_M
+        if outside_direction[side_axis] < 0.0
+        else maximum[side_axis] + CONVEYOR_OUTSIDE_OFFSET_M
+    )
+
+    conveyor_direction = np.zeros(3, dtype=float)
+    conveyor_direction[travel_axis] = -np.sign(
+        near_end[travel_axis] - center[travel_axis]
+    )
+    return start, outside, conveyor_direction, travel_axis, side_axis, side_inset
+
+
+def compute_direct_neutral_transfer(tree_clear_position, conveyor_outside_high):
+    """이미 나무 밖인 pose와 컨베이어 바깥 상공 사이의 중립점을 계산한다."""
+    tree_clear_position = np.asarray(tree_clear_position, dtype=float)
+    conveyor_outside_high = np.asarray(conveyor_outside_high, dtype=float)
+    if tree_clear_position.shape != (3,) or conveyor_outside_high.shape != (3,):
+        raise ValueError("중립 운반점 입력은 3차원 좌표여야 합니다.")
+    neutral = 0.5 * (tree_clear_position + conveyor_outside_high)
+    neutral[2] = max(tree_clear_position[2], conveyor_outside_high[2])
+    return neutral
+
+
+def select_conveyor_surface_layer(surface_candidates):
+    """대표 운반면과 같은 높이인 Mesh만 합쳐 상판 경계를 반환한다.
+
+    ``surface_candidates`` 항목은 ``(score, prim, box, mesh_size)``이다.
+    가장 넓고 얇은 대표 Mesh가 실제 운반면의 Z를 결정한다. 같은 높이에
+    분할된 Mesh는 X/Y 폭에 합치되, 상단 프레임처럼 더 높은 Mesh는 제외한다.
+    """
+    if not surface_candidates:
+        raise ValueError("컨베이어 surface candidate가 비어 있습니다.")
+
+    anchor = max(surface_candidates, key=lambda item: item[0])
+    anchor_minimum = np.array(anchor[2].GetMin(), dtype=float)
+    anchor_maximum = np.array(anchor[2].GetMax(), dtype=float)
+    anchor_thickness = max(float(anchor[3][2]), 1e-4)
+    # 같은 상판으로 authoring된 분할 Mesh의 미세한 bbox 편차만 허용한다.
+    # 허용치는 대표 Mesh 두께에 비례하되 상·하 프레임까지 합쳐지지 않게 제한한다.
+    layer_tolerance = max(1e-4, min(0.01, 0.1 * anchor_thickness))
+    layer = [
+        item
+        for item in surface_candidates
+        if abs(float(item[2].GetMax()[2]) - anchor_maximum[2])
+        <= layer_tolerance
+    ]
+
+    layer_minima = np.array([item[2].GetMin() for item in layer], dtype=float)
+    layer_maxima = np.array([item[2].GetMax() for item in layer], dtype=float)
+    minimum = anchor_minimum.copy()
+    maximum = anchor_maximum.copy()
+    minimum[:2] = np.min(layer_minima[:, :2], axis=0)
+    maximum[:2] = np.max(layer_maxima[:, :2], axis=0)
+    return minimum, maximum, layer, anchor, layer_tolerance
+
+
 def compute_conveyor_start(stage, robot_position, apple_size):
     """컨베이어 시작점과 그 바깥쪽의 안전 접근점을 계산한다.
 
@@ -1819,68 +2150,77 @@ def compute_conveyor_start(stage, robot_position, apple_size):
         surface_candidates.append((score, prim, mesh_box, mesh_size))
 
     if surface_candidates:
-        _score, surface_prim, box, _surface_size = max(
-            surface_candidates,
-            key=lambda item: item[0],
-        )
-        surface_path = str(surface_prim.GetPath())
+        named_belts = [
+            item for item in surface_candidates
+            if "belt" in item[1].GetName().lower()
+        ]
+        if named_belts:
+            # 폭 변경 자산은 상판이 여러 belt Mesh로 나뉠 수 있다. 실제 운반면과
+            # 같은 높이인 Mesh만 X/Y로 합쳐 프레임 상단을 상판으로 오인하지 않는다.
+            (
+                minimum,
+                maximum,
+                selected_layer,
+                anchor,
+                layer_tolerance,
+            ) = select_conveyor_surface_layer(named_belts)
+            surface_path = ", ".join(
+                str(item[1].GetPath()) for item in selected_layer
+            )
+            rejected_high = [
+                item
+                for item in named_belts
+                if float(item[2].GetMax()[2])
+                > float(maximum[2]) + layer_tolerance
+            ]
+            if rejected_high:
+                rejected_text = ", ".join(
+                    f"{item[1].GetPath()}(top={float(item[2].GetMax()[2]):.4f})"
+                    for item in rejected_high
+                )
+                print(
+                    "   Conveyor     higher non-surface belt Mesh excluded: "
+                    f"{rejected_text}"
+                )
+            print(
+                "   Conveyor     surface anchor "
+                f"{anchor[1].GetPath()}, top {float(maximum[2]):.4f} m, "
+                f"layer tolerance {layer_tolerance:.4f} m"
+            )
+        else:
+            (
+                minimum,
+                maximum,
+                selected_layer,
+                anchor,
+                layer_tolerance,
+            ) = select_conveyor_surface_layer(
+                surface_candidates,
+            )
+            surface_path = ", ".join(
+                str(item[1].GetPath()) for item in selected_layer
+            )
+            print(
+                "   Conveyor     surface anchor "
+                f"{anchor[1].GetPath()}, top {float(maximum[2]):.4f} m, "
+                f"layer tolerance {layer_tolerance:.4f} m"
+            )
     else:
         # 자산이 하나의 결합 Mesh인 경우에만 전체 경계를 최후 수단으로 쓴다.
-        box = root_box
+        minimum = np.array(root_box.GetMin(), dtype=float)
+        maximum = np.array(root_box.GetMax(), dtype=float)
         surface_path = f"{CONVEYOR_PATH} (combined fallback)"
 
-    minimum = np.array(box.GetMin(), dtype=float)
-    maximum = np.array(box.GetMax(), dtype=float)
     size = maximum - minimum
-
-    center = 0.5 * (minimum + maximum)
-    travel_axis = int(np.argmax(size[:2]))
-    side_axis = 1 - travel_axis
-    inset = min(CONVEYOR_END_INSET_M, 0.25 * size[travel_axis])
-
-    negative_end = center.copy()
-    positive_end = center.copy()
-    negative_end[travel_axis] = minimum[travel_axis] + inset
-    positive_end[travel_axis] = maximum[travel_axis] - inset
-    robot_xy = np.asarray(robot_position[:2], dtype=float)
-    candidates = (negative_end, positive_end)
-    near_end = min(
-        candidates,
-        key=lambda point: np.linalg.norm(point[:2] - robot_xy),
-    ).copy()
-    # 진행축 위치는 이동 거리를 줄이기 위해 로봇과 가까운 끝단 쪽을 쓴다.
-    start = near_end.copy()
-
-    # 폭 방향은 정확한 중심선을 강제하지 않고 전체 폭의 중심 ±20% 구간을
-    # 허용한다. 그 구간 안에서 로봇과 가장 가까운 좌표를 선택한다.
-    center_band_half_width = 0.20 * size[side_axis]
-    start[side_axis] = np.clip(
-        robot_xy[side_axis],
-        center[side_axis] - center_band_half_width,
-        center[side_axis] + center_band_half_width,
-    )
-
-    # 경유점은 벨트 진행축 끝 너머가 아니라 로봇과 가까운 측면 바깥에 둔다.
-    # 이렇게 해야 팔이 먼 끝으로 우회하지 않고 컨베이어를 가로지르지도 않는다.
-    outside_direction = np.zeros(3, dtype=float)
-    outside_direction[side_axis] = np.sign(robot_xy[side_axis] - center[side_axis])
-    if abs(outside_direction[side_axis]) < 0.5:
-        distance_to_min = abs(robot_xy[side_axis] - minimum[side_axis])
-        distance_to_max = abs(robot_xy[side_axis] - maximum[side_axis])
-        outside_direction[side_axis] = -1.0 if distance_to_min <= distance_to_max else 1.0
-    if abs(outside_direction[side_axis]) < 0.5:
-        raise RuntimeError("컨베이어 바깥쪽 방향을 결정하지 못했습니다.")
-    outside = start.copy()
-    outside[side_axis] = (
-        minimum[side_axis] - CONVEYOR_OUTSIDE_OFFSET_M
-        if outside_direction[side_axis] < 0.0
-        else maximum[side_axis] + CONVEYOR_OUTSIDE_OFFSET_M
-    )
-
-    # 배치 자세의 수평축은 선택한 진행축 끝에서 벨트 중심으로 향한다.
-    conveyor_direction = np.zeros(3, dtype=float)
-    conveyor_direction[travel_axis] = -np.sign(
-        near_end[travel_axis] - center[travel_axis]
+    (
+        start,
+        outside,
+        conveyor_direction,
+        travel_axis,
+        side_axis,
+        side_inset,
+    ) = compute_conveyor_target_geometry(
+        minimum, maximum, robot_position, apple_size
     )
 
     surface_z = float(maximum[2])
@@ -1913,6 +2253,10 @@ def compute_conveyor_start(stage, robot_position, apple_size):
     axis_name = "X" if travel_axis == 0 else "Y"
     print(f"   Conveyor     surface mesh {surface_path}")
     print(f"   Conveyor     surface bbox min {vec(minimum)}, max {vec(maximum)}")
+    print(
+        f"   Conveyor     length {size[travel_axis]:.4f} m, "
+        f"width {size[side_axis]:.4f} m, edge inset {side_inset:.4f} m"
+    )
     print(
         f"   Conveyor     runtime collider {runtime_path}, "
         f"size {vec(collider_size)}"
@@ -2457,6 +2801,36 @@ class AppleHarvestFSM:
         self.settle_frame = 0
         self._print_state()
 
+    def skip_tree_exit_from_clear_pose(self, actual_position, actual_rotation):
+        """이미 tree proxy 밖이면 고정 0.45 m 탈출점을 버리고 직접 운반한다."""
+        if self.done or self.NAMES[self.state] != "CLEAR_UP":
+            current = "DONE" if self.done else self.NAMES[self.state]
+            raise RuntimeError(
+                "TREE_EXIT 생략 요청 시 현재 FSM 상태가 다릅니다: "
+                f"{current}"
+            )
+        neutral_index = self.NAMES.index("NEUTRAL_TRANSFER")
+        conveyor_index = self.NAMES.index("CONVEYOR_OUTSIDE_HIGH")
+        conveyor_outside_high = np.asarray(
+            self.specs[conveyor_index][0], dtype=float
+        )
+        neutral = compute_direct_neutral_transfer(
+            actual_position, conveyor_outside_high
+        )
+        _old_target, rotation, _steps, grip0, grip1 = self.specs[neutral_index]
+        steps = max(
+            MIN_MOVE_STEPS,
+            int(
+                np.ceil(
+                    np.linalg.norm(neutral - np.asarray(actual_position, dtype=float))
+                    / PLACE_TRANSIT_STEP_M
+                )
+            ),
+        )
+        self.specs[neutral_index] = (neutral, rotation, steps, grip0, grip1)
+        self.skip_current_state("CLEAR_UP", actual_position, actual_rotation)
+        self.skip_current_state("TREE_EXIT", actual_position, actual_rotation)
+
     def complete_current_on_contact(self, actual_position, actual_rotation):
         """저속 진입 중 palm 접촉 위치를 GRASP 유지 pose로 확정한다."""
         if self.done or self.NAMES[self.state] != "ENTER_SLOW":
@@ -2873,7 +3247,8 @@ def create_planning_obstacles(stage, path_start, pregrasp_tcp, apple_center):
         stage,
         f"{PLANNING_OBSTACLE_ROOT_PATH}/target_apple",
         apple_center,
-        TARGET_APPLE_OBSTACLE_RADIUS_M,
+        TARGET_APPLE_OBSTACLE_RADIUS_M
+        + TARGET_APPLE_APPROACH_CLEARANCE_M,
     )
     obstacles.append(target_apple)
     other_apple_count = 0
@@ -3033,6 +3408,9 @@ class CollisionAwareMotion:
         self.path_start = np.asarray(path_start, dtype=float)
         self.apple_center = np.asarray(apple_center, dtype=float)
         self.pregrasp_tcp = np.asarray(pregrasp_tcp, dtype=float)
+        # 초기 관절 자세의 전체 링크 clearance를 검사하기 전에 활성 상태가
+        # 정의되어 있어야 한다. 실제 planner obstacle 등록은 아래에서 한다.
+        self.apple_obstacle_enabled = True
         self.plan_callback = plan_callback
         self.approach_direction = normalized(
             self.apple_center - self.pregrasp_tcp
@@ -3119,7 +3497,6 @@ class CollisionAwareMotion:
                 )
         self.rmpflow.update_world()
         self.rrt.update_world()
-        self.apple_obstacle_enabled = True
         print(f"   RMPflow      frame {EE_FRAME_NAME}, obstacles {len(self.obstacles)}")
         print(
             f"   RRT          frame {EE_FRAME_NAME}, joints "
@@ -3206,15 +3583,20 @@ class CollisionAwareMotion:
         return instancer
 
     def _initialize_collision_sphere_visualization(self, joint_positions):
-        """나무와 현재 로봇 collision sphere를 Stage에 지속 표시한다."""
+        """나무와 현재 로봇 collision sphere를 선택적으로 Stage에 표시한다."""
         root = self.stage.GetPrimAtPath(
             COLLISION_SPHERE_VISUALIZATION_ROOT_PATH
         )
         if root.IsValid():
             self.stage.RemovePrim(COLLISION_SPHERE_VISUALIZATION_ROOT_PATH)
-        UsdGeom.Xform.Define(
+        visualization_root = UsdGeom.Xform.Define(
             self.stage,
             COLLISION_SPHERE_VISUALIZATION_ROOT_PATH,
+        )
+        visualization_root.CreateVisibilityAttr().Set(
+            UsdGeom.Tokens.inherited
+            if args.show_colliders
+            else UsdGeom.Tokens.invisible
         )
 
         tree_radii = np.full(
@@ -3246,7 +3628,7 @@ class CollisionAwareMotion:
             )
             robot_count = len(centers)
         print(
-            "   Collision spheres visible: "
+            f"   Collision spheres {'visible' if args.show_colliders else 'hidden'}: "
             f"robot {robot_count}, tree {len(self.full_branch_centers)}, "
             f"root={COLLISION_SPHERE_VISUALIZATION_ROOT_PATH}"
         )
@@ -3319,8 +3701,12 @@ class CollisionAwareMotion:
                 flush=True,
             )
 
-    def configuration_tree_clearance(self, joint_positions):
-        """전체 로봇 sphere와 전체 나무 proxy의 최소 여유를 반환한다."""
+    def configuration_tree_clearance(
+        self,
+        joint_positions,
+        include_target_apple=False,
+    ):
+        """전체 로봇 sphere와 나무, 선택 시 목표 사과의 여유를 반환한다."""
         sphere_centers, sphere_radii, sphere_frames = (
             self.robot_collision_spheres_world(joint_positions)
         )
@@ -3332,6 +3718,7 @@ class CollisionAwareMotion:
         closest_obstacle_radius = None
         colliding_branches = set()
         colliding_trunks = set()
+        target_apple_collision = False
 
         if self.full_branch_centers.size:
             distances = np.linalg.norm(
@@ -3386,6 +3773,28 @@ class CollisionAwareMotion:
                 if clearance <= 0.0:
                     colliding_trunks.add(trunk_index)
 
+        if include_target_apple and self.apple_obstacle_enabled:
+            apple_clearances = (
+                np.linalg.norm(
+                    sphere_centers - self.apple_center[None, :],
+                    axis=1,
+                )
+                - sphere_radii
+                - TARGET_APPLE_OBSTACLE_RADIUS_M
+            )
+            sphere_index = int(np.argmin(apple_clearances))
+            apple_clearance = float(apple_clearances[sphere_index])
+            if apple_clearance < minimum:
+                minimum = apple_clearance
+                closest = (sphere_frames[sphere_index], "target_apple")
+                closest_robot_center = sphere_centers[sphere_index].copy()
+                closest_robot_radius = float(sphere_radii[sphere_index])
+                closest_obstacle_center = self.apple_center.copy()
+                closest_obstacle_radius = float(TARGET_APPLE_OBSTACLE_RADIUS_M)
+            target_apple_collision = (
+                apple_clearance <= TARGET_APPLE_APPROACH_CLEARANCE_M
+            )
+
         return {
             "minimum_clearance": minimum,
             "closest": closest,
@@ -3395,12 +3804,29 @@ class CollisionAwareMotion:
             "closest_obstacle_radius": closest_obstacle_radius,
             "branch_indices": colliding_branches,
             "trunk_indices": colliding_trunks,
+            "target_apple_collision": target_apple_collision,
         }
 
-    def configuration_tree_collision(self, joint_positions):
-        """전체 로봇 sphere가 나무 안전 proxy와 겹칠 때만 결과를 반환한다."""
-        report = self.configuration_tree_clearance(joint_positions)
-        if not report["branch_indices"] and not report["trunk_indices"]:
+    @staticmethod
+    def configuration_has_collision(report):
+        """나무 겹침 또는 목표 사과 실행 여유 위반 여부를 반환한다."""
+        return bool(
+            report["branch_indices"]
+            or report["trunk_indices"]
+            or report.get("target_apple_collision", False)
+        )
+
+    def configuration_tree_collision(
+        self,
+        joint_positions,
+        include_target_apple=False,
+    ):
+        """전체 로봇 sphere가 검사 대상으로 지정한 proxy를 침범하면 반환한다."""
+        report = self.configuration_tree_clearance(
+            joint_positions,
+            include_target_apple=include_target_apple,
+        )
+        if not self.configuration_has_collision(report):
             return None
         return report
 
@@ -3423,6 +3849,8 @@ class CollisionAwareMotion:
     def show_collision_debug(self, collision):
         """가장 가까운 robot sphere와 나무 proxy를 Stage에 시각화한다."""
         self.clear_collision_debug()
+        if not args.show_colliders:
+            return
         UsdGeom.Xform.Define(self.stage, COLLISION_DEBUG_ROOT_PATH)
         robot_center = collision.get("closest_robot_center")
         obstacle_center = collision.get("closest_obstacle_center")
@@ -3523,7 +3951,7 @@ class CollisionAwareMotion:
                 < minimum_report["minimum_clearance"]
             ):
                 minimum_report = report
-            if report["branch_indices"] or report["trunk_indices"]:
+            if self.configuration_has_collision(report):
                 return {
                     "success": False,
                     "reason": (
@@ -3618,6 +4046,7 @@ class CollisionAwareMotion:
                     float(
                         np.linalg.norm(point - self.apple_center)
                         - TARGET_APPLE_OBSTACLE_RADIUS_M
+                        - TARGET_APPLE_APPROACH_CLEARANCE_M
                     ),
                     "target_apple",
                 )
@@ -3908,8 +4337,11 @@ class CollisionAwareMotion:
         waypoint_count = max(2, int(np.ceil(maximum_delta / 0.20)) + 1)
         path = np.linspace(active_positions, nearest_goal, waypoint_count)
         for waypoint_index, joint_positions in enumerate(path):
-            report = self.configuration_tree_clearance(joint_positions)
-            if report["branch_indices"] or report["trunk_indices"]:
+            report = self.configuration_tree_clearance(
+                joint_positions,
+                include_target_apple=self.apple_obstacle_enabled,
+            )
+            if self.configuration_has_collision(report):
                 return (
                     None,
                     "짧은 c-space 직결 경로가 나무 proxy와 충돌합니다: "
@@ -4203,7 +4635,10 @@ class CollisionAwareMotion:
                 raise ApproachUnreachableError(
                     f"Lula trajectory가 관절 limit을 벗어났습니다: t={sample_time:.3f}"
                 )
-            clearance_report = self.configuration_tree_clearance(joint_target)
+            clearance_report = self.configuration_tree_clearance(
+                joint_target,
+                include_target_apple=self.apple_obstacle_enabled,
+            )
             if (
                 minimum_clearance_report is None
                 or clearance_report["minimum_clearance"]
@@ -4212,8 +4647,7 @@ class CollisionAwareMotion:
                 minimum_clearance_report = clearance_report
             collision = (
                 clearance_report
-                if clearance_report["branch_indices"]
-                or clearance_report["trunk_indices"]
+                if self.configuration_has_collision(clearance_report)
                 else None
             )
             if collision is not None:
@@ -4225,6 +4659,12 @@ class CollisionAwareMotion:
                     )
                     trajectory_collision["trunk_indices"].update(
                         collision["trunk_indices"]
+                    )
+                    trajectory_collision["target_apple_collision"] = bool(
+                        trajectory_collision.get(
+                            "target_apple_collision", False
+                        )
+                        or collision.get("target_apple_collision", False)
                     )
                     if (
                         collision["minimum_clearance"]
@@ -4256,6 +4696,12 @@ class CollisionAwareMotion:
                     target_rotation,
                     segment_name,
                     target_joint_positions=target_joint_positions,
+                )
+            if trajectory_collision.get("target_apple_collision", False):
+                raise ApproachUnreachableError(
+                    f"{segment_name} RRT trajectory가 목표 사과의 "
+                    f"{TARGET_APPLE_APPROACH_CLEARANCE_M:.3f} m 실행 여유를 "
+                    f"침범합니다: {self.collision_text(trajectory_collision)}"
                 )
             raise ApproachUnreachableError(
                 f"{segment_name} RRT trajectory가 이미 반영된 나무 proxy와 "
@@ -4634,8 +5080,99 @@ def move_arm_to_pregrasp(
                     f"TCP {vec(actual_tcp)}"
                 )
 
-        # RMPflow가 시간 궤적을 추종하며 남긴 작은 오차만 task-space 목표로
-        # 정착시킨다. 이 단계에서도 동일 planning world와 접촉 감시를 유지한다.
+        # 영상에서 시간 궤적 종료 후 TCP 오차가 0.66 m 남은 상태로 task-space
+        # 직선 보정을 시작해 목표 사과를 가로질렀다. 검증된 마지막 c-space
+        # 목표를 먼저 유지해 실제 관절이 따라온 뒤에만 작은 pose 오차를 줄인다.
+        final_joint_target = np.asarray(joint_target, dtype=float).copy()
+        cspace_settled = False
+        for settle_index in range(MAX_TARGET_SETTLE_STEPS):
+            if execution_guard is not None:
+                execution_guard()
+            if not simulation_app.is_running():
+                return None
+            if max_physics_steps > 0 and physics_steps >= max_physics_steps:
+                return None
+            pause_reported = False
+            while not world.is_playing():
+                if execution_guard is not None:
+                    execution_guard()
+                if world.is_stopped() or not simulation_app.is_running():
+                    return None
+                if not pause_reported and pause_callback is not None:
+                    pause_callback()
+                    pause_reported = True
+                world.step(render=not args.headless)
+            if pause_reported and resume_callback is not None:
+                resume_callback()
+            if contact_guard is not None and contact_guard():
+                raise ApproachUnreachableError(
+                    "RRT c-space 정착 중 목표 사과 stem joint가 파손됐습니다."
+                )
+
+            actual_arm = robot.get_joint_positions(
+                joint_indices=collision_motion.arm_indices
+            )
+            if actual_arm is None:
+                raise ApproachUnreachableError(
+                    "RRT c-space 정착 중 실제 팔 관절 상태를 읽지 못했습니다."
+                )
+            actual_arm = np.asarray(actual_arm, dtype=float)
+            joint_error = float(
+                np.max(np.abs(final_joint_target - actual_arm))
+            )
+            if joint_error <= RRT_CSPACE_SETTLE_TOLERANCE_RAD:
+                cspace_settled = True
+                print(
+                    f"   [RRT SETTLE] {route_name}: c-space error "
+                    f"{joint_error:.4f} rad"
+                )
+                break
+
+            collision_motion.set_trajectory_cspace_target(final_joint_target)
+            action = collision_motion.next_action()
+            if action.joint_positions is None or not np.all(
+                np.isfinite(action.joint_positions)
+            ):
+                raise ApproachUnreachableError(
+                    "RRT c-space 정착 중 RMPflow 관절 목표가 유효하지 않습니다."
+                )
+            robot.apply_action(action)
+            apply_gripper_target(robot, gripper_indices, 0.0)
+            world.step(render=not args.headless)
+            physics_steps += 1
+            if contact_guard is not None and contact_guard():
+                raise ApproachUnreachableError(
+                    "RRT c-space 정착 중 목표 사과 stem joint가 파손됐습니다."
+                )
+            if settle_index == 0 or (settle_index + 1) % 60 == 0:
+                print(
+                    f"   RRT SETTLE   {route_name:24s} "
+                    f"{settle_index + 1:3d}/{MAX_TARGET_SETTLE_STEPS} "
+                    f"joint error {joint_error:.4f} rad"
+                )
+
+        if not cspace_settled:
+            print(
+                f"   [STALLED ] {route_name}: 검증된 RRT 종점으로 c-space "
+                f"정착하지 못했습니다."
+            )
+            return False
+
+        actual_tcp, actual_rotation = current_tcp_pose(robot)
+        position_error = float(np.linalg.norm(np.asarray(waypoint) - actual_tcp))
+        orientation_error = rotation_error_deg(actual_rotation, target_rotation)
+        if (
+            position_error > RRT_TASK_SETTLE_MAX_POSITION_ERROR_M
+            or orientation_error > RRT_TASK_SETTLE_MAX_ORIENTATION_ERROR_DEG
+        ):
+            print(
+                f"   [STALLED ] {route_name}: task-space 직선 정착 금지; "
+                f"position {position_error:.4f} m, "
+                f"rotation {orientation_error:.2f} deg"
+            )
+            return False
+
+        # c-space 수렴 뒤 남은 작은 pose 오차만 task-space로 정착시킨다.
         return follow_waypoint(
             route_name,
             waypoint_index,

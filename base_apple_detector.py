@@ -1,4 +1,4 @@
-"""base_rsd455 RGB-D 전체 영상에서 가장 가까운 빨간 사과를 검출한다.
+"""base_rsd455 RGB-D 전체 영상에서 로봇별 빨간 사과를 검출·추적한다.
 
 이 파일은 Isaac Sim Python이 아니라 ROS 2 Jazzy가 설치된 시스템 환경에서
 실행한다. 현재 단계의 HSV 검출은 RGB-D와 TF 파이프라인 검증용이며, 여러
@@ -20,11 +20,12 @@
 
 실행 예시:
     source /opt/ros/jazzy/setup.bash
-    ROS_DOMAIN_ID=102 python3 base_apple_detector.py
+    ROS_DOMAIN_ID=101 python3 base_apple_detector.py --robot-id robot_01
 
 use_sim_time은 노드가 직접 강제하므로 별도 인자가 필요하지 않다.
 """
 
+import argparse
 import math
 import os
 from typing import Optional, Tuple
@@ -66,10 +67,15 @@ SIMULATION_STATE_TOPIC = "/simulation/state"
 TARGET_TOPIC = "/harvest/target"
 PERCEPTION_STATUS_TOPIC = "/harvest/perception_status"
 DEBUG_IMAGE_TOPIC = "/harvest/detection_debug"
+ROBOT_APPLE_IDS = {
+    "robot_01": ("apple_001", "apple_002", "apple_003"),
+    "robot_02": ("apple_004", "apple_005", "apple_006"),
+}
+TRACK_MATCH_DISTANCE_M = 0.10
 
 TARGET_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
-    depth=1,
+    depth=10,
     reliability=ReliabilityPolicy.RELIABLE,
     durability=DurabilityPolicy.VOLATILE,
 )
@@ -104,7 +110,7 @@ def rotate_vector_by_quaternion(vector, quaternion):
 class BaseAppleDetector(Node):
     """RGB, Depth, CameraInfo를 결합해 사과 중심 Pose를 계산하는 노드."""
 
-    def __init__(self):
+    def __init__(self, robot_id):
         # docs/architecture/ros2_interfaces.md는 모든 ROS 2 노드가
         # use_sim_time:=true를 쓰도록 규정한다. CLI 인자를 빠뜨리면 이 노드만
         # wall time으로 동작해 /clock 기준 timestamp 비교가 어긋나므로
@@ -113,6 +119,10 @@ class BaseAppleDetector(Node):
             "base_apple_detector",
             parameter_overrides=[Parameter("use_sim_time", value=True)],
         )
+        self.robot_id = str(robot_id).strip()
+        if self.robot_id not in ROBOT_APPLE_IDS:
+            raise ValueError(f"지원하지 않는 robot_id입니다: {self.robot_id}")
+        self.apple_ids = ROBOT_APPLE_IDS[self.robot_id]
 
         # 현재 빨간 사과 에셋용 검출 파라미터다. ROS parameter로 노출하여
         # 코드를 수정하지 않고 환경별로 조절할 수 있다.
@@ -129,9 +139,6 @@ class BaseAppleDetector(Node):
         # 기하학적으로 정확하지만 depth noise에 민감해진다.
         self.declare_parameter("depth_surface_percentile", 10.0)
         self.declare_parameter("target_frame", "world")
-        # ID 생성 규칙은 아직 TBD이므로 실행 시 명시적으로 주입한다.
-        # reset_id와 조합한 lifecycle 규약은 HarvestTarget 계약을 따른다.
-        self.declare_parameter("target_id", "")
         self.declare_parameter("show_debug_window", True)
 
         self.minimum_contour_area = float(
@@ -184,12 +191,6 @@ class BaseAppleDetector(Node):
                 "HarvestTarget 계약의 target_frame은 'world'여야 합니다: "
                 f"{self.target_frame!r}"
             )
-        self.target_id = str(self.get_parameter("target_id").value).strip()
-        if not self.target_id:
-            raise ValueError(
-                "target_id 규칙은 아직 TBD입니다. 실행 시 ROS parameter로 "
-                "명시해야 합니다. 예: --ros-args -p target_id:=<approved_id>"
-            )
         self.show_debug_window = bool(
             self.get_parameter("show_debug_window").value
         )
@@ -204,8 +205,13 @@ class BaseAppleDetector(Node):
         self.last_status_code = None
         self.last_status_publish_ns = -1
         self.simulation_state: Optional[SimulationState] = None
+        self.target_tracks = {}
+        self.tracking_initialized = False
 
-        self.tf_buffer = Buffer()
+        # node clock을 연결해야 /clock이 과거로 점프할 때 tf2_ros.Buffer가
+        # 이전 Isaac Sim 실행의 transform을 자동으로 폐기한다. Buffer()만
+        # 사용하면 system clock을 감시하므로 simulation restart를 놓친다.
+        self.tf_buffer = Buffer(node=self)
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.create_subscription(
@@ -240,11 +246,29 @@ class BaseAppleDetector(Node):
             Image, DEBUG_IMAGE_TOPIC, qos_profile_sensor_data
         )
 
-        self.get_logger().info("base_rsd455 RGB-D 사과 검출 노드 시작")
+        self.get_logger().info(
+            f"base_rsd455 RGB-D 사과 검출 노드 시작: robot_id={self.robot_id}"
+        )
         self.get_logger().info(f"RGB: {RGB_TOPIC}")
         self.get_logger().info(f"Depth: {DEPTH_TOPIC}")
         self.get_logger().info(f"CameraInfo: {CAMERA_INFO_TOPIC}")
-        self.get_logger().info(f"Target: {TARGET_TOPIC} (target_id={self.target_id})")
+        self.get_logger().info(
+            f"Target: {TARGET_TOPIC} (자동 ID={','.join(self.apple_ids)})"
+        )
+
+    def reset_tracking(self):
+        """새 simulation 세대에서 ID와 최근 world 위치를 모두 폐기한다."""
+        self.target_tracks.clear()
+        self.tracking_initialized = False
+
+    def clear_generation_caches(self):
+        """이전 Isaac Sim 실행에서 생성된 영상·TF·ID 상태를 폐기한다."""
+        self.latest_rgb = None
+        self.latest_depth = None
+        self.last_processed_rgb_stamp = -1
+        self.last_tf_warning_ns = -1
+        self.tf_buffer.clear()
+        self.reset_tracking()
 
     def simulation_state_callback(self, message: SimulationState):
         """최신 Timeline 상태를 보관하고 reset 세대가 바뀌면 입력 캐시를 버린다."""
@@ -253,12 +277,10 @@ class BaseAppleDetector(Node):
         )
         self.simulation_state = message
         if previous_reset_id is not None and previous_reset_id != message.reset_id:
-            self.latest_rgb = None
-            self.latest_depth = None
-            self.last_processed_rgb_stamp = -1
+            self.clear_generation_caches()
             self.get_logger().info(
                 f"simulation reset_id 변경: {previous_reset_id} -> "
-                f"{message.reset_id}; RGB-D 캐시 폐기"
+                f"{message.reset_id}; RGB-D, TF와 사과 ID track 폐기"
             )
 
     def camera_info_callback(self, message: CameraInfo):
@@ -284,6 +306,18 @@ class BaseAppleDetector(Node):
 
         rgb_stamp = stamp_to_nanoseconds(self.latest_rgb.header.stamp)
         depth_stamp = stamp_to_nanoseconds(self.latest_depth.header.stamp)
+        if (
+            self.last_processed_rgb_stamp >= 0
+            and rgb_stamp < self.last_processed_rgb_stamp
+        ):
+            previous_stamp = self.last_processed_rgb_stamp
+            self.clear_generation_caches()
+            self.get_logger().warning(
+                "RGB simulation timestamp 역행 감지: "
+                f"{previous_stamp / 1e9:.6f}s -> {rgb_stamp / 1e9:.6f}s; "
+                "이전 실행의 RGB-D, TF와 사과 ID track을 폐기했습니다."
+            )
+            return
         if rgb_stamp == self.last_processed_rgb_stamp:
             return
         if abs(rgb_stamp - depth_stamp) > self.maximum_sync_error_ns:
@@ -419,8 +453,10 @@ class BaseAppleDetector(Node):
 
             distance = diagnostic["distance"]
             depth_text = "invalid" if distance is None else f"{distance:.2f}m"
+            target_id = diagnostic.get("target_id", "")
+            id_text = "" if not target_id else f" {target_id}"
             label = (
-                f"#{diagnostic['index']} {state} "
+                f"#{diagnostic['index']} {state}{id_text} "
                 f"A={diagnostic['area']:.0f} "
                 f"C={diagnostic['confidence']:.2f} "
                 f"Ci={diagnostic['circularity']:.2f} "
@@ -566,6 +602,66 @@ class BaseAppleDetector(Node):
             SimulationState.PLAYING,
         }
 
+    @staticmethod
+    def world_position(world_pose):
+        position = world_pose.pose.position
+        return np.array([position.x, position.y, position.z], dtype=float)
+
+    def associate_tracks(self, candidates):
+        """최초 거리순 ID를 고정하고 이후 후보를 world 최근접으로 연결한다."""
+        if not self.tracking_initialized:
+            ordered = sorted(
+                candidates,
+                key=lambda candidate: (
+                    candidate["distance"],
+                    candidate["diagnostic"]["index"],
+                ),
+            )
+            associated = []
+            for target_id, candidate in zip(self.apple_ids, ordered):
+                candidate["target_id"] = target_id
+                candidate["diagnostic"]["target_id"] = target_id
+                candidate["diagnostic"]["selected"] = True
+                self.target_tracks[target_id] = candidate["world_position"].copy()
+                associated.append(candidate)
+            self.tracking_initialized = True
+            self.get_logger().info(
+                f"{self.robot_id} 최초 사과 ID 고정: "
+                + ", ".join(
+                    f"{candidate['target_id']}={candidate['distance']:.3f}m"
+                    for candidate in associated
+                )
+            )
+            return associated
+
+        pair_candidates = []
+        for target_id, previous_position in self.target_tracks.items():
+            for candidate_index, candidate in enumerate(candidates):
+                distance = float(
+                    np.linalg.norm(candidate["world_position"] - previous_position)
+                )
+                if distance <= TRACK_MATCH_DISTANCE_M:
+                    pair_candidates.append(
+                        (distance, target_id, candidate_index)
+                    )
+        pair_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+
+        assigned_ids = set()
+        assigned_candidates = set()
+        associated = []
+        for _distance, target_id, candidate_index in pair_candidates:
+            if target_id in assigned_ids or candidate_index in assigned_candidates:
+                continue
+            candidate = candidates[candidate_index]
+            candidate["target_id"] = target_id
+            candidate["diagnostic"]["target_id"] = target_id
+            candidate["diagnostic"]["selected"] = True
+            self.target_tracks[target_id] = candidate["world_position"].copy()
+            assigned_ids.add(target_id)
+            assigned_candidates.add(candidate_index)
+            associated.append(candidate)
+        return sorted(associated, key=lambda candidate: candidate["target_id"])
+
     def publish_perception_status(
         self,
         source_message,
@@ -603,6 +699,7 @@ class BaseAppleDetector(Node):
 
     def publish_harvest_target(
         self,
+        target_id,
         rgb_message,
         camera_pose,
         world_pose,
@@ -630,7 +727,7 @@ class BaseAppleDetector(Node):
         target = HarvestTarget()
         target.header.stamp = rgb_message.header.stamp
         target.header.frame_id = "world"
-        target.target_id = self.target_id
+        target.target_id = target_id
         target.reset_id = self.simulation_state.reset_id
         target.scene_version = self.simulation_state.scene_version
         target.position = world_pose.pose.position
@@ -643,7 +740,7 @@ class BaseAppleDetector(Node):
         self.publish_perception_status(
             rgb_message,
             HarvestPerceptionStatus.OK,
-            target_id=self.target_id,
+            target_id=target_id,
             confidence=confidence,
             valid_depth_ratio=valid_depth_ratio,
             tf_time_error_sec=tf_time_error_sec,
@@ -785,50 +882,78 @@ class BaseAppleDetector(Node):
             self.show_debug(annotated)
             return
 
-        # 전체 유효 후보 중 카메라 광학 중심과의 3D 직선거리가 가장 짧은
-        # 사과를 이번 수확 목표로 선택한다.
-        selected = min(
-            valid_candidates, key=lambda candidate: candidate["distance"]
-        )
-        selected["diagnostic"]["selected"] = True
-        contour = selected["contour"]
-        center = selected["center"]
-        surface_point_camera = selected["surface_point"]
-        point_camera = selected["center_point"]
-        selected_distance = selected["distance"]
-        confidence = selected["confidence"]
-        valid_depth_ratio = selected["valid_depth_ratio"]
-        u, v = center
-        camera_pose = self.make_camera_pose(rgb_message, point_camera)
-        self.camera_pose_publisher.publish(camera_pose)
-
-        world_pose, tf_time_error_sec = self.transform_to_world(camera_pose)
-        if world_pose is not None:
-            self.publish_harvest_target(
-                rgb_message,
-                camera_pose,
-                world_pose,
-                confidence,
-                valid_depth_ratio,
-                tf_time_error_sec,
+        if not self.target_publication_allowed():
+            state_name = (
+                "UNAVAILABLE"
+                if self.simulation_state is None
+                else str(self.simulation_state.state)
             )
-        else:
+            self.publish_perception_status(
+                rgb_message,
+                HarvestPerceptionStatus.SIMULATION_NOT_READY,
+                message=f"SimulationState가 READY/PLAYING이 아님: {state_name}",
+            )
+            self.draw_candidate_diagnostics(annotated, diagnostics)
+            self.publish_debug_image(rgb_message, annotated)
+            self.show_debug(annotated)
+            return
+
+        world_candidates = []
+        for candidate in valid_candidates:
+            camera_pose = self.make_camera_pose(
+                rgb_message, candidate["center_point"]
+            )
+            world_pose, tf_time_error_sec = self.transform_to_world(camera_pose)
+            if world_pose is None:
+                continue
+            candidate["camera_pose"] = camera_pose
+            candidate["world_pose"] = world_pose
+            candidate["world_position"] = self.world_position(world_pose)
+            candidate["tf_time_error_sec"] = tf_time_error_sec
+            world_candidates.append(candidate)
+
+        if not world_candidates:
             self.publish_perception_status(
                 rgb_message,
                 HarvestPerceptionStatus.TF_UNAVAILABLE,
-                confidence=confidence,
-                valid_depth_ratio=valid_depth_ratio,
-                message=f"{camera_pose.header.frame_id} -> world TF 변환 실패",
+                message="유효 후보를 camera frame에서 world로 변환하지 못했습니다.",
+            )
+            self.draw_candidate_diagnostics(annotated, diagnostics)
+            self.publish_debug_image(rgb_message, annotated)
+            self.show_debug(annotated)
+            return
+
+        associated = self.associate_tracks(world_candidates)
+        if not associated:
+            self.publish_perception_status(
+                rgb_message,
+                HarvestPerceptionStatus.NO_DETECTION,
+                message=(
+                    "기존 사과 track의 마지막 world 위치 100mm 이내에서 "
+                    "일치하는 후보를 찾지 못했습니다."
+                ),
+            )
+
+        for candidate in associated:
+            camera_pose = candidate["camera_pose"]
+            self.camera_pose_publisher.publish(camera_pose)
+            self.publish_harvest_target(
+                candidate["target_id"],
+                rgb_message,
+                camera_pose,
+                candidate["world_pose"],
+                candidate["confidence"],
+                candidate["valid_depth_ratio"],
+                candidate["tf_time_error_sec"],
             )
 
         self.draw_candidate_diagnostics(annotated, diagnostics)
-        cv2.circle(annotated, (round(u), round(v)), 5, (255, 0, 0), -1)
+        for candidate in associated:
+            u, v = candidate["center"]
+            cv2.circle(annotated, (round(u), round(v)), 5, (255, 0, 0), -1)
         text = (
-            f"SELECTED {selected['diagnostic']['index']}/{len(diagnostics)} "
-            f"distance={selected_distance:.3f}m "
-            f"conf={confidence:.3f} depth={valid_depth_ratio:.3f} "
-            f"xyz=({point_camera[0]:.3f}, {point_camera[1]:.3f}, "
-            f"{point_camera[2]:.3f})"
+            f"{self.robot_id} TRACKED {len(associated)}/{len(self.target_tracks)} "
+            + " ".join(candidate["target_id"] for candidate in associated)
         )
         cv2.putText(
             annotated,
@@ -848,16 +973,14 @@ class BaseAppleDetector(Node):
             or now_ns - self.last_detection_log_ns >= 1_000_000_000
         ):
             message = (
-                f"사과 후보 {len(valid_candidates)}개, 최근접 거리 "
-                f"{selected_distance:.4f} m, surface camera xyz = "
-                f"{surface_point_camera.round(4).tolist()} m, "
-                f"center camera xyz = {point_camera.round(4).tolist()} m"
+                f"사과 후보 {len(valid_candidates)}개, world 변환 "
+                f"{len(world_candidates)}개, track 연결 {len(associated)}개"
             )
-            if world_pose is not None:
-                position = world_pose.pose.position
-                message += (
-                    f", world xyz = "
-                    f"[{position.x:.4f}, {position.y:.4f}, {position.z:.4f}] m"
+            if associated:
+                message += ", " + "; ".join(
+                    f"{candidate['target_id']}="
+                    f"{candidate['world_position'].round(4).tolist()}"
+                    for candidate in associated
                 )
             self.get_logger().info(message)
             self.last_detection_log_ns = now_ns
@@ -880,8 +1003,16 @@ class BaseAppleDetector(Node):
 
 
 def main(args=None):
-    rclpy.init(args=args)
-    node = BaseAppleDetector()
+    parser = argparse.ArgumentParser(description="로봇별 base D455 사과 검출")
+    parser.add_argument(
+        "--robot-id",
+        choices=tuple(ROBOT_APPLE_IDS),
+        required=True,
+        help="사과 ID 범위를 선택할 담당 로봇",
+    )
+    parsed_args, ros_args = parser.parse_known_args(args=args)
+    rclpy.init(args=ros_args)
+    node = BaseAppleDetector(parsed_args.robot_id)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
