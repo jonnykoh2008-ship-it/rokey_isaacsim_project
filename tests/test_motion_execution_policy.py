@@ -1,5 +1,9 @@
 import ast
 from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import yaml
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -54,6 +58,22 @@ def load_rrt_iteration_policy():
     return namespace
 
 
+def load_policy_function(function_name):
+    source = (PROJECT_DIR / "apple_pick.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    namespace = {"np": np}
+    exec(
+        compile(ast.Module(body=[function], type_ignores=[]), "apple_pick.py", "exec"),
+        namespace,
+    )
+    return namespace[function_name]
+
+
 def test_conveyor_alignment_states_use_rrt_trajectory_execution():
     states = assigned_string_set(
         PROJECT_DIR / "vision_apple_pick.py",
@@ -90,3 +110,59 @@ def test_fast_transfer_converts_task_target_to_warm_start_cspace_goal():
     assert "segment_name in RRT_FAST_TRANSFER_STATES" in source
     assert "warm_start=active_positions" in source
     assert "[RRT IK GOAL]" in source
+
+
+def test_positive_physx_contact_separation_is_ignored_as_proximity():
+    minimum_separation = load_policy_function(
+        "contact_report_minimum_separation"
+    )
+    header = SimpleNamespace(num_contact_data=2, contact_data_offset=1)
+    contact_data = [
+        SimpleNamespace(separation=-1.0),
+        SimpleNamespace(separation=0.004),
+        SimpleNamespace(separation=0.002),
+    ]
+    source = (PROJECT_DIR / "apple_pick.py").read_text(encoding="utf-8")
+
+    assert minimum_separation(header, contact_data) == 0.002
+    assert "minimum_separation > 0.0" in source
+
+
+def test_actual_gripper_envelope_clearance_uses_tcp_and_both_radii():
+    clearance = load_policy_function("gripper_envelope_apple_clearance")
+
+    assert np.isclose(
+        clearance(
+            tcp_position=[0.0, 0.0, 0.0],
+            gripper_radius=0.12,
+            apple_center=[0.30, 0.0, 0.0],
+            apple_radius=0.06,
+        ),
+        0.12,
+    )
+
+
+def test_only_staging_rrt_segments_receive_actual_mesh_envelope_check():
+    is_staging = load_policy_function("is_staging_rrt_segment")
+    source = (PROJECT_DIR / "apple_pick.py").read_text(encoding="utf-8")
+
+    assert is_staging("STAGING direct")
+    assert is_staging("STAGING replan +side")
+    assert is_staging("STAGING replan -side")
+    assert not is_staging("TREE_EXIT")
+    assert not is_staging("NEUTRAL_TRANSFER")
+    assert "apply_staging_gripper_envelope_check" in source
+    assert "[TARGET APPLE REJECT]" in source
+
+
+def test_lula_description_does_not_add_three_finger_planning_proxies():
+    description = yaml.safe_load(
+        (PROJECT_DIR / "m0617_robot_description.yaml").read_text(encoding="utf-8")
+    )
+    gripper_spheres = next(
+        item["gripper_frame"]
+        for item in description["collision_spheres"]
+        if "gripper_frame" in item
+    )
+
+    assert len(gripper_spheres) == 2

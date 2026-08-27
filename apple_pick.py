@@ -1052,6 +1052,25 @@ class RobotTreeContactMonitor:
             return
 
 
+def contact_report_minimum_separation(header, contact_data):
+    """PhysX header가 참조하는 contact point의 최소 separation을 반환한다."""
+    count = int(header.num_contact_data)
+    if count <= 0:
+        return None
+    start = int(header.contact_data_offset)
+    separations = []
+    try:
+        for index in range(start, start + count):
+            separation = float(contact_data[index].separation)
+            if not np.isfinite(separation):
+                return None
+            separations.append(separation)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        # API 데이터가 예상 형식이 아니면 기존처럼 보수적으로 접촉 처리한다.
+        return None
+    return min(separations) if len(separations) == count else None
+
+
 class RobotAppleContactMonitor:
     """사과와 접촉한 gripper collider가 palm인지 손가락인지 구분한다."""
 
@@ -1110,9 +1129,15 @@ class RobotAppleContactMonitor:
     def close(self):
         self._subscription = None
 
-    def _on_contact_report(self, headers, _data):
+    def _on_contact_report(self, headers, contact_data):
         for header in headers:
             if int(header.num_contact_data) <= 0:
+                continue
+            minimum_separation = contact_report_minimum_separation(
+                header, contact_data
+            )
+            if minimum_separation is not None and minimum_separation > 0.0:
+                # PhysX contact offset 안의 근접 후보이며 표면은 아직 안 닿았다.
                 continue
             paths = [
                 self._decode_path(header.actor0),
@@ -1131,7 +1156,8 @@ class RobotAppleContactMonitor:
                     self.palm_path = gripper_path
                     print(
                         f"   [APPLE CONTACT] state={self.state}, "
-                        f"type=palm, robot={gripper_path}"
+                        f"type=palm, separation={minimum_separation}, "
+                        f"apple={APPLE_PATH}, robot={gripper_path}"
                     )
             else:
                 finger_name = self._finger_name(gripper_path)
@@ -1148,7 +1174,9 @@ class RobotAppleContactMonitor:
                 print(
                     f"   [APPLE CONTACT] state={self.state}, "
                     f"type={finger_name}, contacts="
-                    f"{len(self.contacted_fingers)}/3, robot={gripper_path}"
+                    f"{len(self.contacted_fingers)}/3, "
+                    f"separation={minimum_separation}, apple={APPLE_PATH}, "
+                    f"robot={gripper_path}"
                 )
 
 
@@ -2000,6 +2028,61 @@ def compute_gripper_entry_lever_arm(stage, current_tcp):
     if lever <= 0.0:
         raise RuntimeError("gripper finger collider 지렛대를 측정하지 못했습니다.")
     return lever
+
+
+def compute_gripper_collision_envelope_radius(stage, current_tcp):
+    """실행 중인 전체 gripper collision mesh의 TCP 기준 최대 반경을 잰다.
+
+    Stage에 collider를 새로 만들지 않는다. 현재 열린 그리퍼의 authored palm과
+    세 손가락 collision mesh vertex를 읽어 실행 전 수학 검사에만 사용한다.
+    """
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    gripper_root = require_prim(stage, GRIPPER_ROOT_PATH)
+    current_tcp = np.asarray(current_tcp, dtype=float)
+    maximum_radius = 0.0
+    farthest_path = None
+    mesh_count = 0
+    for prim in Usd.PrimRange(gripper_root, Usd.TraverseInstanceProxies()):
+        path = str(prim.GetPath())
+        if not prim.IsA(UsdGeom.Mesh) or "/collisions/" not in path:
+            continue
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            enabled = UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get()
+            if enabled is False:
+                continue
+        points = _mesh_sample_points_world(prim, xform_cache, vertices_only=True)
+        if points.size == 0:
+            continue
+        mesh_count += 1
+        radius = float(np.max(np.linalg.norm(points - current_tcp, axis=1)))
+        if radius > maximum_radius:
+            maximum_radius = radius
+            farthest_path = path
+    if maximum_radius <= 0.0 or farthest_path is None:
+        raise RuntimeError("전체 gripper collision mesh 반경을 측정하지 못했습니다.")
+    return maximum_radius, farthest_path, mesh_count
+
+
+def gripper_envelope_apple_clearance(
+    tcp_position,
+    gripper_radius,
+    apple_center,
+    apple_radius,
+):
+    """TCP 중심 gripper envelope와 목표 사과 구 사이의 표면 여유다."""
+    return float(
+        np.linalg.norm(
+            np.asarray(tcp_position, dtype=float)
+            - np.asarray(apple_center, dtype=float)
+        )
+        - float(gripper_radius)
+        - float(apple_radius)
+    )
+
+
+def is_staging_rrt_segment(segment_name):
+    """목표 사과를 obstacle로 유지하는 staging RRT 구간인지 반환한다."""
+    return str(segment_name).startswith("STAGING ")
 
 
 def point_to_line_distance(point, line_point, line_direction):
@@ -3429,6 +3512,17 @@ class CollisionAwareMotion:
         self.path_start = np.asarray(path_start, dtype=float)
         self.apple_center = np.asarray(apple_center, dtype=float)
         self.pregrasp_tcp = np.asarray(pregrasp_tcp, dtype=float)
+        (
+            self.gripper_collision_envelope_radius,
+            self.gripper_collision_envelope_farthest_path,
+            gripper_collision_mesh_count,
+        ) = compute_gripper_collision_envelope_radius(stage, self.path_start)
+        print(
+            "   Gripper mesh envelope "
+            f"radius {self.gripper_collision_envelope_radius:.4f} m, "
+            f"meshes {gripper_collision_mesh_count}, "
+            f"farthest={self.gripper_collision_envelope_farthest_path}"
+        )
         # 초기 관절 자세의 전체 링크 clearance를 검사하기 전에 활성 상태가
         # 정의되어 있어야 한다. 실제 planner obstacle 등록은 아래에서 한다.
         self.apple_obstacle_enabled = True
@@ -3709,6 +3803,41 @@ class CollisionAwareMotion:
             dtype=float,
         )
         return np.asarray(tcp_position, dtype=float), quaternion_xyzw
+
+    def apply_staging_gripper_envelope_check(
+        self,
+        report,
+        joint_positions,
+        segment_name,
+    ):
+        """staging 표본을 실제 mesh 기반 그리퍼 envelope로 추가 검사한다."""
+        if (
+            not self.apple_obstacle_enabled
+            or not is_staging_rrt_segment(segment_name)
+        ):
+            return report
+        tcp_position, _tcp_orientation = self.planned_tcp_pose(joint_positions)
+        clearance = gripper_envelope_apple_clearance(
+            tcp_position,
+            self.gripper_collision_envelope_radius,
+            self.apple_center,
+            TARGET_APPLE_OBSTACLE_RADIUS_M,
+        )
+        report["gripper_envelope_clearance"] = clearance
+        if clearance < report["minimum_clearance"]:
+            report["minimum_clearance"] = clearance
+            report["closest"] = ("actual_gripper_envelope", "target_apple")
+            report["closest_robot_center"] = tcp_position.copy()
+            report["closest_robot_radius"] = float(
+                self.gripper_collision_envelope_radius
+            )
+            report["closest_obstacle_center"] = self.apple_center.copy()
+            report["closest_obstacle_radius"] = float(
+                TARGET_APPLE_OBSTACLE_RADIUS_M
+            )
+        if clearance <= TARGET_APPLE_APPROACH_CLEARANCE_M:
+            report["target_apple_collision"] = True
+        return report
 
     def notify_plan(self, snapshot):
         """시각화 오류가 planner 또는 executor로 전파되지 않게 격리한다."""
@@ -4705,6 +4834,11 @@ class CollisionAwareMotion:
                 joint_target,
                 include_target_apple=self.apple_obstacle_enabled,
             )
+            clearance_report = self.apply_staging_gripper_envelope_check(
+                clearance_report,
+                joint_target,
+                segment_name,
+            )
             if (
                 minimum_clearance_report is None
                 or clearance_report["minimum_clearance"]
@@ -4732,6 +4866,15 @@ class CollisionAwareMotion:
                         )
                         or collision.get("target_apple_collision", False)
                     )
+                    if "gripper_envelope_clearance" in collision:
+                        trajectory_collision["gripper_envelope_clearance"] = min(
+                            float(
+                                trajectory_collision.get(
+                                    "gripper_envelope_clearance", float("inf")
+                                )
+                            ),
+                            float(collision["gripper_envelope_clearance"]),
+                        )
                     if (
                         collision["minimum_clearance"]
                         < trajectory_collision["minimum_clearance"]
@@ -4740,6 +4883,13 @@ class CollisionAwareMotion:
                             "minimum_clearance"
                         ]
                         trajectory_collision["closest"] = collision["closest"]
+                        for key in (
+                            "closest_robot_center",
+                            "closest_robot_radius",
+                            "closest_obstacle_center",
+                            "closest_obstacle_radius",
+                        ):
+                            trajectory_collision[key] = collision.get(key)
             if collect_visualization:
                 tcp_position, tcp_orientation = self.planned_tcp_pose(joint_target)
                 sampled_joint_positions.append(joint_target.copy())
@@ -4764,11 +4914,22 @@ class CollisionAwareMotion:
                     target_joint_positions=target_joint_positions,
                 )
             if trajectory_collision.get("target_apple_collision", False):
-                raise ApproachUnreachableError(
-                    f"{segment_name} RRT trajectory가 목표 사과의 "
-                    f"{TARGET_APPLE_APPROACH_CLEARANCE_M:.3f} m 실행 여유를 "
-                    f"침범합니다: {self.collision_text(trajectory_collision)}"
+                envelope_clearance = trajectory_collision.get(
+                    "gripper_envelope_clearance"
                 )
+                envelope_text = (
+                    ""
+                    if envelope_clearance is None
+                    else f", actual_mesh_envelope={envelope_clearance:.4f} m"
+                )
+                print(
+                    f"   [TARGET APPLE REJECT] {segment_name}: 목표 사과의 "
+                    f"{TARGET_APPLE_APPROACH_CLEARANCE_M:.3f} m 실행 여유를 "
+                    f"침범하는 trajectory를 실행하지 않습니다: "
+                    f"{self.collision_text(trajectory_collision)}"
+                    f"{envelope_text}; 다음 +side/-side 후보 재계획"
+                )
+                return None
             raise ApproachUnreachableError(
                 f"{segment_name} RRT trajectory가 이미 반영된 나무 proxy와 "
                 f"충돌합니다: {self.collision_text(trajectory_collision)}"
