@@ -1,112 +1,254 @@
-# Isaac Sim 기반 사과 수확·품질 분류 시스템
+# Isaac Sim 사과 수확·품질 검사 시스템
 
-디지털 트윈 환경에서 Doosan M0617 협동로봇 두 대와 Robotiq AGS-001-MTCP 3-finger soft gripper를 이용해 사과를 수확하고, MVP의 3모듈 컨베이어에서 품질을 판정하는 프로젝트다. v2.0에서는 개인 PC 1이 영상에서 사과의 3D 좌표를 계산하고, GPU PC 1이 해당 좌표를 받아 Lula 기반 경로 계획과 로봇 실행을 전담한다. 3차 통합에서는 저장된 USD의 두 M0617과 두 수확 영역을 로봇별 프로파일로 선택한다.
+NVIDIA Isaac Sim과 ROS 2 Jazzy를 이용해 사과를 수확하고 컨베이어에서 품질을
+검사하는 다중 PC 시스템이다. GPU PC 1이 시뮬레이션과 로봇 실행을 담당하고,
+개인 PC 1은 수확 target을 계산하며, GPU PC 2는 품질 결과를 생성하고, 개인 PC 2는
+운영 상태를 표시한다.
 
-## 개발 목표
+## 1. 시스템 설계와 전체 흐름
 
-1. 단일 사과의 접근·파지·Twist & Pull 수확
-2. 컨베이어 투입 및 검사 구간 이송
-3. 상단 카메라 영상 기반 상·중·하 품질 판정
-4. 2차 개발에서 컨베이어 4와 푸셔 3개를 추가해 물리 분류
-5. 3차 개발에서 두 M0617, 다중 나무 및 전체 파이프라인 통합
-
-## 기준 환경
-
-- Isaac Sim 5.1.0
-- Ubuntu 24.04
-- ROS 2 Jazzy / Fast DDS
-- Isaac Sim Python 3.11 / ROS 2 Python 3.12
-- GPU 노트북 2대, 개인 노트북 2대
-- 2.5Gbps 5포트 스위치 중 4포트 사용
-
-## 저장된 USD 멀티로봇 매핑
-
-현재 실행 자산의 기준 경로와 초기 관절 자세는 다음과 같다.
-
-| 로봇 프로파일 | 로봇 Prim | 초기 관절 자세 (deg) | 수확 자산 영역 | 인식 카메라 Prim |
-|---|---|---|---|---|
-| `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` | `/World/Xform`의 `tree`·`apple_branch[_1/_2]` | `/World/base_rsd455_01` |
-| `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` | `/World/Xform_03`의 `tree`·`apple_branch[_1/_2]` | `/World/base_rsd455_02` |
-
-사과의 `PhysicsFixedJoint`는 각 `apple_branch_xx` 내부에 있으며,
-`branchbody → applebody` 관계를 사용한다. GPU PC 1 코드는 실행 시 이 관계를
-검증하고 파손 한계를 Session Layer에 적용한다. 각 로봇의 Articulation root는
-`/World/Xform_01/m0617_rail/root_joint` 또는
-`/World/Xform_02/m0617_rail/root_joint`이며, M0617 본체는 각각의
-`m0617_01/FixedJoint`·`m0617_02/FixedJoint`로 rail mount에 연결된다. ROS topic/action namespace는
-3차 통합 계약에서 `TBD`로 유지한다.
-
-## v2.0 실행 구조
+![시스템 전체 플로우차트](docs/architecture/system_flowchart.png)
 
 ```text
-GPU PC 1: Isaac Sim RGB-D/TF/장애물 발행
-  → 개인 PC 1: 영상 수신·사과 3D 좌표 계산
-  → GPU PC 1: Lula RRT 전역 계획·궤적 생성·RMPflow 실행·PhysX 안전 감시
-  → 개인 PC 1: RViz 원격 표시
+GPU PC 1 Isaac Sim
+  ├─ RGB-D·CameraInfo·TF·/clock 발행
+  ├─ 사과 수확·컨베이어 투입 실행
+  └─ /conveyor/checkpoint_events
+       ├─► 개인 PC 1: 검출·depth projection·world target
+       │       └─ /<robot_id>/harvest/target ─► GPU PC 1
+       └─► GPU PC 2: ROI/tracker·검사 프레임 구성·착색률 계산
+                └─ /quality/results ─► 개인 PC 2 모니터
 ```
 
-- 영상 기반 수확 인식의 실행 주체는 개인 PC 1이다.
-- 경로 계획, 계획 검증, Action 실행 및 최종 충돌 감시는 GPU PC 1이다.
-- motion planning 시각화 데이터는 GPU PC 1이 발행하고 RViz GUI는 개인 PC 1에서 실행한다.
-- GPU PC 2는 컨베이어 카메라 영상을 받아 ROI/tracker, 후보 프레임 수집·대표 프레임
-  선택, 품질 추론 및 사과 단위 결과 통합을 수행하고, 개인 PC 2는 결과 표시·푸셔
-  선택을 담당한다.
+품질 등급은 착색률로 결정한다.
 
-쉽게 말하면 개인 PC 1은 카메라로 보는 **눈**, GPU PC 1은 경로를 결정하고 로봇을
-움직이는 **두뇌와 팔**, 개인 PC 1의 RViz는 결과를 보는 **화면**이다.
+| 등급 | 조건 |
+|---|---|
+| `HIGH` | `color_ratio >= 0.80` |
+| `MEDIUM` | `0.60 <= color_ratio < 0.80` |
+| `LOW` | `color_ratio < 0.60` |
 
-## 3차 멀티로봇 실행 선택
+`diameter_mm`은 측정값으로 전달하며 등급 계산에는 사용하지 않는다.
 
-GPU PC 1의 standalone 수확·통합 실행은 `--robot-id robot_01` 또는
-`--robot-id robot_02`로 USD 로봇 프로파일을 선택한다. 두 프로파일은 각각의
-`m0617_rail` Articulation root, M0617 본체, 나무/사과 영역, D455 Prim 및
-초기 관절 자세를 사용한다.
-두 로봇을 동시에 운용할 ROS topic/action namespace와 target의 최종 robot ID
-필드는 아직 `TBD`다.
+## 2. PC별 역할과 주요 파일
 
-## PC별 개발 범위
-
-| PC | 담당 기능 | 유지·개발 대상 |
+| PC | 역할 | 주요 파일 |
 |---|---|---|
-| GPU PC 1 | Isaac Sim, 물리, 센서·TF·planning scene, Lula RRT/trajectory/RMPflow, 로봇 실행, 충돌 감시, 계획 시각화 | `apple_pick.py`, `vision_apple_pick.py`, `base_camera_publish.py`, planner/executor |
-| GPU PC 2 | 컨베이어 카메라 수신, ROI/tracker, 후보 프레임 수집·대표 프레임 선택, 품질 영상 추론 및 사과 단위 품질 결과 통합 | 품질 캡처·추론·결과 통합 소스 (`TBD`) |
-| 개인 PC 1 | RGB-D 기반 사과 검출·3D 좌표 계산·target 발행, RViz 원격 표시 | PC1 perception 노드 및 RViz 설정 (`TBD`) |
-| 개인 PC 2 | 모니터링, 품질 결과 표시, 재검 요청, 2차 푸셔 선택 | 모니터링·푸셔 선택 소스 (`TBD`) |
+| GPU PC 1 | Isaac Sim, 물리·센서·TF·컨베이어, Lula RRT/RMPflow, 로봇 실행·안전 감시 | `vision_apple_pick.py`, `apple_pick.py`, `conveyor_camera_publish.py`, `base_camera_publish.py` |
+| GPU PC 2 | 컨베이어 영상 수신, ROI/tracker, 검사 프레임 구성, 품질 추론·통합 | `quality_grading_system/conveyor_camera_adapter_node.py`, `quality_grading_system/quality_inspection_node.py` |
+| 개인 PC 1 | RGB-D 사과 검출, depth projection, world target 발행, RViz | `base_apple_detector.py`, `harvest_multi_robot.launch.py` |
+| 개인 PC 2 | 품질 결과·checkpoint 모니터링과 운영 로그 | `appleproj_personal_pc2/` |
 
-v2.0 기준으로 수확 계획·상태 머신·RobotMotion 실행을 담당하는
-`harvest_coordinator.py`와 `harvest_route_planner.py`의 소유권은 GPU PC 1로
-이전한다. 개인 PC 1은 새 perception 노드와 RViz 설정을 소유한다. 실제 코드
-이관과 인터페이스 반영은 별도 구현 단계에서 수행하며, 공유 인터페이스와 문서는
-네 PC 공동 소유다.
+## 3. ROS 2 통신
 
-## 모션 계획 원칙
+모든 PC는 ROS 2 Jazzy, Fast DDS, `ROS_DOMAIN_ID=101`을 사용한다. 모든 노드는
+`use_sim_time=true`이며 시간 기준은 Isaac Sim의 `/clock`이다.
 
-GPU PC 1은 정적 planning scene에서 Lula RRT로 시작 관절 상태부터 transit/staging/pre-grasp까지 전역 경로 후보를 만든다. RRT 출력 waypoint를 그대로 로봇에 보내지 않고 Lula trajectory generation으로 시간 매개화한 뒤, GPU PC 1의 RMPflow와 PhysX contact monitor로 실행 중 재검증한다. palm 접촉 이후의 twist·pull은 접촉 의도가 있는 결정론적 task-space 동작으로 유지한다. 동적 장애물이나 목표 변화가 생기면 현재 Action을 중단하고 최신 `reset_id/scene_version`으로 재계획한다.
+### 수확·시뮬레이션
 
-## 문서
+| 이름 | 타입 | 송신 → 수신 |
+|---|---|---|
+| `/<robot_id>/base_camera/color/image_raw` | `sensor_msgs/msg/Image` | GPU PC 1 → 개인 PC 1 |
+| `/<robot_id>/base_camera/depth/image_raw` | `sensor_msgs/msg/Image` | GPU PC 1 → 개인 PC 1 |
+| `/<robot_id>/base_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | GPU PC 1 → 개인 PC 1 |
+| `/<robot_id>/harvest/target` | `appleproj_interfaces/msg/HarvestTarget` | 개인 PC 1 → GPU PC 1 |
+| `/<robot_id>/harvest/perception_status` | `appleproj_interfaces/msg/HarvestPerceptionStatus` | 개인 PC 1 → GPU PC 1 |
+| `/<robot_id>/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 내부 |
+| `/<robot_id>/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | GPU PC 1 → 모니터 |
+| `/simulation/state` | `appleproj_interfaces/msg/SimulationState` | GPU PC 1 → 전체 |
+| `/planning_scene` | `appleproj_interfaces/msg/PlanningScene` | GPU PC 1 → 개인 PC 1 |
+| `/clock` | `rosgraph_msgs/msg/Clock` | Isaac Sim → 전체 |
+| `/tf`, `/tf_static` | `tf2_msgs/msg/TFMessage` | GPU PC 1 → 개인 PC 1/RViz |
 
-### 공통 아키텍처
+### 품질 검사
+
+| 이름 | 타입 | 송신 → 수신 |
+|---|---|---|
+| `/conveyor_camera/color/image_raw` | `sensor_msgs/msg/Image` | GPU PC 1 → GPU PC 2 |
+| `/conveyor_camera/depth/image_raw` | `sensor_msgs/msg/Image` | GPU PC 1 → GPU PC 2 |
+| `/conveyor_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | GPU PC 1 → GPU PC 2 |
+| `/quality/inspection_images` | `appleproj_interfaces/msg/InspectionImage` | GPU PC 2 adapter → GPU PC 2 검사 노드 |
+| `/quality/inspection_completed` | `appleproj_interfaces/msg/InspectionCompleted` | GPU PC 2 adapter → GPU PC 2 검사 노드 |
+| `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 → 개인 PC 2 |
+| `/conveyor/checkpoint_events` | `appleproj_interfaces/msg/CheckpointEvent` | GPU PC 1 → 개인 PC 2 |
+
+카메라 입력 QoS는 Reliable/Volatile/Keep Last 6, 상태·결과 QoS는
+Reliable/Volatile/Keep Last 10을 사용한다.
+
+## 4. 장비와 USD 자산
+
+- RTX 5080 GPU 노트북 2대와 Ubuntu Linux 노트북 2대
+- 2.5Gbps 5포트 Ethernet 스위치
+- Doosan M0617 6-DOF 2대
+- Robotiq AGS-001-MTCP 3-finger soft gripper 2개
+- Intel RealSense D455 base 카메라와 컨베이어 상부 카메라 1대
+- 2모듈 컨베이어(총 길이 3.3m): 1번 입력·이송 모듈, 2번 롤러 검사 모듈
+- rigid body/collider 사과(직경 80mm, 질량 0.3kg, breakable stem)
+- `m0617_3fgripper08201638.usd`
+
+| robot ID | 로봇 Prim | 초기 관절 자세(deg) | base 카메라 |
+|---|---|---|---|
+| `robot_01` | `/World/Xform_01/m0617_01` | `[0, 0, -90, 0, 90, 0]` | `/World/base_rsd455_01` |
+| `robot_02` | `/World/Xform_02/m0617_02` | `[0, 0, 90, 0, -90, 0]` | `/World/base_rsd455_02` |
+
+현재 통합 실행의 컨베이어는 2개 모듈, 총 3.3m다. 1번 모듈은 입력·이송,
+2번 모듈은 롤러 방식의 검사 구간이다. 컨베이어 카메라 namespace는
+`/conveyor_camera`이며 2번 모듈 상부의 `conv_rsd455` 한 대를 사용한다.
+
+## 5. 운영 환경과 네트워크
+
+| 항목 | 값 |
+|---|---|
+| OS | Ubuntu 24.04 |
+| ROS 2 | Jazzy |
+| DDS | Fast DDS (`rmw_fastrtps_cpp`) |
+| Isaac Sim | 5.1.0 |
+| Isaac Python | 3.11 |
+| 시스템 ROS Python | 3.12 |
+| Isaac 확장 | `isaacsim.ros2.bridge`, `isaacsim.asset.gen.conveyor` |
+| simulation time | `/clock`, `use_sim_time=true` |
+
+| 장비 | 고정 IP |
+|---|---|
+| GPU PC 1 | `10.10.0.1` |
+| GPU PC 2 | `10.10.0.2` |
+| 개인 PC 1 | `10.10.0.3` |
+| 개인 PC 2 | `10.10.0.4` |
+
+## 6. 의존성 설치
+
+Python 패키지는 저장소 루트의 [`requirements.txt`](requirements.txt)에 기록되어
+있다.
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+ROS 2 apt 패키지는 별도로 설치한다.
+
+```bash
+sudo apt install \
+  ros-jazzy-rclpy ros-jazzy-cv-bridge ros-jazzy-tf2-ros \
+  ros-jazzy-sensor-msgs ros-jazzy-geometry-msgs ros-jazzy-launch-ros \
+  ros-jazzy-rviz2 python3-colcon-common-extensions
+```
+
+Isaac Sim이 제공하는 `isaacsim`, `omni`, `pxr`, Isaac용 `rclpy`는 pip로 설치하지
+않고 `/home/rokey/isaacsim/python.sh`에서 사용한다.
+
+## 7. 빌드
+
+```bash
+cd /home/rokey/cobot3_ws/rokey_isaacsim_project
+source /opt/ros/jazzy/setup.bash
+export ROS_DOMAIN_ID=101
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+
+colcon build --symlink-install \
+  --packages-select appleproj_interfaces quality_grading_system appleproj_personal_pc2
+source install/setup.bash
+```
+
+GPU PC 1의 Isaac Python 3.11에서 custom interface를 사용하기 위한 추가 빌드:
+
+```bash
+./build_interfaces_for_isaac.sh
+export APPLEPROJ_INTERFACES_PREFIX="$PWD/install_isaac311/appleproj_interfaces"
+```
+
+## 8. 실행 순서
+
+### 8.1 GPU PC 1
+
+```bash
+cd /home/rokey/cobot3_ws/rokey_isaacsim_project
+source /opt/ros/jazzy/setup.bash
+export ROS_DOMAIN_ID=101
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export APPLEPROJ_INTERFACES_PREFIX="$PWD/install_isaac311/appleproj_interfaces"
+PYTHONUNBUFFERED=1 /home/rokey/isaacsim/python.sh vision_apple_pick.py
+```
+
+`vision_apple_pick.py`가 하나의 Isaac Sim World에서 로봇, 컨베이어, base 카메라,
+컨베이어 카메라, TF와 `/clock`을 함께 발행한다.
+
+### 8.2 개인 PC 1
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ROS_DOMAIN_ID=101 python3 base_apple_detector.py --robot-id robot_01
+```
+
+두 로봇을 함께 사용할 때:
+
+```bash
+ROS_DOMAIN_ID=101 ros2 launch harvest_multi_robot.launch.py \
+  domain_id:=101 execute:=true
+```
+
+### 8.3 GPU PC 2
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=101
+
+ros2 run quality_grading_system conveyor_camera_adapter_node
+ros2 run quality_grading_system quality_inspection_node \
+  --ros-args -p model_backend:=opencv_color \
+             -p grade_by:=color \
+             -p min_valid_views:=1
+```
+
+### 8.4 개인 PC 2
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ROS_DOMAIN_ID=101 ros2 launch appleproj_personal_pc2 personal_pc2.launch.py
+```
+
+## 9. 검증
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source install/setup.bash
+ros2 node list
+ros2 topic echo --once /quality/results
+ros2 topic echo --once /conveyor/checkpoint_events
+ros2 topic hz /conveyor_camera/color/image_raw
+ros2 topic info -v /quality/results
+colcon test --packages-select quality_grading_system appleproj_personal_pc2
+```
+
+인터페이스 확인:
+
+```bash
+ros2 interface show appleproj_interfaces/msg/QualityResult
+ros2 interface show appleproj_interfaces/msg/CheckpointEvent
+ros2 interface show appleproj_interfaces/msg/HarvestTarget
+```
+
+## 10. Reset 및 오류 처리
+
+- Timeline Stop/Reset 시 GPU PC 1은 실행 중인 목표와 대기열을 폐기하고
+  `SimulationState.reset_id`를 증가시킨다.
+- 개인 PC 1은 `READY` 또는 `PLAYING` 상태에서만 새 target을 발행한다.
+- `reset_id` 또는 `scene_version`이 현재 상태와 다른 target은 실행하지 않는다.
+- 품질 결과가 ROI 이탈 후 0.5 simulation-second 안에 도착하지 않으면 `TIMEOUT`,
+  이후 도착하면 `LATE_RESULT`로 기록한다.
+- ID 불일치, 관측 부족, timeout은 개인 PC 2 모니터에 오류 상태로 표시한다.
+- RViz 연결이 끊겨도 GPU PC 1의 안전 정지와 실행 판정은 독립적으로 동작한다.
+
+## 11. 기준 문서
 
 - [시스템 개요](docs/architecture/system_overview.md)
 - [ROS 2 인터페이스](docs/architecture/ros2_interfaces.md)
-- [TF 및 시간](docs/architecture/tf_frames.md)
 - [하드웨어 및 네트워크](docs/architecture/hardware_network.md)
-
-### 기능 명세
-
-- [수확용 인식](docs/features/harvest_perception.md)
-- [수확 및 파지](docs/features/harvesting.md)
+- [TF 및 시간](docs/architecture/tf_frames.md)
 - [컨베이어](docs/features/conveyor.md)
-- [품질 분류](docs/features/quality_grading.md)
-- [자산 요구사항](docs/assets/asset_requirements.md)
-
-### 개발 단계
-
-- [1차 MVP](docs/phases/phase_1_mvp.md)
-- [2차 AI·도메인 무작위화](docs/phases/phase_2_ai_randomization.md)
-- [2차 푸셔](docs/phases/phase_2_pusher.md)
-- [3차 시스템 통합](docs/phases/phase_3_system_integration.md)
-
-## 변경 규칙
-
-파일 및 코드 변경은 반드시 사용자 승인 후 진행한다. 상세 규칙은 루트의 `AGENTS.md`를 따른다.
+- [품질 검사](docs/features/quality_grading.md)
+- [수확 인식](docs/features/harvest_perception.md)
+- [수확 동작](docs/features/harvesting.md)
+- [개인 PC 2 테스트](appleproj_personal_pc2/PERSONAL_PC2_TEST_RUNBOOK.md)

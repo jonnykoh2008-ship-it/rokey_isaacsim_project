@@ -24,15 +24,20 @@ from conveyor_camera_adapter_node import (
     GROUP_STAMP_TOLERANCE_NS,
     ConveyorCameraAdapterNode,
     ExactStampSynchronizer,
+    annotate_apple_detection,
     decode_depth_mm,
     decode_rgb_bgr,
+    encode_debug_jpeg,
     selected_apple_mask,
+    rolling_apple_mask,
+    resize_debug_image,
 )
 from inspection_session import (
     MAX_REPRESENTATIVE_FRAMES,
     QUALITY_CAMERA_OPTICAL_FRAMES,
     REPRESENTATIVE_INSTANTS,
 )
+from opencv_size_grader import AppleNotDetected, DetectionConfig
 
 
 def header(sec: int, nanosec: int = 0):
@@ -114,6 +119,82 @@ class ImageConversionTest(unittest.TestCase):
         self.assertGreater(detection.diameter_px, 80.0)
         self.assertEqual(int(mask[90, 80]), 255)
         self.assertEqual(int(mask[25, 210]), 0)
+
+    def test_annotation_draws_detected_apple_bounding_box(self) -> None:
+        import cv2
+
+        image = np.zeros((100, 140, 3), dtype=np.uint8)
+        cv2.circle(image, (70, 50), 22, (20, 30, 210), thickness=-1)
+        detection, _mask = selected_apple_mask(image)
+        annotated = annotate_apple_detection(image, detection)
+        x, y, width, height = detection.bounding_box
+
+        np.testing.assert_array_equal(image[0, 0], np.zeros(3, dtype=np.uint8))
+        self.assertTrue(
+            np.any(annotated[y : y + height, x : x + width, 1] == 255)
+        )
+
+    def test_debug_image_is_half_resolution_without_changing_source(self) -> None:
+        image = np.arange(8 * 12 * 3, dtype=np.uint8).reshape(8, 12, 3)
+        original = image.copy()
+        resized = resize_debug_image(image, 0.5)
+
+        self.assertEqual(resized.shape, (4, 6, 3))
+        np.testing.assert_array_equal(image, original)
+
+    def test_debug_image_scale_must_be_valid(self) -> None:
+        image = np.zeros((8, 12, 3), dtype=np.uint8)
+        for scale in (0.0, -0.5, 1.01):
+            with self.subTest(scale=scale), self.assertRaises(ValueError):
+                resize_debug_image(image, scale)
+
+    def test_debug_jpeg_preserves_scaled_dimensions(self) -> None:
+        import cv2
+
+        image = np.full((360, 640, 3), (20, 80, 210), dtype=np.uint8)
+        encoded = encode_debug_jpeg(image, 75)
+        decoded = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+        self.assertIsNotNone(decoded)
+        self.assertEqual(decoded.shape, (360, 640, 3))
+        self.assertLess(len(encoded), image.nbytes // 4)
+
+    def test_debug_jpeg_quality_must_be_valid(self) -> None:
+        image = np.zeros((16, 16, 3), dtype=np.uint8)
+        for quality in (0, 101):
+            with self.subTest(quality=quality), self.assertRaises(ValueError):
+                encode_debug_jpeg(image, quality)
+
+    def test_rolling_fallback_recovers_low_saturation_bright_peel(self) -> None:
+        import cv2
+
+        first = np.zeros((160, 240, 3), dtype=np.uint8)
+        cv2.circle(first, (100, 80), 28, (10, 20, 220), thickness=-1)
+        config = DetectionConfig()
+        previous, _mask = selected_apple_mask(first, config)
+
+        hsv = np.zeros_like(first)
+        cv2.circle(hsv, (112, 80), 27, (25, 20, 255), thickness=-1)
+        rolled = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        with self.assertRaises(AppleNotDetected):
+            selected_apple_mask(rolled, config)
+
+        detection, mask = rolling_apple_mask(rolled, previous, config)
+        self.assertAlmostEqual(detection.center[0], 112.0, delta=2.0)
+        self.assertGreater(int(np.count_nonzero(mask)), 1500)
+
+    def test_rolling_fallback_rejects_large_background_candidate(self) -> None:
+        import cv2
+
+        first = np.zeros((180, 260, 3), dtype=np.uint8)
+        cv2.circle(first, (100, 90), 25, (10, 20, 220), thickness=-1)
+        config = DetectionConfig()
+        previous, _mask = selected_apple_mask(first, config)
+
+        rolled = np.zeros_like(first)
+        cv2.circle(rolled, (105, 90), 55, (40, 80, 240), thickness=-1)
+        with self.assertRaises(AppleNotDetected):
+            rolling_apple_mask(rolled, previous, config)
 
 
 class ThreeViewGroupingTest(unittest.TestCase):

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from inspection_session import (
@@ -37,8 +37,22 @@ CAMERA_INFO_SUFFIX = "/camera_info"
 
 INSPECTION_TOPIC = "/quality/inspection_images"
 COMPLETION_TOPIC = "/quality/inspection_completed"
+DETECTION_DEBUG_TOPIC = "/quality/conveyor_detection_debug/compressed"
+DEFAULT_DETECTION_DEBUG_SCALE = 0.5
+DEFAULT_DETECTION_DEBUG_JPEG_QUALITY = 75
 DEFAULT_REARM_ABSENT_FRAMES = 3
 DEFAULT_SYNC_QUEUE_SIZE = 20
+
+# 롤러 위에서 사과가 회전하면 정반사 면은 채도가 30 아래로 내려가고 밝기는
+# 255까지 올라간다. 정지 영상용 기본값(35, 250)을 그대로 쓰면 같은 사과가
+# 회전할 때마다 사라지므로 adapter 기본값은 실측 범위를 포함한다.
+DEFAULT_ROLLING_MIN_SATURATION = 20
+DEFAULT_ROLLING_MAX_VALUE = 255
+ROLLING_FALLBACK_MIN_SATURATION = 8
+ROLLING_FALLBACK_HUE_LOW_MAX = 35
+ROLLING_FALLBACK_BBOX_EXPANSION = 0.75
+ROLLING_FALLBACK_MIN_DIAMETER_RATIO = 0.55
+ROLLING_FALLBACK_MAX_DIAMETER_RATIO = 1.60
 
 # 검사 ROI는 카메라 영상 안의 세로 띠로 정의한다. docs/features/conveyor.md는
 # 프레임 수집의 시작과 종료를 trigger collider가 아니라 카메라 ROI로 판단하도록
@@ -324,12 +338,163 @@ def selected_apple_mask(image, config: DetectionConfig = DetectionConfig()):
     return detection, mask
 
 
+def rolling_apple_mask(image, previous_detection, config: DetectionConfig):
+    """Re-detect a rotating apple near its previous bounding box.
+
+    The relaxed colour/shape thresholds are only applied inside an expanded
+    previous box. This keeps bright or yellow-red peel visible while avoiding
+    a full-frame relaxed search that could select conveyor or background parts.
+    """
+
+    import numpy as np
+
+    height, width = image.shape[:2]
+    x, y, box_width, box_height = previous_detection.bounding_box
+    padding = int(
+        round(max(box_width, box_height) * ROLLING_FALLBACK_BBOX_EXPANSION)
+    )
+    x0 = max(0, x - padding)
+    y0 = max(0, y - padding)
+    x1 = min(width, x + box_width + padding)
+    y1 = min(height, y + box_height + padding)
+    if x1 <= x0 or y1 <= y0:
+        raise AppleNotDetected("previous apple bounding box is outside the image")
+
+    relaxed = DetectionConfig(
+        min_saturation=min(
+            config.min_saturation, ROLLING_FALLBACK_MIN_SATURATION
+        ),
+        min_value=max(10, config.min_value - 15),
+        max_value=255,
+        min_area_ratio=max(0.0001, config.min_area_ratio * 0.25),
+        morphology_kernel=config.morphology_kernel,
+        hue_low_max=max(config.hue_low_max, ROLLING_FALLBACK_HUE_LOW_MAX),
+        hue_high_min=config.hue_high_min,
+        min_fill_ratio=max(0.35, config.min_fill_ratio - 0.20),
+        max_area_ratio=config.max_area_ratio,
+    )
+    local_detection, local_mask = selected_apple_mask(
+        image[y0:y1, x0:x1], relaxed
+    )
+    previous_diameter = max(float(previous_detection.diameter_px), 1.0)
+    diameter_ratio = float(local_detection.diameter_px) / previous_diameter
+    if not (
+        ROLLING_FALLBACK_MIN_DIAMETER_RATIO
+        <= diameter_ratio
+        <= ROLLING_FALLBACK_MAX_DIAMETER_RATIO
+    ):
+        raise AppleNotDetected(
+            "rolling fallback candidate changed diameter too much: "
+            f"ratio={diameter_ratio:.2f}"
+        )
+
+    contour = np.asarray(local_detection.contour).copy()
+    contour[..., 0] += x0
+    contour[..., 1] += y0
+    local_x, local_y, local_width, local_height = local_detection.bounding_box
+    full_mask = np.zeros((height, width), dtype=np.uint8)
+    full_mask[y0:y1, x0:x1] = local_mask
+    detection = replace(
+        local_detection,
+        contour=contour,
+        bounding_box=(
+            local_x + x0,
+            local_y + y0,
+            local_width,
+            local_height,
+        ),
+        center=(
+            local_detection.center[0] + x0,
+            local_detection.center[1] + y0,
+        ),
+        mask=full_mask,
+    )
+    return detection, full_mask
+
+
 def encode_image(extension: str, image) -> bytes:
     import cv2
 
     success, encoded = cv2.imencode(extension, image)
     if not success:
         raise ValueError(f"OpenCV failed to encode {extension} image")
+    return encoded.tobytes()
+
+
+def annotate_apple_detection(image, detection=None):
+    """Draw the selected apple bounding box without modifying the source image."""
+
+    import cv2
+
+    annotated = image.copy()
+    if detection is None:
+        cv2.putText(
+            annotated,
+            "NO APPLE",
+            (16, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return annotated
+
+    x, y, width, height = detection.bounding_box
+    cv2.rectangle(
+        annotated,
+        (x, y),
+        (x + width - 1, y + height - 1),
+        (0, 255, 0),
+        2,
+    )
+    label_y = max(20, y - 8)
+    cv2.putText(
+        annotated,
+        f"apple {detection.confidence:.2f} ({x},{y},{width},{height})",
+        (x, label_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 255, 0),
+        2,
+        cv2.LINE_AA,
+    )
+    return annotated
+
+
+def resize_debug_image(image, scale: float):
+    """Downscale display-only output while preserving inspection resolution."""
+
+    import cv2
+
+    if not 0.0 < scale <= 1.0:
+        raise ValueError("detection debug scale must satisfy 0 < scale <= 1")
+    if scale == 1.0:
+        return image.copy()
+    height, width = image.shape[:2]
+    output_width = max(1, int(round(width * scale)))
+    output_height = max(1, int(round(height * scale)))
+    return cv2.resize(
+        image,
+        (output_width, output_height),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def encode_debug_jpeg(image, quality: int) -> bytes:
+    """Encode display-only BGR output as a bounded-quality JPEG."""
+
+    import cv2
+
+    if not 1 <= quality <= 100:
+        raise ValueError("detection debug JPEG quality must be between 1 and 100")
+    success, encoded = cv2.imencode(
+        ".jpg",
+        image,
+        [cv2.IMWRITE_JPEG_QUALITY, int(quality)],
+    )
+    if not success:
+        raise ValueError("OpenCV failed to encode detection debug JPEG")
     return encoded.tobytes()
 
 
@@ -544,9 +709,9 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             ("crop_margin_px", DEFAULT_CROP_MARGIN_PX),
             ("camera_qos_reliable", False),
             ("rearm_absent_frames", DEFAULT_REARM_ABSENT_FRAMES),
-            ("min_saturation", DetectionConfig().min_saturation),
+            ("min_saturation", DEFAULT_ROLLING_MIN_SATURATION),
             ("min_value", DetectionConfig().min_value),
-            ("max_value", DetectionConfig().max_value),
+            ("max_value", DEFAULT_ROLLING_MAX_VALUE),
             ("min_area_ratio", DetectionConfig().min_area_ratio),
             ("morphology_kernel", DetectionConfig().morphology_kernel),
             ("representative_instants", REPRESENTATIVE_INSTANTS),
@@ -555,6 +720,12 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             ("roi_radius_m", DEFAULT_ROI_RADIUS_M),
             ("track_gap_ns", DEFAULT_TRACK_GAP_NS),
             ("track_radius_m", DEFAULT_TRACK_RADIUS_M),
+            ("detection_debug_topic", DETECTION_DEBUG_TOPIC),
+            ("detection_debug_scale", DEFAULT_DETECTION_DEBUG_SCALE),
+            (
+                "detection_debug_jpeg_quality",
+                DEFAULT_DETECTION_DEBUG_JPEG_QUALITY,
+            ),
         ):
             if not self.has_parameter(name):
                 self.declare_parameter(name, default)
@@ -631,6 +802,18 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         self._track_gap_ns = int(self.get_parameter("track_gap_ns").value)
         self._track_radius_m = float(self.get_parameter("track_radius_m").value)
         self._last_track: dict[str, Any] | None = None
+        self._detection_debug_scale = float(
+            self.get_parameter("detection_debug_scale").value
+        )
+        if not 0.0 < self._detection_debug_scale <= 1.0:
+            raise ValueError("detection_debug_scale must satisfy 0 < scale <= 1")
+        self._detection_debug_jpeg_quality = int(
+            self.get_parameter("detection_debug_jpeg_quality").value
+        )
+        if not 1 <= self._detection_debug_jpeg_quality <= 100:
+            raise ValueError(
+                "detection_debug_jpeg_quality must be between 1 and 100"
+            )
         if self._representative_instants * len(self._namespaces) > MAX_REPRESENTATIVE_FRAMES:
             raise ValueError(
                 "representative_instants x cameras cannot exceed "
@@ -672,6 +855,15 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         # 마지막 그룹의 검출 위치·크기. 정지한 배경을 사과로 오인하는지
         # 판단하려면 무엇이 어디서 잡히는지 보여야 한다.
         self._last_detection: list[str] = []
+        # RGB 도착 즉시 검출해 debug 영상을 발행한다. 이후 같은 RGB-D 그룹은
+        # 이 결과를 재사용하여 OpenCV 검출을 두 번 수행하지 않는다.
+        self._rgb_detection_cache: OrderedDict[
+            tuple[str, int], tuple[Any, Any, Any] | None
+        ] = OrderedDict()
+        self._rolling_detections: dict[str, Any] = {}
+        self._rolling_detection_misses: dict[str, int] = {
+            namespace: 0 for namespace in self._namespaces
+        }
 
         qos = make_reliable_qos()
         self._inspection_publisher = self.create_publisher(
@@ -679,6 +871,14 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         )
         self._completion_publisher = self.create_publisher(
             InspectionCompleted, COMPLETION_TOPIC, qos
+        )
+        detection_debug_topic = str(
+            self.get_parameter("detection_debug_topic").value
+        )
+        self._detection_debug_publisher = self.create_publisher(
+            CompressedImage,
+            detection_debug_topic,
+            make_sensor_qos(False, depth=1),
         )
         camera_reliable = bool(self.get_parameter("camera_qos_reliable").value)
         camera_qos = make_sensor_qos(camera_reliable)
@@ -688,7 +888,9 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         self.get_logger().info(
             "GPU PC 2 conveyor adapter ready: "
             f"{len(self._namespaces)} views {self._namespaces} -> "
-            f"{INSPECTION_TOPIC}"
+            f"{INSPECTION_TOPIC}; bbox debug -> {detection_debug_topic} "
+            f"(JPEG q={self._detection_debug_jpeg_quality}, "
+            f"scale {self._detection_debug_scale:.2f}, latest frame only)"
         )
         self.get_logger().info(
             f"ROI mode: {self._roi_mode} "
@@ -766,6 +968,8 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             )
 
     def _accept(self, namespace: str, component: str, message: Any) -> None:
+        if component == "rgb":
+            self._detect_and_publish_rgb(namespace, message)
         synchronized = self._synchronizers[namespace].add(component, message)
         if synchronized is None:
             return
@@ -778,6 +982,81 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             )
             return
         self._collect(namespace, synchronized)
+
+    def _detect_and_publish_rgb(self, namespace: str, rgb_message: Any) -> None:
+        """Detect and publish a bounding box from RGB without waiting for depth."""
+
+        key = (namespace, stamp_to_ns(rgb_message.header.stamp))
+        try:
+            image = decode_rgb_bgr(rgb_message)
+            try:
+                detection, apple_mask = self._detect_rolling_apple(namespace, image)
+                cached: tuple[Any, Any, Any] | None = (
+                    image,
+                    detection,
+                    apple_mask,
+                )
+                annotated = annotate_apple_detection(image, detection)
+            except AppleNotDetected:
+                self._record_rolling_detection_miss(namespace)
+                cached = None
+                annotated = annotate_apple_detection(image)
+
+            self._rgb_detection_cache[key] = cached
+            self._rgb_detection_cache.move_to_end(key)
+            max_cached = DEFAULT_SYNC_QUEUE_SIZE * max(1, len(self._namespaces))
+            while len(self._rgb_detection_cache) > max_cached:
+                self._rgb_detection_cache.popitem(last=False)
+
+            debug_image = resize_debug_image(
+                annotated, self._detection_debug_scale
+            )
+            debug_message = CompressedImage()
+            debug_message.header = copy.deepcopy(rgb_message.header)
+            debug_message.format = "bgr8; jpeg compressed bgr8"
+            debug_message.data = encode_debug_jpeg(
+                debug_image, self._detection_debug_jpeg_quality
+            )
+            self._detection_debug_publisher.publish(debug_message)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Failed to detect {namespace} RGB frame: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    def _detect_rolling_apple(self, namespace: str, image):
+        """Use normal detection first, then a previous-box rolling fallback."""
+
+        try:
+            detection, apple_mask = selected_apple_mask(
+                image, self._detection_config
+            )
+        except AppleNotDetected:
+            previous = getattr(self, "_rolling_detections", {}).get(namespace)
+            if previous is None:
+                raise
+            detection, apple_mask = rolling_apple_mask(
+                image, previous, self._detection_config
+            )
+        if not hasattr(self, "_rolling_detections"):
+            self._rolling_detections = {}
+        if not hasattr(self, "_rolling_detection_misses"):
+            self._rolling_detection_misses = {}
+        self._rolling_detections[namespace] = detection
+        self._rolling_detection_misses[namespace] = 0
+        return detection, apple_mask
+
+    def _record_rolling_detection_miss(self, namespace: str) -> None:
+        if not hasattr(self, "_rolling_detection_misses"):
+            self._rolling_detection_misses = {}
+        if not hasattr(self, "_rolling_detections"):
+            self._rolling_detections = {}
+        misses = getattr(self, "_rolling_detection_misses", {}).get(namespace, 0) + 1
+        self._rolling_detection_misses[namespace] = misses
+        if misses >= getattr(
+            self, "_rearm_absent_frames", DEFAULT_REARM_ABSENT_FRAMES
+        ):
+            self._rolling_detections.pop(namespace, None)
 
     @staticmethod
     def _validate_view(rgb_message: Any, depth_message: Any, camera_info: Any) -> None:
@@ -856,14 +1135,25 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         # 검출 순서로 매기면 한 면이 빠졌을 때 index가 다른 면을 가리킨다.
         for frame_index, namespace in enumerate(self._namespaces):
             rgb_message, depth_message, camera_info = group[namespace]
-            image = decode_rgb_bgr(rgb_message)
-            try:
-                detection, apple_mask = selected_apple_mask(
-                    image, self._detection_config
-                )
-            except AppleNotDetected:
-                # 세 면 중 일부에만 사과가 보이는 것은 정상이다.
+            cache_key = (namespace, stamp_to_ns(rgb_message.header.stamp))
+            cache_missing = object()
+            cached = getattr(self, "_rgb_detection_cache", {}).pop(
+                cache_key, cache_missing
+            )
+            if cached is cache_missing:
+                image = decode_rgb_bgr(rgb_message)
+                try:
+                    detection, apple_mask = self._detect_rolling_apple(
+                        namespace, image
+                    )
+                except AppleNotDetected:
+                    self._record_rolling_detection_miss(namespace)
+                    # 세 면 중 일부에만 사과가 보이는 것은 정상이다.
+                    continue
+            elif cached is None:
                 continue
+            else:
+                image, detection, apple_mask = cached
             if detection.candidate_count > 1:
                 # docs/features/conveyor.md: 두 사과가 겹치면 RECHECK 대상이다.
                 # 붙어 있는 두 사과는 한 윤곽으로 합쳐져 직경이 두 배가 되므로
@@ -878,6 +1168,7 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
                     "image": image,
                     "apple_mask": apple_mask,
                     "depth_mm": decode_depth_mm(depth_message),
+                    "bounding_box": detection.bounding_box,
                     "confidence": detection.confidence,
                     "diameter_px": detection.diameter_px,
                     "position_m": apple_position_m(
@@ -894,10 +1185,11 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             import numpy as np
 
             self._last_detection = [
-                "{}: x={:.2f} area={}px d={:.0f}px".format(
+                "{}: bbox={} x={:.2f} area={}px d={:.0f}px".format(
                     ("top", "left", "right")[view["frame_index"]]
                     if view["frame_index"] < 3
                     else view["frame_index"],
+                    view["bounding_box"],
                     self._mask_centre_ratio(view["apple_mask"]) or -1.0,
                     int(np.count_nonzero(view["apple_mask"])),
                     view["diameter_px"],
