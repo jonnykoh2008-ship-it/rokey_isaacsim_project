@@ -13,6 +13,7 @@ from harvest_coordinator import (
     HarvestCoordinator,
     PendingTarget,
     assign_apple_ids_by_distance,
+    should_host_place_coordinator,
     validate_runtime_identity,
 )
 from harvest_route_planner import RoutePlanningError
@@ -50,6 +51,14 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
             with self.subTest(robot_id=robot_id, topic=topic):
                 with self.assertRaises(ValueError):
                     validate_runtime_identity(robot_id, topic)
+
+    def test_robot_01_hosts_shared_place_coordinator_in_auto_mode(self):
+        self.assertTrue(should_host_place_coordinator("robot_01", "auto"))
+        self.assertFalse(should_host_place_coordinator("robot_02", "auto"))
+        self.assertTrue(should_host_place_coordinator("robot_02", "host"))
+        self.assertFalse(should_host_place_coordinator("robot_01", "client"))
+        with self.assertRaises(ValueError):
+            should_host_place_coordinator("robot_01", "invalid")
 
     def test_apple_ids_are_frozen_by_robot_distance(self):
         candidates = [
@@ -95,6 +104,7 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator.place_command_pending = False
         coordinator.place_reservation_submitted = False
         coordinator.place_ready = False
+        coordinator.place_service_wait_reported = False
         coordinator.safety_stopped = False
         coordinator.safety_stop_reason = None
         coordinator.target_samples = {}
@@ -133,6 +143,7 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator._publish_status = Mock()
         coordinator.get_logger = Mock(return_value=Mock())
         coordinator.queue_dispatch_timer = Mock()
+        coordinator.place_retry_timer = Mock()
         return coordinator
 
     @staticmethod
@@ -482,7 +493,7 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         self.assertFalse(coordinator.running)
         self.assertEqual(len(coordinator.pending_targets), 3)
 
-    def test_batch_dispatch_selects_nearest_after_all_ids_arrive(self):
+    def test_batch_dispatch_selects_nearest_and_keeps_personal_pc1_id(self):
         coordinator = self.make_coordinator()
         coordinator.planning_scene = PlanningScene()
         far = self.candidate("apple-3", [1.5, 0.0, 0.0])
@@ -501,15 +512,15 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         coordinator._dispatch_pending_targets()
 
         self.assertEqual(coordinator._active_target_key, near.key)
-        self.assertEqual("apple_001", coordinator.active_apple_id)
+        self.assertEqual("apple-1", coordinator.active_apple_id)
         self.assertEqual(
-            "robot_01:2:apple_001", coordinator.active_reservation_id
+            "robot_01:2:apple-1", coordinator.active_reservation_id
         )
         self.assertIn(far.key, coordinator.pending_targets)
         self.assertIn(middle.key, coordinator.pending_targets)
         coordinator.queue_dispatch_timer.cancel.assert_called()
 
-    def test_batch_dispatch_waits_for_all_three_camera_targets(self):
+    def test_batch_dispatch_starts_with_two_camera_targets(self):
         coordinator = self.make_coordinator()
         coordinator.planning_scene = PlanningScene()
         first = self.candidate("apple-1", [0.6, 0.0, 0.0])
@@ -519,8 +530,18 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
 
         coordinator._dispatch_pending_targets()
 
-        coordinator._start_next_target.assert_not_called()
-        self.assertFalse(coordinator.running)
+        coordinator._start_next_target.assert_called_once_with()
+
+    def test_batch_dispatch_starts_with_one_camera_target(self):
+        coordinator = self.make_coordinator()
+        coordinator.planning_scene = PlanningScene()
+        first = self.candidate("apple-2", [0.6, 0.0, 0.0])
+        coordinator.pending_targets = {first.key: first}
+        coordinator._start_next_target = Mock()
+
+        coordinator._dispatch_pending_targets()
+
+        coordinator._start_next_target.assert_called_once_with()
 
     def test_place_reservation_request_keeps_active_apple_id(self):
         coordinator = self.make_coordinator()
@@ -563,6 +584,30 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
         request = coordinator.place_client.call_async.call_args.args[0]
         self.assertEqual(2, request.command)
         future.add_done_callback.assert_called_once()
+
+    def test_missing_place_service_waits_without_safety_stop(self):
+        coordinator = self.make_coordinator()
+        coordinator.place_client.service_is_ready.return_value = False
+
+        sent = coordinator._send_place_command(Mock(), Mock())
+
+        self.assertFalse(sent)
+        self.assertFalse(coordinator.safety_stopped)
+        self.assertIsNone(coordinator.safety_stop_reason)
+        coordinator.place_retry_timer.reset.assert_called_once_with()
+        coordinator._publish_status.assert_called_once()
+
+    def test_late_place_service_resumes_current_place(self):
+        coordinator = self.make_coordinator()
+        coordinator.running = True
+        coordinator.index = 5
+        coordinator.place_client.service_is_ready.return_value = True
+        coordinator.send_next = Mock()
+
+        coordinator._retry_place_coordination()
+
+        coordinator.place_retry_timer.cancel.assert_called_once_with()
+        coordinator.send_next.assert_called_once_with()
 
     def test_first_precontact_failure_moves_target_to_retry_queue(self):
         coordinator = self.make_coordinator()
