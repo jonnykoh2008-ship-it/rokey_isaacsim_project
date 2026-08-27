@@ -476,9 +476,9 @@ Response 필드:
 
 | 등급 | 푸셔 | `trigger_checkpoint_id` |
 |---|---|---|
-| `HIGH` | `PUSHER_1` | `CONVEYOR_4_PUSHER_1_TRIGGER` |
-| `MEDIUM` | `PUSHER_2` | `CONVEYOR_4_PUSHER_2_TRIGGER` |
-| `LOW` | `PUSHER_3` | `CONVEYOR_4_PUSHER_3_TRIGGER` |
+| `HIGH` | `PUSHER_1` | `CONVEYOR_PUSHER_1_TRIGGER` |
+| `MEDIUM` | `PUSHER_2` | `CONVEYOR_PUSHER_2_TRIGGER` |
+| `LOW` | `PUSHER_3` | `CONVEYOR_PUSHER_3_TRIGGER` |
 
 GPU PC 1은 `/conveyor/checkpoint_events`에도 위와 동일한 checkpoint 이름을 사용한다.
 요청의 세 식별자가 비어 있거나 grade, pusher, trigger 매핑이 유효하지 않으면

@@ -17,6 +17,7 @@ from appleproj_interfaces.msg import (
     SimulationState,
 )
 from appleproj_interfaces.srv import GetPlanningScene, PlaceCommand
+from conveyor_place_coordinator import PlaceCoordinatorNode
 from geometry_msgs.msg import PoseStamped
 from harvest_route_planner import (
     RoutePlanningError,
@@ -24,7 +25,7 @@ from harvest_route_planner import (
     validate_scene_version,
 )
 from rclpy.action import ActionClient
-from rclpy.executors import ExternalShutdownException
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -63,6 +64,7 @@ DEFAULT_ROBOT_ID = "robot_01"
 DEFAULT_MOTION_STATUS_TOPIC = "/harvest/motion_status"
 PLACE_STATUS_TOPIC = "/conveyor/place_coordinator_status"
 PLACE_COMMAND_SERVICE = "/conveyor/place_command"
+PLACE_COORDINATOR_MODES = ("auto", "host", "client")
 APPLE_IDS_BY_ROBOT = {
     "robot_01": ("apple_001", "apple_002", "apple_003"),
     "robot_02": ("apple_004", "apple_005", "apple_006"),
@@ -71,6 +73,21 @@ PLACE_IDS_BY_ROBOT = {
     "robot_01": "CONVEYOR_PLACE_01_LANDING",
     "robot_02": "CONVEYOR_PLACE_02_LANDING",
 }
+
+
+def should_host_place_coordinator(robot_id, mode):
+    """공유 Place service를 어느 coordinator 프로세스가 소유할지 결정한다."""
+    robot_id = str(robot_id).strip().strip("/")
+    mode = str(mode).strip().lower()
+    if mode not in PLACE_COORDINATOR_MODES:
+        raise ValueError(
+            "place coordinator mode는 auto, host, client 중 하나여야 합니다."
+        )
+    if mode == "host":
+        return True
+    if mode == "client":
+        return False
+    return robot_id == "robot_01"
 
 
 def validate_runtime_identity(robot_id, motion_status_topic):
@@ -171,6 +188,7 @@ class HarvestCoordinator(Node):
         self.place_command_pending = False
         self.place_reservation_submitted = False
         self.place_ready = False
+        self.place_service_wait_reported = False
         self.safety_stopped = False
         self.safety_stop_reason = None
         self.target_max_age_sec = self._optional_threshold(TARGET_MAX_AGE_SEC)
@@ -250,6 +268,10 @@ class HarvestCoordinator(Node):
             self._dispatch_pending_targets,
         )
         self.queue_dispatch_timer.cancel()
+        self.place_retry_timer = self.create_timer(
+            0.5, self._retry_place_coordination
+        )
+        self.place_retry_timer.cancel()
         self.get_logger().info(
             f"robot_id={self.robot_id}, motion_status_topic={self.motion_status_topic}"
         )
@@ -432,6 +454,8 @@ class HarvestCoordinator(Node):
         self.place_reservation_submitted = False
         self.place_command_pending = False
         self.place_ready = False
+        self.place_service_wait_reported = False
+        self.place_retry_timer.cancel()
         self.samples.clear()
         self._sample_target_key = None
 
@@ -947,14 +971,44 @@ class HarvestCoordinator(Node):
         if self.place_command_pending:
             return False
         if not self.place_client.service_is_ready():
-            self._place_integration_failure(
-                "Place Coordinator service를 찾을 수 없습니다."
-            )
+            if not self.place_service_wait_reported:
+                reason = (
+                    "Place Coordinator service가 아직 준비되지 않았습니다. "
+                    "수확 상태를 유지하고 service discovery를 재시도합니다."
+                )
+                self.get_logger().warning(reason)
+                self._publish_status(
+                    "PLACE_COORDINATOR_WAIT", True, 0.0, "", reason
+                )
+                self.place_service_wait_reported = True
+            self.place_retry_timer.reset()
             return False
+        self.place_retry_timer.cancel()
+        if self.place_service_wait_reported:
+            self.get_logger().info(
+                "Place Coordinator service 연결이 확인되어 PLACE를 재개합니다."
+            )
+            self.place_service_wait_reported = False
         self.place_command_pending = True
         future = self.place_client.call_async(request)
         future.add_done_callback(callback)
         return True
+
+    def _retry_place_coordination(self):
+        """PLACE 대기 중 service가 늦게 시작되면 현재 수확을 그대로 재개한다."""
+        waiting_for_place = (
+            self.running
+            and self.index < len(SEQUENCE)
+            and SEQUENCE[self.index] == RobotMotion.Goal.PLACE
+            and not self.place_command_pending
+            and not self.place_ready
+        )
+        if not waiting_for_place:
+            self.place_retry_timer.cancel()
+            return
+        if self.place_client.service_is_ready():
+            self.place_retry_timer.cancel()
+            self.send_next()
 
     def _place_response(self, future):
         self.place_command_pending = False
@@ -1288,6 +1342,8 @@ class HarvestCoordinator(Node):
             request = self._place_request(PlaceCommand.Request.RELEASED)
             self._send_place_command(request, self._on_released_response)
             self.place_ready = False
+            self.place_service_wait_reported = False
+            self.place_retry_timer.cancel()
         self.index += 1
         self.send_next()
 
@@ -1301,6 +1357,15 @@ def main():
     parser.add_argument(
         "--motion-status-topic", default=DEFAULT_MOTION_STATUS_TOPIC
     )
+    parser.add_argument(
+        "--place-coordinator-mode",
+        choices=PLACE_COORDINATOR_MODES,
+        default="auto",
+        help=(
+            "auto는 robot_01 coordinator가 공유 /conveyor/place_command를 "
+            "호스팅하고 robot_02는 client로 사용"
+        ),
+    )
     args, ros_args = parser.parse_known_args()
     rclpy.init(args=ros_args)
     node = HarvestCoordinator(
@@ -1310,11 +1375,29 @@ def main():
         robot_id=args.robot_id,
         motion_status_topic=args.motion_status_topic,
     )
+    place_node = None
+    if should_host_place_coordinator(args.robot_id, args.place_coordinator_mode):
+        if node.place_client.wait_for_service(timeout_sec=0.5):
+            node.get_logger().info(
+                "기존 외부 Place Coordinator service를 사용합니다."
+            )
+        else:
+            place_node = PlaceCoordinatorNode()
+            node.get_logger().info(
+                "공유 Place Coordinator service를 이 프로세스에서 호스팅합니다."
+            )
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+    if place_node is not None:
+        executor.add_node(place_node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        executor.shutdown()
+        if place_node is not None:
+            place_node.destroy_node()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

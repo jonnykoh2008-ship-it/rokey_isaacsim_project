@@ -226,6 +226,9 @@ TREE_ROOT_PATH = ROBOT_PROFILE.tree_root_path
 SCENE_01_ROOT_PATH = f"{TREE_ROOT_PATH}/scene_01"
 PLANNING_OBSTACLE_ROOT_PATH = "/World/RuntimeHarvestPlanningObstacles"
 RUNTIME_TREE_COLLIDER_ROOT_PATH = "/World/RuntimeHarvestTreeColliders"
+# 현재 unified tree asset의 component 160은 화면의 가지와 일치하지 않는
+# 분리 geometry다. PhysX capsule과 planning branch proxy 양쪽에서 제외한다.
+EXCLUDED_UNIFIED_TREE_COMPONENT_INDICES = frozenset({160})
 COLLISION_DEBUG_ROOT_PATH = "/World/RuntimeHarvestCollisionDebug"
 COLLISION_SPHERE_VISUALIZATION_ROOT_PATH = (
     "/World/RuntimeHarvestCollisionSpheres"
@@ -256,16 +259,14 @@ INITIAL_ARM_JOINTS_RAD = np.deg2rad(INITIAL_ARM_JOINTS_DEG)
 BREAK_FORCE_N = 15.0
 BREAK_TORQUE_NM = 1.5
 
-# palm collision mesh 앞면(+Y 50.8 mm)과 명목 사과 반지름(40 mm)을 합친 포위
-# 파지 중심이다. 접촉 여유는 현재 0 mm이므로 실효 offset은 90.8 mm이며,
-# docs/features/harvesting.md의 명목 80 mm 사과 중심 목표(+Y 90.8 mm)와
-# 일치한다. docs/architecture/tf_frames.md는 접촉 여유 2.2 mm를 포함한
-# 93 mm를 명시하므로 두 문서 값이 서로 다르다. 여유를 되살리려면
-# PALM_CONTACT_CLEARANCE_M만 조정한다. 기존 125 mm는 사과와 palm 사이에
-# 약 34 mm 틈을 남겨 손가락 끝만 접촉하므로 사용하지 않는다.
+# palm collision mesh 앞면(+Y 50.8 mm), 명목 사과 반지름(40 mm), 요청된
+# 비접촉 표면 여유 4 mm를 합친 파지 중심이다. ENTER_SLOW/GRASP/TWIST에서
+# TCP를 사과 중심에 두더라도 palm 앞면은 사과 표면에서 4 mm 떨어진다.
+# 손가락은 이 비접촉 자세에 도달한 뒤 저토크 GRASP에서만 닫힌다.
 PALM_COLLISION_FACE_Y_M = 0.0508
 NOMINAL_APPLE_RADIUS_M = 0.0400
-PALM_CONTACT_CLEARANCE_M = 0.0
+APPLE_APPROACH_MIN_SURFACE_GAP_M = 0.004
+PALM_CONTACT_CLEARANCE_M = APPLE_APPROACH_MIN_SURFACE_GAP_M
 PALM_TO_TCP = np.array(
     [
         0.0,
@@ -281,6 +282,10 @@ PREGRASP_DISTANCE_M = 0.15
 ENTER_SLOW_DISTANCE_M = 0.03
 ENTER_FAST_STEPS = 360
 ENTER_SLOW_STEPS = 360
+# 접촉 report를 받은 위치에서 강한 팔 position drive가 stem에 계속 하중을
+# 전달하지 않도록, 손가락을 닫기 전에 접근 반대 방향으로 이 거리만큼 뺀다.
+# 영상의 GRASP_SETTLE 조기 파손을 기준으로 한 현재 USD용 임시값이다.
+PALM_CONTACT_UNLOAD_DISTANCE_M = 0.002
 ENTRY_PRESHAPE_SAMPLE_STEPS = 30
 ENTRY_PRESHAPE_MAX_SETTLE_STEPS = 120
 # 명목 지름 80 mm 사과의 중심에서 각 측면 손가락 안쪽 면까지 50 mm를
@@ -624,6 +629,65 @@ def rrt_max_iterations_for_segment(segment_name):
     return RRT_DEFAULT_MAX_ITERATIONS
 
 
+def select_short_periodic_goal(current, goals, lower_limits, upper_limits):
+    """여러 IK 해에서 현재 자세와 가장 짧게 연결되는 주기 관절 표현을 고른다."""
+    current = np.asarray(current, dtype=np.float64)
+    lower_limits = np.asarray(lower_limits, dtype=np.float64)
+    upper_limits = np.asarray(upper_limits, dtype=np.float64)
+    periodic = (upper_limits - lower_limits) >= (2.0 * np.pi - 1.0e-4)
+    ranked = []
+    for goal_index, raw_goal in enumerate(goals):
+        goal = np.asarray(raw_goal, dtype=np.float64)
+        if goal.shape != current.shape or not np.all(np.isfinite(goal)):
+            continue
+        normalized = goal.copy()
+        for joint_index in np.flatnonzero(periodic):
+            minimum_turn = int(
+                np.ceil(
+                    (lower_limits[joint_index] - goal[joint_index] - 1.0e-9)
+                    / (2.0 * np.pi)
+                )
+            )
+            maximum_turn = int(
+                np.floor(
+                    (upper_limits[joint_index] - goal[joint_index] + 1.0e-9)
+                    / (2.0 * np.pi)
+                )
+            )
+            equivalents = [
+                goal[joint_index] + 2.0 * np.pi * turn
+                for turn in range(minimum_turn, maximum_turn + 1)
+            ]
+            if equivalents:
+                normalized[joint_index] = min(
+                    equivalents,
+                    key=lambda value: abs(value - current[joint_index]),
+                )
+        if np.any(normalized < lower_limits - 1.0e-6) or np.any(
+            normalized > upper_limits + 1.0e-6
+        ):
+            continue
+        delta = normalized - current
+        periodic_travel = (
+            float(np.max(np.abs(delta[periodic])))
+            if np.any(periodic)
+            else 0.0
+        )
+        ranked.append(
+            (
+                periodic_travel > np.pi + 1.0e-3,
+                periodic_travel,
+                float(np.linalg.norm(delta)),
+                goal_index,
+                normalized,
+            )
+        )
+    if not ranked:
+        raise ValueError("관절 limit 안의 유효한 IK 목표가 없습니다.")
+    selected = min(ranked, key=lambda item: item[:4])
+    return selected[4], selected[3], periodic, selected[1]
+
+
 def gf_quat_to_numpy(quaternion):
     """Gf.Quat 계열을 Isaac 형식 (w, x, y, z) 배열로 바꾼다."""
     imaginary = quaternion.GetImaginary()
@@ -840,6 +904,7 @@ def open_project_stage():
 def configure_breakable_joint(stage):
     """두 나무의 모든 사과 FixedJoint에 동일한 파손 한계를 적용한다."""
     break_force, break_torque = configured_break_limits()
+    disabled_branch_colliders = disable_branchbody_collisions(stage)
     for assembly in ALL_APPLE_ASSEMBLIES:
         joint = UsdPhysics.Joint(require_prim(stage, assembly["joint_path"]))
         body0 = [str(path) for path in joint.GetBody0Rel().GetTargets()]
@@ -857,8 +922,8 @@ def configure_breakable_joint(stage):
         joint.GetJointEnabledAttr().Set(True)
         joint.GetCollisionEnabledAttr().Set(False)
 
-        # USD 단독 Play에서 검증된 원본 구성을 유지한다. 각 branchbody는
-        # kinematic rigid body이며 authored anchor가 사과를 가지에 고정한다.
+        # branchbody는 사과를 매다는 kinematic anchor로만 사용한다. 렌더링과
+        # FixedJoint 관계는 유지하지만 로봇·planning collision에는 포함하지 않는다.
         branch_prim = require_prim(stage, assembly["branch_body_path"])
         if not branch_prim.HasAPI(UsdPhysics.RigidBodyAPI):
             raise RuntimeError(
@@ -877,6 +942,24 @@ def configure_breakable_joint(stage):
         f"{args.break_test}: "
         f"force {break_force:.3g} N, torque {break_torque:.3g} N·m"
     )
+    print(
+        "   Branchbody collision disabled: "
+        f"{disabled_branch_colliders} authored collider prims"
+    )
+
+
+def disable_branchbody_collisions(stage):
+    """모든 수확용 branchbody 하위 PhysX collider를 비활성화한다."""
+    disabled = 0
+    for branch_body_path in BRANCH_BODY_PATHS:
+        branch_root = require_prim(stage, branch_body_path)
+        for prim in Usd.PrimRange(branch_root):
+            if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                continue
+            collision = UsdPhysics.CollisionAPI(prim)
+            collision.CreateCollisionEnabledAttr(False).Set(False)
+            disabled += 1
+    return disabled
 
 
 def configured_break_limits():
@@ -1739,6 +1822,12 @@ def configure_unified_tree_physx_colliders(stage):
         components = _mesh_connected_components_world(mesh_prim, xform_cache)
         component_count += len(components)
         for component_index, points in enumerate(components):
+            if component_index in EXCLUDED_UNIFIED_TREE_COMPONENT_INDICES:
+                print(
+                    "   Tree collider excluded unified component "
+                    f"{component_index}: no PhysX/planning geometry"
+                )
+                continue
             local_specs = _component_local_capsule_specs(points)
             if not local_specs:
                 continue
@@ -2000,6 +2089,45 @@ def compute_gripper_entry_swept_clearance(
     return closest_clearance, closest_path
 
 
+def compute_gripper_apple_surface_clearance(
+    stage, apple_center, apple_radius, vertices_only=False
+):
+    """실제 authored gripper collider와 사과 표면 사이의 최소 여유를 잰다.
+
+    swept clearance는 손가락이 남은 진입 선분을 안전하게 지나가는지
+    검사한다. 이 함수는 현재 pose의 palm과 세 손가락 전체를 검사해 palm
+    옆면처럼 swept finger 검사에서 빠지는 직접 접촉을 별도로 차단한다.
+    """
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    gripper_root = require_prim(stage, GRIPPER_ROOT_PATH)
+    apple_center = np.asarray(apple_center, dtype=float)
+    closest_clearance = float("inf")
+    closest_path = None
+    for prim in Usd.PrimRange(gripper_root, Usd.TraverseInstanceProxies()):
+        path = str(prim.GetPath())
+        if not prim.IsA(UsdGeom.Mesh) or "/collisions/" not in path:
+            continue
+        if prim.HasAPI(UsdPhysics.CollisionAPI):
+            enabled = UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get()
+            if enabled is False:
+                continue
+        points = _mesh_sample_points_world(
+            prim, xform_cache, vertices_only=vertices_only
+        )
+        if points.size == 0:
+            continue
+        clearance = float(
+            np.min(np.linalg.norm(points - apple_center, axis=1))
+            - float(apple_radius)
+        )
+        if clearance < closest_clearance:
+            closest_clearance = clearance
+            closest_path = path
+    if closest_path is None:
+        raise RuntimeError("전체 gripper collision mesh를 측정하지 못했습니다.")
+    return closest_clearance, closest_path
+
+
 def compute_gripper_entry_lever_arm(stage, current_tcp):
     """TCP에서 가장 먼 finger collider 점까지의 거리를 반환한다.
 
@@ -2077,6 +2205,18 @@ def gripper_envelope_apple_clearance(
         )
         - float(gripper_radius)
         - float(apple_radius)
+    )
+
+
+def palm_contact_unload_target(contact_position, approach_direction):
+    """접촉 위치에서 stem 하중을 빼기 위한 짧은 후퇴 목표를 반환한다."""
+    direction = np.asarray(approach_direction, dtype=float)
+    norm = float(np.linalg.norm(direction))
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("approach_direction은 0이 아닌 유한 벡터여야 합니다.")
+    return (
+        np.asarray(contact_position, dtype=float)
+        - direction / norm * PALM_CONTACT_UNLOAD_DISTANCE_M
     )
 
 
@@ -2170,6 +2310,84 @@ def compute_conveyor_target_geometry(minimum, maximum, robot_position, apple_siz
         near_end[travel_axis] - center[travel_axis]
     )
     return start, outside, conveyor_direction, travel_axis, side_axis, side_inset
+
+
+def conveyor_surface_velocity_vector(conveyor_direction, speed_mps):
+    """컨베이어 진행축과 설정 속도로 world 기준 surface velocity를 만든다."""
+    direction = np.asarray(conveyor_direction, dtype=float)
+    speed = float(speed_mps)
+    if direction.shape != (3,) or not np.all(np.isfinite(direction)):
+        raise ValueError("conveyor direction은 유효한 world XYZ 벡터여야 합니다.")
+    if not np.isfinite(speed) or speed < 0.0:
+        raise ValueError("conveyor speed는 0 이상의 유한한 값이어야 합니다.")
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-9:
+        if speed == 0.0:
+            return np.zeros(3, dtype=float)
+        raise ValueError("0이 아닌 conveyor speed에는 진행 방향이 필요합니다.")
+    return direction / norm * speed
+
+
+def conveyor_transport_velocity(current_velocity, conveyor_direction, speed_mps):
+    """상판 위 동적 물체의 진행축 속도를 벨트 속도에 맞춘다.
+
+    Surface Velocity가 마찰·sleep 상태 때문에 동적 물체를 깨우지 못하는 경우에
+    사용하는 보정값이다. 낙하/횡방향 속도는 보존하고 진행축 성분만 바꾼다.
+    """
+    current = np.asarray(current_velocity, dtype=float)
+    if current.shape != (3,) or not np.all(np.isfinite(current)):
+        raise ValueError("current velocity는 유효한 world XYZ 벡터여야 합니다.")
+    target = conveyor_surface_velocity_vector(conveyor_direction, speed_mps)
+    speed = float(np.linalg.norm(target))
+    if speed <= 1e-9:
+        return current.copy()
+    axis = target / speed
+    return current + (speed - float(np.dot(current, axis))) * axis
+
+
+def apple_on_conveyor_surface(center, minimum, maximum, apple_radius):
+    """사과 중심이 runtime 상판의 실제 접촉 높이·평면 안인지 판정한다."""
+    center = np.asarray(center, dtype=float)
+    minimum = np.asarray(minimum, dtype=float)
+    maximum = np.asarray(maximum, dtype=float)
+    radius = float(apple_radius)
+    if any(value.shape != (3,) for value in (center, minimum, maximum)):
+        raise ValueError("conveyor surface 판정 입력은 world XYZ 벡터여야 합니다.")
+    if not all(np.all(np.isfinite(value)) for value in (center, minimum, maximum)):
+        return False
+    return bool(
+        minimum[0] <= center[0] <= maximum[0]
+        and minimum[1] <= center[1] <= maximum[1]
+        and maximum[2] - 0.01
+        <= center[2]
+        <= maximum[2] + radius + 0.03
+    )
+
+
+def configure_conveyor_surface_velocity(stage, conveyor_direction, speed_mps):
+    """runtime 상판 collider에 실제 PhysX surface velocity를 적용한다."""
+    collider = require_prim(stage, RUNTIME_CONVEYOR_COLLIDER_PATH)
+    velocity = conveyor_surface_velocity_vector(
+        conveyor_direction, speed_mps
+    )
+    rigid_body = UsdPhysics.RigidBodyAPI.Apply(collider)
+    rigid_body.CreateRigidBodyEnabledAttr().Set(True)
+    rigid_body.CreateKinematicEnabledAttr().Set(True)
+    surface_velocity = PhysxSchema.PhysxSurfaceVelocityAPI.Apply(collider)
+    surface_velocity.CreateSurfaceVelocityEnabledAttr().Set(True)
+    # conveyor_direction은 이미 world 축으로 계산되므로 local 변환하지 않는다.
+    surface_velocity.CreateSurfaceVelocityLocalSpaceAttr().Set(False)
+    surface_velocity.CreateSurfaceVelocityAttr().Set(
+        Gf.Vec3f(*(float(value) for value in velocity))
+    )
+    surface_velocity.CreateSurfaceAngularVelocityAttr().Set(
+        Gf.Vec3f(0.0, 0.0, 0.0)
+    )
+    print(
+        f"   Conveyor     PhysX surface velocity {vec(velocity)} m/s "
+        f"on {RUNTIME_CONVEYOR_COLLIDER_PATH}"
+    )
+    return velocity
 
 
 def compute_direct_neutral_transfer(tree_clear_position, conveyor_outside_high):
@@ -2935,10 +3153,10 @@ class AppleHarvestFSM:
         self.skip_current_state("CLEAR_UP", actual_position, actual_rotation)
         self.skip_current_state("TREE_EXIT", actual_position, actual_rotation)
 
-    def complete_current_on_contact(self, actual_position, actual_rotation):
-        """저속 진입 중 palm 접촉 위치를 GRASP 유지 pose로 확정한다."""
+    def complete_current_at_standoff(self, actual_position, actual_rotation):
+        """저속 진입 중 비접촉 여유에 도달한 pose를 GRASP 시작점으로 삼는다."""
         if self.done or self.NAMES[self.state] != "ENTER_SLOW":
-            raise RuntimeError("ENTER_SLOW가 아닌 상태에서 접촉 완료를 요청했습니다.")
+            raise RuntimeError("ENTER_SLOW가 아닌 상태에서 standoff 완료를 요청했습니다.")
         self.start_position = np.asarray(actual_position, dtype=float)
         self.start_quat = rot_matrix_to_quat(actual_rotation)
         self.state += 1
@@ -3163,11 +3381,14 @@ def _visual_cuboid(stage, path, position, size):
 
 
 def _collect_tree_planning_geometry(stage, xform_cache):
-    """기존 분리 asset과 지원 단일 구조 mesh를 같은 형식으로 수집한다."""
+    """고정 tree 구조만 수집하고 수확용 branchbody는 obstacle에서 제외한다."""
     branch_points = []
     trunk_meshes = []
     unified_meshes = []
-    for root_path in (TREE_ROOT_PATH, *BRANCH_BODY_PATHS):
+    # branchbody는 FixedJoint의 시각적·kinematic anchor일 뿐이며 모든 PhysX
+    # collision도 비활성화한다. planning proxy까지 남기면 수확 후 보이지 않는
+    # branch_xxxx가 TREE_EXIT/NEUTRAL_TRANSFER를 계속 막으므로 수집하지 않는다.
+    for root_path in (TREE_ROOT_PATH,):
         root = require_prim(stage, root_path)
         for prim in Usd.PrimRange(root):
             path_text = str(prim.GetPath()).lower()
@@ -3176,7 +3397,10 @@ def _collect_tree_planning_geometry(stage, xform_cache):
             if _is_scene_01_path(prim.GetPath()):
                 continue
             if _is_unified_tree_structure_path(prim.GetPath()):
-                for points in _mesh_connected_components_world(prim, xform_cache):
+                components = _mesh_connected_components_world(prim, xform_cache)
+                for component_index, points in enumerate(components):
+                    if component_index in EXCLUDED_UNIFIED_TREE_COMPONENT_INDICES:
+                        continue
                     thick_points = _component_thick_local_points(points)
                     if thick_points.size:
                         branch_points.append(thick_points)
@@ -4201,6 +4425,8 @@ class CollisionAwareMotion:
                     "target_apple",
                 )
             )
+        if not candidates:
+            return float("inf"), "no_planning_proxy"
         return min(candidates, key=lambda item: item[0])
 
     def minimum_tree_clearance(self, point):
@@ -4226,6 +4452,8 @@ class CollisionAwareMotion:
                     f"branch_{branch_index:03d}",
                 )
             )
+        if not candidates:
+            return float("inf"), "no_tree_proxy"
         return min(candidates, key=lambda item: item[0])
 
     @staticmethod
@@ -4540,27 +4768,110 @@ class CollisionAwareMotion:
                 self.link6_to_palm_translation,
                 self.link6_to_palm_rotation,
             )
-            ik_goal, solved = self.validation_kinematics.compute_inverse_kinematics(
-                frame_name=EE_FRAME_NAME,
-                target_position=link_position,
-                target_orientation=rot_matrix_to_quat(link_rotation),
-                warm_start=active_positions,
-                position_tolerance=0.005,
-                orientation_tolerance=np.deg2rad(5.0),
-            )
-            ik_goal = np.asarray(ik_goal, dtype=float)
-            if (
-                not solved
-                or ik_goal.shape != active_positions.shape
-                or not np.all(np.isfinite(ik_goal))
-            ):
+            periodic_joints = (
+                upper_limits - lower_limits
+            ) >= (2.0 * np.pi - 1.0e-4)
+            limit_midpoint = 0.5 * (lower_limits + upper_limits)
+            central_equivalent = active_positions.copy()
+            for joint_index in np.flatnonzero(periodic_joints):
+                minimum_turn = int(
+                    np.ceil(
+                        (
+                            lower_limits[joint_index]
+                            - active_positions[joint_index]
+                            - 1.0e-9
+                        )
+                        / (2.0 * np.pi)
+                    )
+                )
+                maximum_turn = int(
+                    np.floor(
+                        (
+                            upper_limits[joint_index]
+                            - active_positions[joint_index]
+                            + 1.0e-9
+                        )
+                        / (2.0 * np.pi)
+                    )
+                )
+                equivalents = [
+                    active_positions[joint_index] + 2.0 * np.pi * turn
+                    for turn in range(minimum_turn, maximum_turn + 1)
+                ]
+                if equivalents:
+                    central_equivalent[joint_index] = min(
+                        equivalents,
+                        key=lambda value: abs(value - limit_midpoint[joint_index]),
+                    )
+            ik_seeds = [active_positions, central_equivalent, limit_midpoint]
+            unique_seeds = []
+            for seed in ik_seeds:
+                if not any(np.allclose(seed, existing) for existing in unique_seeds):
+                    unique_seeds.append(np.asarray(seed, dtype=float))
+            ik_goals = []
+            for seed_index, seed in enumerate(unique_seeds):
+                ik_goal, solved = (
+                    self.validation_kinematics.compute_inverse_kinematics(
+                        frame_name=EE_FRAME_NAME,
+                        target_position=link_position,
+                        target_orientation=rot_matrix_to_quat(link_rotation),
+                        warm_start=seed,
+                        position_tolerance=0.005,
+                        orientation_tolerance=np.deg2rad(5.0),
+                    )
+                )
+                ik_goal = np.asarray(ik_goal, dtype=float)
+                if (
+                    solved
+                    and ik_goal.shape == active_positions.shape
+                    and np.all(np.isfinite(ik_goal))
+                ):
+                    ik_goals.append(ik_goal)
+                    print(
+                        f"   [RRT IK CANDIDATE] {segment_name}: "
+                        f"seed={seed_index}, goal={vec(ik_goal)}"
+                    )
+                    (
+                        _candidate_goal,
+                        _candidate_index,
+                        _candidate_periodic,
+                        candidate_periodic_travel,
+                    ) = select_short_periodic_goal(
+                        active_positions,
+                        ik_goals,
+                        lower_limits,
+                        upper_limits,
+                    )
+                    if candidate_periodic_travel <= np.pi + 1.0e-3:
+                        # 현재 자세 seed가 짧은 해를 주는 정상 경우에는 추가 IK를
+                        # 실행하지 않아 연속 수확 전환 지연을 늘리지 않는다.
+                        break
+            if not ik_goals:
                 raise ApproachUnreachableError(
                     f"{segment_name} 가까운 c-space 목표 IK를 구하지 못했습니다."
                 )
-            target_joint_positions = ik_goal
+            (
+                target_joint_positions,
+                selected_ik_index,
+                _periodic_joints,
+                periodic_travel,
+            ) = select_short_periodic_goal(
+                active_positions,
+                ik_goals,
+                lower_limits,
+                upper_limits,
+            )
+            if periodic_travel > np.pi + 1.0e-3:
+                raise ApproachUnreachableError(
+                    f"{segment_name} 다중 seed IK에서도 현재 자세와 π 이하로 "
+                    f"연결되는 주기 관절 해가 없습니다: "
+                    f"minimum_periodic_travel={periodic_travel:.3f} rad"
+                )
             print(
                 f"   [RRT IK GOAL] {segment_name}: task-space 목표를 "
-                f"warm-start c-space {vec(ik_goal)}로 변환"
+                f"candidate={selected_ik_index}, periodic_travel="
+                f"{periodic_travel:.3f} rad, c-space "
+                f"{vec(target_joint_positions)}로 변환"
             )
 
         explicit_cspace_goal = target_joint_positions is not None

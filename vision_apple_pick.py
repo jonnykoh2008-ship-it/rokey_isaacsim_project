@@ -72,7 +72,7 @@ from appleproj_interfaces.srv import GetPlanningScene, PlaceCommand, RetryInspec
 from geometry_msgs.msg import PoseStamped
 from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.core.prims import SingleArticulation
-from pxr import Usd, UsdGeom
+from pxr import Gf, Usd, UsdGeom
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -1049,8 +1049,11 @@ class ConveyorLifecycleRuntime:
         maximum = harvest.np.asarray(box.GetMax(), dtype=float)
         travel_axis = int(harvest.np.argmax((maximum - minimum)[:2]))
         self.bounds = ConveyorBounds(minimum, maximum, travel_axis)
-        belt_speed = float(os.environ.get("APPLEPROJ_CONVEYOR_SPEED_MPS", "0.30"))
-        self.landing = LandingTracker(self.bounds, belt_speed)
+        self.belt_speed = float(
+            os.environ.get("APPLEPROJ_CONVEYOR_SPEED_MPS", "0.30")
+        )
+        self._configure_surface_velocity()
+        self.landing = LandingTracker(self.bounds, self.belt_speed)
         self.contact = AppleConveyorContactMonitor(
             lambda: float(self.world.current_time)
         )
@@ -1072,6 +1075,16 @@ class ConveyorLifecycleRuntime:
             )
         self.generation = None
         self.active_landing_key = None
+        self.transport_apple_paths = set()
+        self._transport_log_paths = set()
+
+    def _configure_surface_velocity(self):
+        conveyor_direction = harvest.np.asarray(
+            self.engine.conveyor[3], dtype=float
+        )
+        harvest.configure_conveyor_surface_velocity(
+            self.stage, conveyor_direction, self.belt_speed
+        )
 
     @staticmethod
     def _apple_body_path(apple_prim_path):
@@ -1086,6 +1099,59 @@ class ConveyorLifecycleRuntime:
             return None
         velocity = harvest.np.asarray(value, dtype=float)
         return velocity if velocity.shape == (3,) else None
+
+    def _drive_released_apples(self):
+        """release된 사과가 실제 상판에 있을 때 진행축 속도를 보장한다."""
+        direction = harvest.np.asarray(self.engine.conveyor[3], dtype=float)
+        for apple_path in tuple(self.transport_apple_paths):
+            apple_prim = self.stage.GetPrimAtPath(apple_path)
+            if not apple_prim.IsValid():
+                self.transport_apple_paths.discard(apple_path)
+                self._transport_log_paths.discard(apple_path)
+                continue
+            center = harvest.compute_live_prim_center(self.stage, apple_path)
+            inside_xy = all(
+                self.bounds.minimum[axis] <= center[axis] <= self.bounds.maximum[axis]
+                for axis in (0, 1)
+            )
+            on_surface = harvest.apple_on_conveyor_surface(
+                center,
+                self.bounds.minimum,
+                self.bounds.maximum,
+                self.engine.apple_radius,
+            )
+            if not inside_xy:
+                self.transport_apple_paths.discard(apple_path)
+                self._transport_log_paths.discard(apple_path)
+                continue
+            if not on_surface:
+                continue
+            body_path = self._apple_body_path(apple_path)
+            velocity = self._velocity(body_path)
+            if velocity is None:
+                continue
+            corrected = harvest.conveyor_transport_velocity(
+                velocity, direction, self.belt_speed
+            )
+            if harvest.np.linalg.norm(corrected - velocity) <= 0.01:
+                continue
+            body = self.stage.GetPrimAtPath(body_path)
+            stage_id = harvest.omni.usd.get_context().get_stage_id()
+            encoded_body_path = harvest.PhysicsSchemaTools.sdfPathToInt(
+                body.GetPath()
+            )
+            harvest.omni.physx.get_physx_simulation_interface().wake_up(
+                stage_id, encoded_body_path
+            )
+            harvest.UsdPhysics.RigidBodyAPI(body).GetVelocityAttr().Set(
+                Gf.Vec3f(*(float(value) for value in corrected))
+            )
+            if apple_path not in self._transport_log_paths:
+                self._transport_log_paths.add(apple_path)
+                self.node.get_logger().info(
+                    f"컨베이어 속도 보정 apple={apple_path}: "
+                    f"{velocity.tolist()} -> {corrected.tolist()} m/s"
+                )
 
     def process(self):
         status = self.node.latest_place_status()
@@ -1110,6 +1176,7 @@ class ConveyorLifecycleRuntime:
                     )
                     return
                 self.active_landing_key = key
+                self.transport_apple_paths.add(apple_path)
                 self.landing.start(
                     status.lock_owner_robot_id,
                     status.reservation_id,
@@ -1119,19 +1186,27 @@ class ConveyorLifecycleRuntime:
                 )
                 if self.inspection is not None:
                     self.inspection.bind_apple(status.apple_id, apple_path)
+        self._drive_released_apples()
         if self.landing.session is not None and not self.landing.terminal:
             apple_path = self.landing.apple_prim_path
             apple_body_path = self._apple_body_path(apple_path)
             velocity = self._velocity(apple_body_path)
             if velocity is None:
                 velocity = harvest.np.full(3, harvest.np.nan)
+            apple_center = harvest.compute_live_prim_center(
+                self.stage, apple_path
+            )
             observation = LandingObservation(
-                center=harvest.compute_live_prim_center(
-                    self.stage, apple_path
-                ),
+                center=apple_center,
                 linear_velocity=velocity,
-                belt_contact=self.contact.is_in_contact(
-                    apple_body_path, now_s
+                belt_contact=(
+                    self.contact.is_in_contact(apple_body_path, now_s)
+                    or harvest.apple_on_conveyor_surface(
+                        apple_center,
+                        self.bounds.minimum,
+                        self.bounds.maximum,
+                        self.engine.apple_radius,
+                    )
                 ),
                 gripper_attached=not self.engine.last_release_detached,
             )
@@ -1147,7 +1222,12 @@ class ConveyorLifecycleRuntime:
             self.inspection.update(centers)
 
     def reset(self):
+        # MotionEngine reset이 runtime belt collider를 다시 만들기 때문에 PhysX
+        # API도 새 Prim에 다시 적용해야 한다.
+        self._configure_surface_velocity()
         self.active_landing_key = None
+        self.transport_apple_paths.clear()
+        self._transport_log_paths.clear()
         self.landing.reset()
         self.contact.reset()
         if self.inspection is not None:
@@ -1868,7 +1948,6 @@ class MotionEngine:
         if not candidate_specs:
             raise harvest.ApproachUnreachableError("접근 방향 후보가 없습니다.")
 
-        initial = self._require_arm_joint_positions()
         current_tcp, _current_rotation = self._current_tcp_pose()
         preview_motion = harvest.CollisionAwareMotion(
             robot=self.robot,
@@ -1885,15 +1964,35 @@ class MotionEngine:
                 f"{preview_motion.collision_text(preview_motion.start_collision)}",
             )
 
-        # 실제 접촉 후에는 안전상 다른 방향으로 자동 전환할 수 없다. 따라서
-        # 로봇을 움직이기 전에 모든 후보의 마지막 15 cm ENTER 구간을 순차 IK와
-        # 전체 링크 collision sphere로 검사하고 안전 여유가 큰 순서로 정렬한다.
-        preflight_candidates = []
-        for candidate in candidate_specs:
+        # 기본 WORLD_Z를 먼저 검사하고 즉시 실행한다. 전체 14개 후보를 시작 전에
+        # 모두 생성·검사하면 연속 수확 전환 때 Isaac 메인 스레드가 오래 멈춘다.
+        # 현재 후보가 IK/충돌검사/RRT에서 실패한 경우에만 다음 방향을 생성한다.
+        for candidate_index, candidate in enumerate(candidate_specs):
             candidate_name = candidate["name"]
             direction = candidate["direction"]
             rotation = candidate["rotation"]
             pregrasp = candidate["pregrasp"]
+            current_tcp, _current_rotation = self._current_tcp_pose()
+            if candidate_index == 0:
+                candidate_motion = preview_motion
+                candidate_motion.plan_callback = self.planning_visualization_callback
+            else:
+                candidate_motion = harvest.CollisionAwareMotion(
+                    robot=self.robot,
+                    stage=self.stage,
+                    apple_center=center,
+                    path_start=current_tcp,
+                    pregrasp_tcp=pregrasp,
+                    plan_callback=self.planning_visualization_callback,
+                )
+            if candidate_motion.start_collision is not None:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    "나무가 M0617 현재 자세의 collision sphere와 이미 "
+                    f"겹쳐 있습니다: "
+                    f"{candidate_motion.collision_text(candidate_motion.start_collision)}",
+                )
+            initial = self._require_arm_joint_positions()
             planned = harvest.AppleHarvestFSM(
                 pregrasp,
                 rotation,
@@ -1919,7 +2018,7 @@ class MotionEngine:
                 )
                 continue
 
-            entry_check = preview_motion.validate_entry_segment(
+            entry_check = candidate_motion.validate_entry_segment(
                 self.lula,
                 initial,
                 pregrasp,
@@ -1934,58 +2033,15 @@ class MotionEngine:
                 )
                 collision_report = entry_check.get("collision_report")
                 if collision_report is not None:
-                    preview_motion.show_collision_debug(collision_report)
+                    candidate_motion.show_collision_debug(collision_report)
                 continue
-            candidate["entry_clearance"] = entry_check["minimum_clearance"]
-            candidate["joint_travel"] = entry_check["joint_travel"]
-            preflight_candidates.append(candidate)
             print(
                 f"   [ENTRY PREFLIGHT] {candidate_name} SAFE: "
                 f"clearance {entry_check['minimum_clearance']:.4f} m, "
                 f"joint travel {entry_check['joint_travel']:.4f} rad, "
                 f"samples {entry_check['sample_count']}"
             )
-
-        if preflight_candidates:
-            preview_motion.clear_collision_debug()
-        del preview_motion
-        preflight_candidates.sort(
-            key=lambda candidate: (
-                -candidate["entry_clearance"],
-                candidate["joint_travel"],
-            )
-        )
-        if preflight_candidates:
-            print(
-                "   [APPROACH RANK] "
-                + " -> ".join(
-                    f"{candidate['name']}"
-                    f"({candidate['entry_clearance']:.3f}m)"
-                    for candidate in preflight_candidates
-                )
-            )
-
-        for candidate in preflight_candidates:
-            candidate_name = candidate["name"]
-            direction = candidate["direction"]
-            rotation = candidate["rotation"]
-            pregrasp = candidate["pregrasp"]
-            current_tcp, _current_rotation = self._current_tcp_pose()
-            candidate_motion = harvest.CollisionAwareMotion(
-                robot=self.robot,
-                stage=self.stage,
-                apple_center=center,
-                path_start=current_tcp,
-                pregrasp_tcp=pregrasp,
-                plan_callback=self.planning_visualization_callback,
-            )
-            if candidate_motion.start_collision is not None:
-                raise MotionExecutionError(
-                    "302:COLLISION_RISK",
-                    "나무가 M0617 초기 자세의 collision sphere와 이미 "
-                    f"겹쳐 있습니다: "
-                    f"{candidate_motion.collision_text(candidate_motion.start_collision)}",
-                )
+            candidate_motion.clear_collision_debug()
             self.collision_motion = candidate_motion
             try:
                 _steps, complete = harvest.move_arm_to_pregrasp(
@@ -2115,7 +2171,7 @@ class MotionEngine:
         return lateral, rotation_rad * reference["lever_arm"], reference["clearance"]
 
     def _check_entry_arm_deviation(self, motion_state):
-        """진입 중 실제 남은 swept clearance를 다시 재서 판정한다.
+        """진입 중 swept 여유와 현재 실제 표면 여유를 함께 판정한다.
 
         측정 여유에서 이탈량을 빼는 방식은 횡방향 이탈과 손목 회전이 모두
         사과 쪽을 향한다고 보고 단순 합산하므로 지나치게 보수적이다. 현재
@@ -2136,6 +2192,13 @@ class MotionEngine:
             self.apple_radius,
             vertices_only=True,
         )
+        surface_clearance, surface_path = (
+            harvest.compute_gripper_apple_surface_clearance(
+                self.stage,
+                self.entry_reference["apple_center"],
+                self.apple_radius,
+            )
+        )
         if self.fsm.frame % 60 == 0:
             drift = self._entry_drift()
             detail = ""
@@ -2153,7 +2216,8 @@ class MotionEngine:
                 )
             print(
                 f"   [ENTRY LIVE] {motion_state} frame {self.fsm.frame}: "
-                f"실측 여유 {clearance * 1000:.1f} mm{detail}"
+                f"swept {clearance * 1000:.1f} mm, "
+                f"surface {surface_clearance * 1000:.1f} mm{detail}"
             )
         if clearance < harvest.ENTRY_LIVE_MIN_CLEARANCE_M:
             raise MotionExecutionError(
@@ -2163,9 +2227,39 @@ class MotionEngine:
                 f"{harvest.ENTRY_LIVE_MIN_CLEARANCE_M * 1000:.1f} mm 아래입니다: "
                 f"closest={closest_path}. 사과에 닿기 전에 진입을 중단합니다.",
             )
+        if surface_clearance < harvest.APPLE_APPROACH_MIN_SURFACE_GAP_M:
+            if surface_clearance <= 0.0:
+                raise MotionExecutionError(
+                    "302:COLLISION_RISK",
+                    f"{motion_state} 중 실제 gripper collider가 사과 표면을 "
+                    f"침범했습니다: clearance={surface_clearance * 1000:.2f} mm, "
+                    f"closest={surface_path}. GRASP로 전환하지 않습니다.",
+                )
+            if motion_state == "ENTER_SLOW":
+                actual, actual_rotation = self._current_tcp_pose()
+                current_state = self.fsm.NAMES[self.fsm.state]
+                if current_state == "ENTER_SLOW":
+                    self.fsm.complete_current_at_standoff(
+                        actual, actual_rotation
+                    )
+                print(
+                    "   [4MM STANDOFF] actual surface clearance "
+                    f"{surface_clearance * 1000:.2f} mm, "
+                    f"closest={surface_path}; 팔 진입을 멈추고 저토크 GRASP로 전환"
+                )
+                return True
+            raise MotionExecutionError(
+                "302:COLLISION_RISK",
+                f"{motion_state} 중 실제 gripper-사과 표면 여유가 "
+                f"{surface_clearance * 1000:.1f} mm로 요청된 "
+                f"{harvest.APPLE_APPROACH_MIN_SURFACE_GAP_M * 1000:.1f} mm "
+                f"아래입니다: closest={surface_path}. 저속 진입 전에 너무 "
+                "가까워 동작을 중단합니다.",
+            )
+        return False
 
     def _handle_entry_apple_contact(self, motion_state, arm_positions):
-        """ENTER 접촉 순서를 검사하고 palm 접촉이면 즉시 현재 pose를 유지한다."""
+        """GRASP 전 접촉은 부위와 무관하게 비정상 직접 접촉으로 거부한다."""
         if motion_state not in {"ENTER", "ENTER_SLOW"}:
             return False
         actual, actual_rotation = self._current_tcp_pose()
@@ -2178,27 +2272,23 @@ class MotionEngine:
                 f"robot={self.apple_contact.finger_path}, "
                 f"{motion_state} target_error={target_error:.4f} m",
             )
-        if not self.apple_contact.palm_contacted:
-            return False
-        if motion_state != "ENTER_SLOW":
+        if self.apple_contact.palm_contacted:
+            self.robot.apply_action(
+                harvest.ArticulationAction(
+                    joint_positions=harvest.np.asarray(
+                        arm_positions, dtype=float
+                    ).copy(),
+                    joint_indices=self.arm_indices,
+                )
+            )
             raise MotionExecutionError(
                 "302:COLLISION_RISK",
-                "저속 최종 접근 전에 palm이 사과에 조기 접촉했습니다: "
+                "GRASP 전 palm collider가 사과에 직접 접촉했습니다: "
                 f"robot={self.apple_contact.palm_path}, "
-                f"{motion_state} target_error={target_error:.4f} m",
+                f"{motion_state} target_error={target_error:.4f} m. "
+                "4 mm 비접촉 여유를 확보하지 못해 진입을 중단합니다.",
             )
-        self.robot.apply_action(
-            harvest.ArticulationAction(
-                joint_positions=harvest.np.asarray(arm_positions, dtype=float).copy(),
-                joint_indices=self.arm_indices,
-            )
-        )
-        self.fsm.complete_current_on_contact(actual, actual_rotation)
-        print(
-            f"   [PALM READY] target error {target_error:.4f} m, "
-            "palm 접촉 위치에서 팔 정지, GRASP 허용"
-        )
-        return True
+        return False
 
     def _run_fsm(self, handle, stop_state):
         if self.fsm is None or self.collision_motion is None:
@@ -2270,10 +2360,18 @@ class MotionEngine:
                         "GRASP",
                         report=True,
                     )
-                    print(
-                        f"   [GRASP SETTLE] arm hold for "
-                        f"{harvest.GRASP_SETTLE_STEPS} steps before closing"
-                    )
+                    if self.apple_contact.palm_contacted:
+                        raise MotionExecutionError(
+                            "302:COLLISION_RISK",
+                            "GRASP 시작 전에 palm 접촉이 기록되었습니다. "
+                            "4 mm 비접촉 standoff가 성립하지 않아 폐합하지 않습니다.",
+                        )
+                    else:
+                        print(
+                            "   [GRASP STANDOFF] ENTER_SLOW 100%; "
+                            f"사과 표면 {harvest.APPLE_APPROACH_MIN_SURFACE_GAP_M * 1000:.1f} mm "
+                            "비접촉 자세에서 저토크 GRASP를 시작합니다."
+                        )
 
             if motion_state == "GRASP" and grasp_settle_remaining > 0:
                 self.joint_break.set_state("GRASP_SETTLE")
@@ -2318,7 +2416,6 @@ class MotionEngine:
                     )
                 if grasp_settle_remaining == 0:
                     # ENTER에서 발생한 접촉 기록을 GRASP 손가락 수에 섞지 않는다.
-                    # palm 접촉은 GRASP admission 조건이므로 그대로 유지한다.
                     self.apple_contact.reset_finger_contacts()
                     print("   [GRASP CONTACT] finger contact count reset")
                 continue
@@ -2401,14 +2498,10 @@ class MotionEngine:
                 self.robot.apply_action(action)
                 failures = 0
                 actual, actual_rotation = self._current_tcp_pose()
-                completion_allowed = (
-                    motion_state != "ENTER_SLOW"
-                    or self.apple_contact.palm_contacted
-                )
                 advance_result = self.fsm.advance(
                     actual,
                     actual_rotation,
-                    completion_allowed=completion_allowed,
+                    completion_allowed=True,
                 )
                 if advance_result == "timeout":
                     if motion_state == "ENTER_SLOW":
@@ -2467,7 +2560,8 @@ class MotionEngine:
             self._handle_entry_apple_contact(
                 motion_state, self._require_arm_joint_positions()
             )
-            self._check_entry_arm_deviation(motion_state)
+            if self._check_entry_arm_deviation(motion_state):
+                continue
             if self.tree_contact.detected:
                 raise MotionExecutionError(
                     "302:COLLISION_RISK",
@@ -2484,11 +2578,6 @@ class MotionEngine:
                     f"사과 FixedJoint가 {self.joint_break.break_state} 중 조기 파손됐습니다.",
                 )
         self._check_execution_guard()
-        if stop_state == "GRASP" and not self.apple_contact.palm_contacted:
-            raise MotionExecutionError(
-                "302:COLLISION_RISK",
-                "palm-사과 접촉이 확인되지 않아 GRASP를 허용하지 않습니다.",
-            )
         # stop_state는 아직 실행하지 않은 다음 상태다. 바로 전에 완료한 상태를
         # 100%로 보고해야 coordinator 로그와 실제 FSM 진행이 일치한다.
         completed_index = max(0, self.fsm.state - 1)
