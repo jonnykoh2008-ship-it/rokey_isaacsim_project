@@ -138,11 +138,11 @@ CAMERA_ROOT_PATHS = {
 CAMERA_ROOT_PATH = CAMERA_ROOT_PATHS[ARGS.robot_id]
 CAMERA_PRIM_PATH = f"{CAMERA_ROOT_PATH}/RSD455/Camera_OmniVision_OV9782_Color"
 GRAPH_PATH = f"/BaseCameraRosGraph_{ARGS.robot_id}"
-FRAME_ID = "base_camera"
+FRAME_ID = f"{ARGS.robot_id}/base_camera"
 
-RGB_TOPIC = "/base_camera/color/image_raw"
-DEPTH_TOPIC = "/base_camera/depth/image_raw"
-CAMERA_INFO_TOPIC = "/base_camera/camera_info"
+RGB_TOPIC = f"/{ARGS.robot_id}/base_camera/color/image_raw"
+DEPTH_TOPIC = f"/{ARGS.robot_id}/base_camera/depth/image_raw"
+CAMERA_INFO_TOPIC = f"/{ARGS.robot_id}/base_camera/camera_info"
 
 
 def require_prim(stage, prim_path):

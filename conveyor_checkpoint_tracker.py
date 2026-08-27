@@ -38,6 +38,21 @@ class ConveyorBounds:
     def side_axis(self) -> int:
         return 1 - self.travel_axis
 
+    @property
+    def length_midpoint(self) -> float:
+        """Halfway point used to keep the two Place zones physically separate."""
+        return 0.5 * (
+            self.minimum[self.travel_axis] + self.maximum[self.travel_axis]
+        )
+
+    def place_zone_bounds(self, robot_id: str) -> Tuple[float, float]:
+        if robot_id not in PLACE_IDS:
+            raise ValueError(f"unknown robot Place zone: {robot_id}")
+        midpoint = self.length_midpoint
+        if robot_id == "robot_01":
+            return float(self.minimum[self.travel_axis]), float(midpoint)
+        return float(midpoint), float(self.maximum[self.travel_axis])
+
     def in_landing_region(self, robot_id: str, center: np.ndarray) -> bool:
         center = np.asarray(center, dtype=float)
         if center.shape != (3,) or not np.all(np.isfinite(center)):
@@ -52,9 +67,7 @@ class ConveyorBounds:
         )
         if abs(center[self.side_axis] - side_center) > side_half_width:
             return False
-        length_midpoint = 0.5 * (
-            self.minimum[self.travel_axis] + self.maximum[self.travel_axis]
-        )
+        length_midpoint = self.length_midpoint
         if robot_id == "robot_01":
             return self.minimum[self.travel_axis] <= center[self.travel_axis] < length_midpoint
         return length_midpoint <= center[self.travel_axis] <= self.maximum[self.travel_axis]

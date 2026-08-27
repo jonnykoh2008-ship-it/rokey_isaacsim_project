@@ -69,13 +69,14 @@ from appleproj_interfaces.msg import (
     SimulationState,
 )
 from appleproj_interfaces.srv import GetPlanningScene, PlaceCommand, RetryInspection
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from isaacsim.core.utils.extensions import enable_extension
 from isaacsim.core.prims import SingleArticulation
 from pxr import Gf, Usd, UsdGeom
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from tf2_ros import TransformBroadcaster
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -151,6 +152,10 @@ ERROR_CODES = {
 CAMERA_PATH = harvest.ROBOT_PROFILE.camera_prim_path
 CAMERA_GRAPH_PATH = f"/BaseCameraRosGraph_{harvest.ROBOT_PROFILE.robot_id}"
 ROBOT_TF_GRAPH_PATH = f"/RobotTfRosGraph_{harvest.ROBOT_PROFILE.robot_id}"
+ROBOT_NAMESPACE = f"/{harvest.ROBOT_PROFILE.robot_id}"
+ROBOT_CAMERA_FRAME = f"{harvest.ROBOT_PROFILE.robot_id}/base_camera"
+ROBOT_MOTION_ACTION = f"{ROBOT_NAMESPACE}/harvest/robot_motion"
+ROBOT_MOTION_STATUS = f"{ROBOT_NAMESPACE}/harvest/motion_status"
 CONVEYOR_GRAPH_PATH = "/World/ConveyorTrack/ConveyorBeltGraph"
 FIXED_CAMERA_RUNTIME_PATHS = (
     "/World/base_rsd455_01",
@@ -161,6 +166,8 @@ FIXED_CAMERA_RUNTIME_PATHS = (
 )
 PLACE_STATUS_TOPIC = "/conveyor/place_coordinator_status"
 PLACE_COMMAND_SERVICE = "/conveyor/place_command"
+PLANNING_SCENE_TOPIC = f"{ROBOT_NAMESPACE}/planning_scene"
+PLANNING_SCENE_SERVICE = f"{ROBOT_NAMESPACE}/planning_scene/get_snapshot"
 CHECKPOINT_TOPIC = "/conveyor/checkpoint_events"
 RETRY_INSPECTION_SERVICE = "/quality/retry_inspection"
 
@@ -491,18 +498,18 @@ def create_base_camera_graph(stage):
                 k.SET_VALUES: [
                     ("Render.inputs:cameraPrim", [usdrt.Sdf.Path(CAMERA_PATH)]),
                     ("Render.inputs:width", 1280), ("Render.inputs:height", 720),
-                    ("Rgb.inputs:frameId", "base_camera"),
-                    ("Rgb.inputs:topicName", "/base_camera/color/image_raw"),
+                    ("Rgb.inputs:frameId", ROBOT_CAMERA_FRAME),
+                    ("Rgb.inputs:topicName", f"{ROBOT_NAMESPACE}/base_camera/color/image_raw"),
                     ("Rgb.inputs:type", "rgb"), ("Rgb.inputs:frameSkipCount", 1),
-                    ("Depth.inputs:frameId", "base_camera"),
-                    ("Depth.inputs:topicName", "/base_camera/depth/image_raw"),
+                    ("Depth.inputs:frameId", ROBOT_CAMERA_FRAME),
+                    ("Depth.inputs:topicName", f"{ROBOT_NAMESPACE}/base_camera/depth/image_raw"),
                     ("Depth.inputs:type", "depth"), ("Depth.inputs:frameSkipCount", 1),
-                    ("Info.inputs:frameId", "base_camera"),
-                    ("Info.inputs:topicName", "/base_camera/camera_info"),
+                    ("Info.inputs:frameId", ROBOT_CAMERA_FRAME),
+                    ("Info.inputs:topicName", f"{ROBOT_NAMESPACE}/base_camera/camera_info"),
                     ("Info.inputs:frameSkipCount", 1),
                     ("Tf.inputs:topicName", "/tf_static"),
                     ("Tf.inputs:parentFrameId", "world"),
-                    ("Tf.inputs:childFrameId", "base_camera"),
+                    ("Tf.inputs:childFrameId", ROBOT_CAMERA_FRAME),
                     ("Tf.inputs:staticPublisher", True),
                     ("Tf.inputs:translation", position), ("Tf.inputs:rotation", rotation),
                 ],
@@ -511,20 +518,21 @@ def create_base_camera_graph(stage):
 
 
 def create_robot_tf_graph(stage):
-    """M0617의 /joint_states와 전체 로봇 TF를 /clock 시각으로 발행한다.
+    """M0617의 /joint_states와 static 로봇 TF를 /clock 시각으로 발행한다.
 
     docs/architecture/tf_frames.md의 구조를 따른다.
 
         world → odom → base_link → link_1 … link_6 → palm → 손가락
 
     `world → odom`은 항등, `odom → base_link`는 MVP에서 로봇이 고정이므로
-    USD에서 읽은 고정 변환이다. 로봇 링크만 Isaac이 동적으로 발행한다.
+    USD에서 읽은 고정 변환이다. 동적 link pose는 RobotMotionNode가 prefix를
+    적용해 발행한다.
 
     현재 저장된 USD에서는 `m0617_rail/root_joint`가 Articulation root로
     기능한다. TF link 범위는 `--robot-id`로 선택한 `m0617_01` 또는
     `m0617_02` 본체와 그리퍼로 제한한다.
 
-    같은 TF를 두 노드가 중복 발행하지 않도록 robot_state_publisher는 쓰지
+    같은 TF를 두 노드가 중복 발행하지 않도록 TransformTree 노드는 사용하지
     않는다.
     """
     # open_project_stage()가 선택한 m0617_rail 아래의 root_joint와 M0617
@@ -583,7 +591,6 @@ def create_robot_tf_graph(stage):
                     ("JointState", "isaacsim.ros2.bridge.ROS2PublishJointState"),
                     ("WorldOdom", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
                     ("OdomBase", "isaacsim.ros2.bridge.ROS2PublishRawTransformTree"),
-                    ("RobotTf", "isaacsim.ros2.bridge.ROS2PublishTransformTree"),
                 ],
                 k.CONNECT: [
                     ("Tick.outputs:tick", "JointState.inputs:execIn"),
@@ -592,39 +599,30 @@ def create_robot_tf_graph(stage):
                     ("Time.outputs:simulationTime", "WorldOdom.inputs:timeStamp"),
                     ("Tick.outputs:tick", "OdomBase.inputs:execIn"),
                     ("Time.outputs:simulationTime", "OdomBase.inputs:timeStamp"),
-                    ("Tick.outputs:tick", "RobotTf.inputs:execIn"),
-                    ("Time.outputs:simulationTime", "RobotTf.inputs:timeStamp"),
                 ],
                 k.SET_VALUES: [
                     ("JointState.inputs:targetPrim",
                      [usdrt.Sdf.Path(articulation_path)]),
-                    ("JointState.inputs:topicName", "/joint_states"),
+                    ("JointState.inputs:topicName", f"{ROBOT_NAMESPACE}/joint_states"),
                     # world → odom: MVP에서는 항등 변환이다.
                     ("WorldOdom.inputs:topicName", "/tf_static"),
                     ("WorldOdom.inputs:parentFrameId", "world"),
-                    ("WorldOdom.inputs:childFrameId", "odom"),
+                    ("WorldOdom.inputs:childFrameId", f"{harvest.ROBOT_PROFILE.robot_id}/odom"),
                     ("WorldOdom.inputs:staticPublisher", True),
                     ("WorldOdom.inputs:translation", [0.0, 0.0, 0.0]),
                     ("WorldOdom.inputs:rotation", [0.0, 0.0, 0.0, 1.0]),
                     # odom → base_link: USD 조립 자세에서 읽은 고정 변환이다.
                     # 카메라 static TF와 동일한 방식이라 좌표계가 일치한다.
                     ("OdomBase.inputs:topicName", "/tf_static"),
-                    ("OdomBase.inputs:parentFrameId", "odom"),
-                    ("OdomBase.inputs:childFrameId", "base_link"),
+                    ("OdomBase.inputs:parentFrameId", f"{harvest.ROBOT_PROFILE.robot_id}/odom"),
+                    ("OdomBase.inputs:childFrameId", f"{harvest.ROBOT_PROFILE.robot_id}/base_link"),
                     ("OdomBase.inputs:staticPublisher", True),
                     ("OdomBase.inputs:translation", list(base_world)),
                     ("OdomBase.inputs:rotation", base_quat),
-                    # base_link 기준으로 선택한 로봇 링크만 동적 발행한다.
-                    # articulation 전체를 주지 않고 링크를 명시해 robot별
-                    # TF 경계를 유지한다.
-                    ("RobotTf.inputs:topicName", "/tf"),
-                    ("RobotTf.inputs:parentPrim",
-                     [usdrt.Sdf.Path(harvest.ROBOT_BASE_PATH)]),
-                    ("RobotTf.inputs:targetPrims",
-                     [usdrt.Sdf.Path(path) for path in link_paths]),
                 ],
             },
         )
+    return tuple(link_paths)
 
 
 @dataclass
@@ -655,6 +653,8 @@ class RobotMotionNode(Node):
         self.scene_version = 0
         self.simulation_state = SimulationState.INITIALIZING
         self.scene_message = None
+        self.tf_broadcaster = TransformBroadcaster(self)
+        self.tf_link_paths = []
         self.last_motion_failure = None
         self.place_status = None
         latched_qos = QoSProfile(
@@ -667,11 +667,11 @@ class RobotMotionNode(Node):
             SimulationState, "/simulation/state", latched_qos
         )
         self.scene_publisher = self.create_publisher(
-            PlanningScene, "/planning_scene", latched_qos
+            PlanningScene, PLANNING_SCENE_TOPIC, latched_qos
         )
         self.planning_visualization = MotionPlanningVisualizationPublisher(self)
         self.scene_service = self.create_service(
-            GetPlanningScene, "/planning_scene/get_snapshot", self.get_scene
+            GetPlanningScene, PLANNING_SCENE_SERVICE, self.get_scene
         )
         self.retry_inspection_service = self.create_service(
             RetryInspection,
@@ -686,7 +686,7 @@ class RobotMotionNode(Node):
         )
         self.motion_status_subscription = self.create_subscription(
             MotionStatus,
-            "/harvest/motion_status",
+            ROBOT_MOTION_STATUS,
             self.on_motion_status,
             status_qos,
         )
@@ -705,11 +705,43 @@ class RobotMotionNode(Node):
         self.server = ActionServer(
             self,
             RobotMotion,
-            "/harvest/robot_motion",
+            ROBOT_MOTION_ACTION,
             execute_callback=self.execute,
             goal_callback=self.accept_goal,
             cancel_callback=lambda _goal: CancelResponse.ACCEPT,
         )
+
+    def configure_tf_paths(self, link_paths):
+        self.tf_link_paths = tuple(str(path) for path in link_paths)
+
+    def publish_prefixed_tf(self, stage):
+        """Publish Isaac link poses with an explicit robot-scoped frame ID.
+
+        Isaac's TransformTree graph derives child frame names from USD prims and
+        cannot add a frame prefix.  Publishing world-relative link transforms
+        here keeps the USD names unchanged while making the ROS TF tree unique.
+        """
+        stamp = self.get_clock().now().to_msg()
+        robot_id = harvest.ROBOT_PROFILE.robot_id
+        # base_link는 static odom→base_link graph가 소유한다. 여기서 다시
+        # world 기준으로 발행하면 child frame이 중복되므로 dynamic links만 보낸다.
+        paths = self.tf_link_paths
+        for path in paths:
+            position, quaternion_wxyz = harvest.get_prim_world_pose(stage, path)
+            prim_name = str(path).rsplit("/", 1)[-1]
+            child_frame = f"{robot_id}/{('base_link' if path == harvest.ROBOT_BASE_PATH else prim_name)}"
+            message = TransformStamped()
+            message.header.stamp = stamp
+            message.header.frame_id = "world"
+            message.child_frame_id = child_frame
+            message.transform.translation.x = float(position[0])
+            message.transform.translation.y = float(position[1])
+            message.transform.translation.z = float(position[2])
+            message.transform.rotation.x = float(quaternion_wxyz[1])
+            message.transform.rotation.y = float(quaternion_wxyz[2])
+            message.transform.rotation.z = float(quaternion_wxyz[3])
+            message.transform.rotation.w = float(quaternion_wxyz[0])
+            self.tf_broadcaster.sendTransform(message)
 
     def accept_goal(self, request):
         with self.lock:
@@ -2934,9 +2966,10 @@ def main():
     # create_robot 안의 world.reset()이 articulation과 PhysX view를 초기화한
     # 뒤라야 TF/JointState 노드가 articulation을 찾을 수 있다. 그 전에 그래프를
     # 만들면 "did not match any articulations"로 빈 TF만 발행된다.
-    create_robot_tf_graph(stage)
+    tf_link_paths = create_robot_tf_graph(stage)
     rclpy.init()
     node = RobotMotionNode()
+    node.configure_tf_paths(tf_link_paths)
     sort_runtime = (
         sort_runtime_type(node, pusher_actuator, pusher_timing)
         if sort_runtime_type is not None
@@ -2979,6 +3012,7 @@ def main():
         print_startup_lifecycle("after world.play", stage, world)
         print_startup_lifecycle("before first world.step", stage, world)
         world.step(render=not harvest.args.headless)
+        node.publish_prefixed_tf(stage)
         print_startup_lifecycle("after first world.step", stage, world)
         publish_current_scene()
         print_startup_lifecycle("after planning scene publish", stage, world)
@@ -3033,6 +3067,7 @@ def main():
                 conveyor_lifecycle.reset()
                 world.play()
                 world.step(render=not harvest.args.headless)
+                node.publish_prefixed_tf(stage)
                 reset_id += 1
                 scene_version += 1
                 publish_current_scene()
@@ -3072,6 +3107,7 @@ def main():
                 pending = node.requests.get_nowait()
             except queue.Empty:
                 world.step(render=not harvest.args.headless)
+                node.publish_prefixed_tf(stage)
                 conveyor_lifecycle.process()
                 continue
             if world.is_stopped() or not robot.handles_initialized:
@@ -3100,6 +3136,7 @@ def main():
                 conveyor_lifecycle.reset()
                 world.play()
                 world.step(render=not harvest.args.headless)
+                node.publish_prefixed_tf(stage)
                 reset_id += 1
                 scene_version += 1
                 publish_current_scene()

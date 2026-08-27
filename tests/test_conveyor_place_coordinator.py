@@ -27,7 +27,11 @@ class PlaceCoordinatorTest(unittest.TestCase):
         self.statuses.clear()
 
     def reserve(self, robot="robot_01", reservation="reservation-1", apple="apple-1"):
-        return self.controller.reserve(robot, reservation, apple, "shared_place", 11.0)
+        place_id = {
+            "robot_01": "CONVEYOR_PLACE_01_LANDING",
+            "robot_02": "CONVEYOR_PLACE_02_LANDING",
+        }[robot]
+        return self.controller.reserve(robot, reservation, apple, place_id, 11.0)
 
     def test_first_reservation_owns_lock_and_required_fields(self):
         result = self.reserve()
@@ -39,16 +43,16 @@ class PlaceCoordinatorTest(unittest.TestCase):
         self.assertEqual("robot_01", status.lock_owner_robot_id)
         self.assertEqual("reservation-1", status.reservation_id)
         self.assertEqual("apple-1", status.apple_id)
-        self.assertEqual("shared_place", status.place_position_id)
+        self.assertEqual("CONVEYOR_PLACE_01_LANDING", status.place_position_id)
         self.assertEqual((4, 7), (status.reset_id, status.scene_version))
 
     def test_waiting_reservations_are_fifo(self):
         self.reserve()
         queued = self.controller.reserve(
-            "robot_02", "reservation-2", "apple-2", "shared_place", 11.1
+            "robot_02", "reservation-2", "apple-2", "CONVEYOR_PLACE_02_LANDING", 11.1
         )
         self.controller.reserve(
-            "robot_01", "reservation-3", "apple-3", "shared_place", 11.2
+            "robot_01", "reservation-3", "apple-3", "CONVEYOR_PLACE_01_LANDING", 11.2
         )
 
         self.assertTrue(queued.queued)
@@ -66,11 +70,22 @@ class PlaceCoordinatorTest(unittest.TestCase):
     def test_duplicate_reservation_id_is_rejected(self):
         self.reserve()
         duplicate = self.controller.reserve(
-            "robot_02", "reservation-1", "apple-2", "shared_place", 11.5
+            "robot_02", "reservation-1", "apple-2", "CONVEYOR_PLACE_02_LANDING", 11.5
         )
 
         self.assertFalse(duplicate.accepted)
         self.assertEqual("DUPLICATE_RESERVATION", duplicate.error_code)
+
+    def test_robot_cannot_reserve_the_other_robot_place_zone(self):
+        result = self.controller.reserve(
+            "robot_01",
+            "reservation-zone-mismatch",
+            "apple-1",
+            "CONVEYOR_PLACE_02_LANDING",
+            11.0,
+        )
+        self.assertFalse(result.accepted)
+        self.assertEqual("PLACE_ZONE_MISMATCH", result.error_code)
         self.assertEqual(1, len(self.statuses))
 
     def test_non_owner_cannot_enter_place(self):
@@ -121,7 +136,7 @@ class PlaceCoordinatorTest(unittest.TestCase):
     def test_reset_discards_lock_queue_and_duplicate_cache(self):
         self.reserve()
         self.controller.reserve(
-            "robot_02", "reservation-2", "apple-2", "shared_place", 11.1
+            "robot_02", "reservation-2", "apple-2", "CONVEYOR_PLACE_02_LANDING", 11.1
         )
 
         self.controller.reset(5, 8, 1.0)

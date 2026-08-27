@@ -199,6 +199,14 @@ def test_enter_slow_allows_grasp_only_from_noncontact_standoff():
     assert "GRASP 전 palm collider가 사과에 직접 접촉했습니다" in source
 
 
+def test_dynamic_tf_is_robot_prefixed_and_not_published_by_raw_transform_tree():
+    source = (PROJECT_DIR / "vision_apple_pick.py").read_text(encoding="utf-8")
+
+    assert "TransformBroadcaster" in source
+    assert "child_frame = f\"{robot_id}/" in source
+    assert "ROS2PublishTransformTree" not in source
+
+
 def test_only_staging_rrt_segments_receive_actual_mesh_envelope_check():
     is_staging = load_policy_function("is_staging_rrt_segment")
     source = (PROJECT_DIR / "apple_pick.py").read_text(encoding="utf-8")

@@ -164,7 +164,7 @@ class RobotRuntimeProfile:
     def apple_assembly_root_paths(self):
         return tuple(
             f"{self.apple_parent_path}/apple_branch{suffix}"
-            for suffix in ("", "_1", "_2")
+            for suffix in ("",)
         )
 
 
@@ -1954,7 +1954,7 @@ def configure_contact_colliders(stage):
             stage.RemovePrim(collider_path)
         collider_count += 1
 
-    # 세 사과 Mesh의 authored collider를 활성화하고 contact report를 건다.
+    # 선택된 수확 영역의 authored apple collider를 활성화하고 contact report를 건다.
     apple_collider_count = 0
     for assembly in APPLE_ASSEMBLIES:
         apple_root = require_prim(stage, assembly["apple_path"])

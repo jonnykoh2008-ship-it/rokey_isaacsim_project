@@ -62,9 +62,7 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
 
     def test_apple_ids_are_frozen_by_robot_distance(self):
         candidates = [
-            self.candidate("far", [3.0, 0.0, 0.0]),
             self.candidate("near", [1.0, 0.0, 0.0]),
-            self.candidate("middle", [2.0, 0.0, 0.0]),
         ]
 
         robot_01 = assign_apple_ids_by_distance(
@@ -74,11 +72,17 @@ class HarvestCoordinatorSynchronizationTest(unittest.TestCase):
             "robot_02", np.zeros(3), candidates
         )
 
-        self.assertEqual("apple_001", robot_01[candidates[1].key])
-        self.assertEqual("apple_002", robot_01[candidates[2].key])
-        self.assertEqual("apple_003", robot_01[candidates[0].key])
-        self.assertEqual("apple_004", robot_02[candidates[1].key])
-        self.assertEqual("apple_006", robot_02[candidates[0].key])
+        self.assertEqual("apple_001", robot_01[candidates[0].key])
+        self.assertEqual("apple_004", robot_02[candidates[0].key])
+        with self.assertRaises(ValueError):
+            assign_apple_ids_by_distance(
+                "robot_01",
+                np.zeros(3),
+                [
+                    self.candidate("a", [1.0, 0.0, 0.0]),
+                    self.candidate("b", [2.0, 0.0, 0.0]),
+                ],
+            )
 
     @staticmethod
     def make_coordinator():

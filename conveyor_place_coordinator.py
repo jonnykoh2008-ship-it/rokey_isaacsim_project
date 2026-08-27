@@ -15,6 +15,10 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 
 PLACE_STATUS_TOPIC = "/conveyor/place_coordinator_status"
 PLACE_COMMAND_SERVICE = "/conveyor/place_command"
+PLACE_IDS_BY_ROBOT = {
+    "robot_01": "CONVEYOR_PLACE_01_LANDING",
+    "robot_02": "CONVEYOR_PLACE_02_LANDING",
+}
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,14 @@ class PlaceCoordinator:
             )
         ):
             return self._reject("INVALID_RESERVATION", "required reservation field is empty")
+        expected_place = PLACE_IDS_BY_ROBOT.get(reservation.robot_id)
+        if expected_place is None:
+            return self._reject("UNKNOWN_ROBOT", "robot has no configured conveyor Place zone")
+        if reservation.place_position_id != expected_place:
+            return self._reject(
+                "PLACE_ZONE_MISMATCH",
+                f"{reservation.robot_id} must use {expected_place}",
+            )
         if reservation.reservation_id in self.reservation_ids:
             return self._reject(
                 "DUPLICATE_RESERVATION",

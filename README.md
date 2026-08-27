@@ -64,6 +64,36 @@ GPU PC 1의 standalone 수확·통합 실행은 `--robot-id robot_01` 또는
 두 로봇을 동시에 운용할 ROS topic/action namespace와 target의 최종 robot ID
 필드는 아직 `TBD`다.
 
+## 통합 실행 코드
+
+각 PC에서 저장소 루트의 `system_launcher.py`를 실행한다. launcher는 원격 PC에
+접속하지 않고 현재 PC 역할에 해당하는 프로세스만 시작한다. 네 PC는 같은
+`ROS_DOMAIN_ID`와 Fast DDS 네트워크 설정을 사용해야 한다.
+
+GPU PC 1에서 Isaac Sim과 두 로봇 Coordinator를 준비한다.
+
+```bash
+python3 system_launcher.py --role gpu_pc1 --robot-id robot_01
+```
+
+개인 PC 1에서는 두 카메라 detector를 실행한다.
+
+```bash
+python3 system_launcher.py --role personal_pc1
+```
+
+개인 PC 2에서는 품질 모니터를 실행한다.
+
+```bash
+python3 system_launcher.py --role personal_pc2
+```
+
+실행 전에 명령만 확인하려면 각 명령에 `--dry-run`을 붙인다. 현재
+`vision_apple_pick.py`의 Isaac Sim runtime은 단일 `--robot-id` profile만 직접
+실행하므로 GPU PC 1 launcher도 그 제한을 따른다. Coordinator와 detector는
+`all` 모드로 두 로봇 endpoint를 준비하지만, 두 로봇을 하나의 Isaac Sim World에서
+동시에 움직이는 최종 runtime은 별도 구현 대상이다.
+
 ## PC별 개발 범위
 
 | PC | 담당 기능 | 유지·개발 대상 |

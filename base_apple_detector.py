@@ -45,6 +45,7 @@ from appleproj_interfaces.msg import (
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import (
@@ -68,8 +69,8 @@ TARGET_TOPIC = "/harvest/target"
 PERCEPTION_STATUS_TOPIC = "/harvest/perception_status"
 DEBUG_IMAGE_TOPIC = "/harvest/detection_debug"
 ROBOT_APPLE_IDS = {
-    "robot_01": ("apple_001", "apple_002", "apple_003"),
-    "robot_02": ("apple_004", "apple_005", "apple_006"),
+    "robot_01": ("apple_001",),
+    "robot_02": ("apple_004",),
 }
 TRACK_MATCH_DISTANCE_M = 0.10
 
@@ -123,6 +124,18 @@ class BaseAppleDetector(Node):
         if self.robot_id not in ROBOT_APPLE_IDS:
             raise ValueError(f"지원하지 않는 robot_id입니다: {self.robot_id}")
         self.apple_ids = ROBOT_APPLE_IDS[self.robot_id]
+        self.topic_prefix = f"/{self.robot_id}"
+
+        def robot_topic(relative_name):
+            return f"{self.topic_prefix}/{relative_name.lstrip('/')}"
+
+        self.rgb_topic = robot_topic("base_camera/color/image_raw")
+        self.depth_topic = robot_topic("base_camera/depth/image_raw")
+        self.camera_info_topic = robot_topic("base_camera/camera_info")
+        self.camera_pose_topic = robot_topic("harvest/detection_pose_camera")
+        self.target_topic = robot_topic("harvest/target")
+        self.perception_status_topic = robot_topic("harvest/perception_status")
+        self.debug_image_topic = robot_topic("harvest/detection_debug")
 
         # 현재 빨간 사과 에셋용 검출 파라미터다. ROS parameter로 노출하여
         # 코드를 수정하지 않고 환경별로 조절할 수 있다.
@@ -216,15 +229,15 @@ class BaseAppleDetector(Node):
 
         self.create_subscription(
             CameraInfo,
-            CAMERA_INFO_TOPIC,
+            self.camera_info_topic,
             self.camera_info_callback,
             qos_profile_sensor_data,
         )
         self.create_subscription(
-            Image, RGB_TOPIC, self.rgb_callback, qos_profile_sensor_data
+            Image, self.rgb_topic, self.rgb_callback, qos_profile_sensor_data
         )
         self.create_subscription(
-            Image, DEPTH_TOPIC, self.depth_callback, qos_profile_sensor_data
+            Image, self.depth_topic, self.depth_callback, qos_profile_sensor_data
         )
         self.create_subscription(
             SimulationState,
@@ -234,26 +247,26 @@ class BaseAppleDetector(Node):
         )
 
         self.camera_pose_publisher = self.create_publisher(
-            PoseStamped, CAMERA_POSE_TOPIC, 10
+            PoseStamped, self.camera_pose_topic, 10
         )
         self.target_publisher = self.create_publisher(
-            HarvestTarget, TARGET_TOPIC, TARGET_QOS
+            HarvestTarget, self.target_topic, TARGET_QOS
         )
         self.perception_status_publisher = self.create_publisher(
-            HarvestPerceptionStatus, PERCEPTION_STATUS_TOPIC, STATUS_QOS
+            HarvestPerceptionStatus, self.perception_status_topic, STATUS_QOS
         )
         self.debug_image_publisher = self.create_publisher(
-            Image, DEBUG_IMAGE_TOPIC, qos_profile_sensor_data
+            Image, self.debug_image_topic, qos_profile_sensor_data
         )
 
         self.get_logger().info(
             f"base_rsd455 RGB-D 사과 검출 노드 시작: robot_id={self.robot_id}"
         )
-        self.get_logger().info(f"RGB: {RGB_TOPIC}")
-        self.get_logger().info(f"Depth: {DEPTH_TOPIC}")
-        self.get_logger().info(f"CameraInfo: {CAMERA_INFO_TOPIC}")
+        self.get_logger().info(f"RGB: {self.rgb_topic}")
+        self.get_logger().info(f"Depth: {self.depth_topic}")
+        self.get_logger().info(f"CameraInfo: {self.camera_info_topic}")
         self.get_logger().info(
-            f"Target: {TARGET_TOPIC} (자동 ID={','.join(self.apple_ids)})"
+            f"Target: {self.target_topic} (자동 ID={','.join(self.apple_ids)})"
         )
 
     def reset_tracking(self):
@@ -525,7 +538,7 @@ class BaseAppleDetector(Node):
         pose = PoseStamped()
         pose.header = rgb_message.header
         if not pose.header.frame_id:
-            pose.header.frame_id = "base_camera"
+            pose.header.frame_id = f"{self.robot_id}/base_camera"
         pose.pose.position.x = float(point_camera[0])
         pose.pose.position.y = float(point_camera[1])
         pose.pose.position.z = float(point_camera[2])
@@ -1006,19 +1019,29 @@ def main(args=None):
     parser = argparse.ArgumentParser(description="로봇별 base D455 사과 검출")
     parser.add_argument(
         "--robot-id",
-        choices=tuple(ROBOT_APPLE_IDS),
+        choices=(*ROBOT_APPLE_IDS, "all"),
         required=True,
-        help="사과 ID 범위를 선택할 담당 로봇",
+        help="사과 ID 범위를 선택할 담당 로봇; all이면 두 카메라를 동시에 구독",
     )
     parsed_args, ros_args = parser.parse_known_args(args=args)
     rclpy.init(args=ros_args)
-    node = BaseAppleDetector(parsed_args.robot_id)
+    robot_ids = (
+        tuple(ROBOT_APPLE_IDS)
+        if parsed_args.robot_id == "all"
+        else (parsed_args.robot_id,)
+    )
+    nodes = [BaseAppleDetector(robot_id) for robot_id in robot_ids]
+    executor = MultiThreadedExecutor(num_threads=len(nodes))
+    for node in nodes:
+        executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        executor.shutdown()
+        for node in nodes:
+            node.destroy_node()
         rclpy.shutdown()
 
 

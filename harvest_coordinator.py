@@ -66,12 +66,18 @@ PLACE_STATUS_TOPIC = "/conveyor/place_coordinator_status"
 PLACE_COMMAND_SERVICE = "/conveyor/place_command"
 PLACE_COORDINATOR_MODES = ("auto", "host", "client")
 APPLE_IDS_BY_ROBOT = {
-    "robot_01": ("apple_001", "apple_002", "apple_003"),
-    "robot_02": ("apple_004", "apple_005", "apple_006"),
+    "robot_01": ("apple_001",),
+    "robot_02": ("apple_004",),
 }
 PLACE_IDS_BY_ROBOT = {
     "robot_01": "CONVEYOR_PLACE_01_LANDING",
     "robot_02": "CONVEYOR_PLACE_02_LANDING",
+}
+PLANNING_SCENE_TOPIC_BY_ROBOT = {
+    robot_id: f"/{robot_id}/planning_scene" for robot_id in APPLE_IDS_BY_ROBOT
+}
+PLANNING_SCENE_SERVICE_BY_ROBOT = {
+    robot_id: f"/{robot_id}/planning_scene/get_snapshot" for robot_id in APPLE_IDS_BY_ROBOT
 }
 
 
@@ -148,11 +154,25 @@ class HarvestCoordinator(Node):
         )
         configured_robot_id = self.declare_parameter("robot_id", robot_id).value
         configured_status_topic = self.declare_parameter(
-            "motion_status_topic", motion_status_topic
+            "motion_status_topic", motion_status_topic or ""
         ).value
+        configured_robot_id = str(configured_robot_id).strip().strip("/")
+        if not configured_status_topic:
+            configured_status_topic = f"/{configured_robot_id}/harvest/motion_status"
         self.robot_id, self.motion_status_topic = validate_runtime_identity(
             configured_robot_id, configured_status_topic
         )
+        self.robot_namespace = f"/{self.robot_id}"
+        # Isaac Sim's ROS2PublishTransformTree derives dynamic child frame IDs
+        # from USD prim names (for example, ``palm``) and has no frame-prefix
+        # input. Topic isolation is robot-scoped; the frame-prefix migration is
+        # kept in the shared TF contract for a later custom TF publisher.
+        self.tcp_frame = TCP_FRAME
+        self.target_topic = f"{self.robot_namespace}/harvest/target"
+        self.perception_status_topic = (
+            f"{self.robot_namespace}/harvest/perception_status"
+        )
+        self.motion_action_name = f"{self.robot_namespace}/harvest/robot_motion"
         self.execute_enabled = execute
         self.sample_count = int(sample_count)
         self.samples = deque(maxlen=sample_count)
@@ -208,7 +228,7 @@ class HarvestCoordinator(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        self.client = ActionClient(self, RobotMotion, "/harvest/robot_motion")
+        self.client = ActionClient(self, RobotMotion, self.motion_action_name)
         status_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=10,
@@ -221,13 +241,16 @@ class HarvestCoordinator(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.scene_client = self.create_client(
-            GetPlanningScene, "/planning_scene/get_snapshot"
+            GetPlanningScene, PLANNING_SCENE_SERVICE_BY_ROBOT[self.robot_id]
         )
         self.place_client = self.create_client(
             PlaceCommand, PLACE_COMMAND_SERVICE
         )
         self.create_subscription(
-            PlanningScene, "/planning_scene", self.on_scene, latched_qos
+            PlanningScene,
+            PLANNING_SCENE_TOPIC_BY_ROBOT[self.robot_id],
+            self.on_scene,
+            latched_qos,
         )
         self.create_subscription(
             SimulationState, "/simulation/state", self.on_state, latched_qos
@@ -245,7 +268,7 @@ class HarvestCoordinator(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         self.create_subscription(
-            HarvestTarget, TARGET_TOPIC, self.on_target, target_qos
+            HarvestTarget, self.target_topic, self.on_target, target_qos
         )
         perception_status_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -255,7 +278,7 @@ class HarvestCoordinator(Node):
         )
         self.create_subscription(
             HarvestPerceptionStatus,
-            PERCEPTION_STATUS_TOPIC,
+            self.perception_status_topic,
             self.on_perception_status,
             perception_status_qos,
         )
@@ -534,11 +557,11 @@ class HarvestCoordinator(Node):
         """Return the world-to-palm transform as rotation and position."""
         try:
             transform = self.tf_buffer.lookup_transform(
-                "world", TCP_FRAME, stamp
+                "world", self.tcp_frame, stamp
             )
         except TransformException as error:
             raise RoutePlanningError(
-                f"{TCP_FRAME} TF is unavailable: {error}"
+                f"{self.tcp_frame} TF is unavailable: {error}"
             )
         rotation = self._matrix_from_quaternion_xyzw(
             transform.transform.rotation.x,
@@ -1353,9 +1376,14 @@ def main():
     parser.add_argument("--execute", action="store_true", help="없으면 좌표만 검증")
     parser.add_argument("--samples", type=int, default=10)
     parser.add_argument("--maximum-spread", type=float, default=0.04)
-    parser.add_argument("--robot-id", default=DEFAULT_ROBOT_ID)
     parser.add_argument(
-        "--motion-status-topic", default=DEFAULT_MOTION_STATUS_TOPIC
+        "--robot-id",
+        choices=(*APPLE_IDS_BY_ROBOT, "all"),
+        default=DEFAULT_ROBOT_ID,
+        help="담당 로봇 또는 all이면 두 로봇 coordinator를 동시에 실행",
+    )
+    parser.add_argument(
+        "--motion-status-topic", default=""
     )
     parser.add_argument(
         "--place-coordinator-mode",
@@ -1368,26 +1396,42 @@ def main():
     )
     args, ros_args = parser.parse_known_args()
     rclpy.init(args=ros_args)
-    node = HarvestCoordinator(
-        args.execute,
-        args.samples,
-        args.maximum_spread,
-        robot_id=args.robot_id,
-        motion_status_topic=args.motion_status_topic,
+    robot_ids = (
+        tuple(APPLE_IDS_BY_ROBOT)
+        if args.robot_id == "all"
+        else (args.robot_id,)
     )
+    nodes = [
+        HarvestCoordinator(
+            args.execute,
+            args.samples,
+            args.maximum_spread,
+            robot_id=robot_id,
+            motion_status_topic=(
+                args.motion_status_topic
+                if len(robot_ids) == 1
+                else ""
+            ),
+        )
+        for robot_id in robot_ids
+    ]
     place_node = None
-    if should_host_place_coordinator(args.robot_id, args.place_coordinator_mode):
-        if node.place_client.wait_for_service(timeout_sec=0.5):
-            node.get_logger().info(
+    host_place = args.place_coordinator_mode == "host" or (
+        args.place_coordinator_mode == "auto" and "robot_01" in robot_ids
+    )
+    if host_place:
+        if nodes[0].place_client.wait_for_service(timeout_sec=0.5):
+            nodes[0].get_logger().info(
                 "기존 외부 Place Coordinator service를 사용합니다."
             )
         else:
             place_node = PlaceCoordinatorNode()
-            node.get_logger().info(
+            nodes[0].get_logger().info(
                 "공유 Place Coordinator service를 이 프로세스에서 호스팅합니다."
             )
-    executor = MultiThreadedExecutor(num_threads=2)
-    executor.add_node(node)
+    executor = MultiThreadedExecutor(num_threads=len(nodes) + (1 if place_node else 0))
+    for node in nodes:
+        executor.add_node(node)
     if place_node is not None:
         executor.add_node(place_node)
     try:
@@ -1398,7 +1442,8 @@ def main():
         executor.shutdown()
         if place_node is not None:
             place_node.destroy_node()
-        node.destroy_node()
+        for node in nodes:
+            node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 
