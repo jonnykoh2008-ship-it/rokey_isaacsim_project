@@ -48,6 +48,20 @@
 
 베이스, arm, 컨베이어 카메라에 동일한 Intel RealSense D455 사양을 사용한다.
 
+컨베이어 2의 품질검사 카메라는 3대다. 손상과 착색은 한쪽 면에만 나타날 수 있어
+한 방향 촬영으로는 표면을 덮지 못하므로, 위·왼쪽·오른쪽 고정 뷰로 사과 표면을
+동시에 관측한다.
+
+| prim | 위치 | 토픽 namespace | optical frame |
+|---|---|---|---|
+| `conv_rsd455` | 위 | `/conveyor_camera` | `quality_camera_top_optical_frame` |
+| `conv_rsd455_01` | 왼쪽 | `/conveyor_camera_01` | `quality_camera_left_optical_frame` |
+| `conv_rsd455_02` | 오른쪽 | `/conveyor_camera_02` | `quality_camera_right_optical_frame` |
+
+세 카메라는 동일한 render product 주기로 발행하며 한 검사의 세 뷰는 timestamp
+차이가 20ms 이내여야 한다. 정확한 장착 위치와 각도는 실제 촬영 결과로 확정하며
+현재 `TBD`다.
+
 - 동작 범위: 0.4~6m, 권장 최적 범위 0.6m 이상
 - Depth 최대 해상도: 1280×720
 - Depth 최대 FPS: 90

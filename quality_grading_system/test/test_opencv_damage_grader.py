@@ -37,6 +37,28 @@ class OpenCVDamageGraderTests(unittest.TestCase):
 
         self.assertFalse(result.combined.any())
 
+    def test_healthy_yellow_cheek_and_shaded_edge_are_not_damage(self):
+        image = np.zeros((160, 160, 3), dtype=np.uint8)
+        apple = np.zeros((160, 160), dtype=np.uint8)
+        cv2.circle(apple, (80, 80), 62, 255, -1)
+        image[apple > 0] = (190, 40, 35)
+        cv2.ellipse(image, (80, 80), (54, 54), 0, -70, 70, (225, 180, 45), -1)
+        cv2.ellipse(image, (80, 80), (60, 60), 0, 105, 255, (115, 28, 25), 4)
+
+        result = detect_damage(image, apple)
+
+        self.assertFalse(result.combined.any())
+
+    def test_apple_boundary_is_excluded_from_damage_candidates(self):
+        image = np.full((100, 100, 3), (190, 40, 35), dtype=np.uint8)
+        apple = np.zeros((100, 100), dtype=np.uint8)
+        cv2.circle(apple, (50, 50), 35, 255, -1)
+        cv2.circle(image, (50, 50), 35, (70, 32, 27), 2)
+
+        result = detect_damage(image, apple)
+
+        self.assertFalse(result.combined.any())
+
     def test_segmentation_metrics_are_exact(self):
         truth = np.zeros((4, 4), dtype=np.uint8)
         truth[0, :2] = 1

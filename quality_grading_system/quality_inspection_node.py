@@ -36,6 +36,14 @@ COMPLETION_TOPIC = "/quality/inspection_completed"
 OUTPUT_TOPIC = "/quality/results"
 RESULT_QOS_DEPTH = 10
 COMPLETION_QOS_DEPTH = 10
+# 컨베이어 2는 카메라 3대로 사과의 서로 다른 면을 본다. 한 면만 보고 판정하면
+# 3면 구성을 쓰는 의미가 없고 반대편 손상을 놓치므로, 기본값은 전 면 요구다.
+# 미달이면 측정값을 만들지 않고 INSUFFICIENT_VIEWS 로 보고한다.
+DEFAULT_MIN_VALID_VIEWS = 3
+# 등급을 무엇으로 매길지. "size" 는 직경, "color" 는 착색률 기준이다.
+# 착색 기준은 color_mask 를 내는 predictor 와 함께 써야 한다
+# (model_backend:=opencv_color).
+DEFAULT_GRADE_BY = "size"
 INPUT_QOS_DEPTH = 6
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5
 DEFAULT_STALE_SESSION_TIMEOUT_SEC = 3.0
@@ -360,6 +368,8 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
             ("model_backend", "auto"),
             ("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD),
             ("stale_session_timeout_sec", DEFAULT_STALE_SESSION_TIMEOUT_SEC),
+            ("min_valid_views", DEFAULT_MIN_VALID_VIEWS),
+            ("grade_by", DEFAULT_GRADE_BY),
         ):
             if not self.has_parameter(name):
                 self.declare_parameter(name, default)
@@ -368,12 +378,20 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
         if configured_predictor is None:
             model_path = str(self.get_parameter("model_path").value)
             backend = str(self.get_parameter("model_backend").value)
-            configured_predictor = (
-                load_measurement_predictor(model_path, backend=backend)
-                if model_path
-                else DiameterOnlyPredictor()
-            )
+            # opencv_color 는 학습 모델 파일이 없으므로 model_path 없이도 고른다.
+            if backend == "opencv_color" or model_path:
+                configured_predictor = load_measurement_predictor(
+                    model_path, backend=backend
+                )
+            else:
+                configured_predictor = DiameterOnlyPredictor()
         self._confidence_threshold = float(self.get_parameter("confidence_threshold").value)
+        self._min_valid_views = int(self.get_parameter("min_valid_views").value)
+        if self._min_valid_views < 1:
+            raise ValueError("min_valid_views must be positive")
+        self._grade_by = str(self.get_parameter("grade_by").value)
+        if self._grade_by not in ("size", "color"):
+            raise ValueError("grade_by must be 'size' or 'color'")
         self._stale_timeout_ns = int(
             float(self.get_parameter("stale_session_timeout_sec").value) * 1_000_000_000
         )
@@ -409,6 +427,11 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
         self.get_logger().info(
             f"GPU PC 2 quality node ready: {INPUT_TOPIC} + {COMPLETION_TOPIC} "
             f"-> {OUTPUT_TOPIC}; use_sim_time=true"
+        )
+        self.get_logger().info(
+            f"grading by {self._grade_by}, "
+            f"min_valid_views={self._min_valid_views}, "
+            f"predictor={type(configured_predictor).__name__}"
         )
 
     def _simulation_time_ns(self) -> int:
@@ -563,6 +586,8 @@ class QualityInspectionNode(Node):  # type: ignore[misc]
             measurements,
             successful_indices,
             confidence_threshold=self._confidence_threshold,
+            min_valid_views=self._min_valid_views,
+            grade_by=self._grade_by,
         )
         self._publish_result(event, result)
         self._coordinator.finalize(event.inspection_id)

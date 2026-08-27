@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from inspection_session import (
+    INSPECTION_ROI_FRAME,
     InspectionContractError,
     InspectionFrame,
     InspectionIdentityMismatch,
@@ -27,7 +28,7 @@ CAMERA_K = [500.0, 0.0, 50.0, 0.0, 500.0, 50.0, 0.0, 0.0, 1.0]
 CAMERA_P = [500.0, 0.0, 50.0, 0.0, 0.0, 500.0, 50.0, 0.0, 0.0, 0.0, 1.0, 0.0]
 
 
-def header(sec: int = 10, nanosec: int = 20, frame_id: str = "quality_camera_optical_frame"):
+def header(sec: int = 10, nanosec: int = 20, frame_id: str = "quality_camera_top_optical_frame"):
     return SimpleNamespace(
         stamp=SimpleNamespace(sec=sec, nanosec=nanosec),
         frame_id=frame_id,
@@ -77,7 +78,9 @@ def make_completion_message(
     sec: int = 10,
 ):
     return SimpleNamespace(
-        header=header(sec=sec, nanosec=0),
+        # ROI exit is a conveyor event, so completions use the ROI frame
+        # rather than any one of the three camera optical frames.
+        header=header(sec=sec, nanosec=0, frame_id=INSPECTION_ROI_FRAME),
         inspection_id=inspection_id,
         apple_id=apple_id,
         total_frames=total_frames,
@@ -93,7 +96,7 @@ class MessageAdapterTest(unittest.TestCase):
         self.assertEqual(frame.ignore_mask_data, b"png-ignore")
         self.assertEqual(frame.depth_data, b"png-depth")
         self.assertEqual(frame.camera_width, 100)
-        self.assertEqual(frame.frame_id, "quality_camera_optical_frame")
+        self.assertEqual(frame.frame_id, "quality_camera_top_optical_frame")
 
     def test_rejects_mismatched_component_header(self) -> None:
         message = make_message(0)
@@ -115,7 +118,7 @@ class MessageAdapterTest(unittest.TestCase):
     def test_converts_completion_header_stamp_to_deadline_source(self) -> None:
         completion = inspection_completion_from_message(make_completion_message(sec=12))
         self.assertEqual(completion.roi_exit_time_ns, 12_000_000_000)
-        self.assertEqual(completion.frame_id, "quality_camera_optical_frame")
+        self.assertEqual(completion.frame_id, INSPECTION_ROI_FRAME)
 
 
 class CoordinatorLifecycleTest(unittest.TestCase):

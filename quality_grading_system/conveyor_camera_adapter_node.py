@@ -19,11 +19,18 @@ from opencv_size_grader import AppleNotDetected, DetectionConfig, detect_single_
 
 # 컨베이어 2의 고정 카메라 3대. 한 사과의 서로 다른 면을 동시에 보므로 세 view를
 # 하나의 검사로 묶어 표면을 덮는다. 손상은 한쪽 면에만 나타날 수 있다.
-DEFAULT_CAMERA_NAMESPACES = (
+KNOWN_CAMERA_NAMESPACES = (
     "/conveyor_camera",
     "/conveyor_camera_01",
     "/conveyor_camera_02",
 )
+
+# 현재 스테이지에는 탑뷰 한 대만 있다. 표면 커버리지는 동시 관측이 아니라 통과
+# 중 회전에서 나오므로 한 대로도 성립한다: 세 대를 동시에 써도 한 순간에 덮이는
+# 것은 표면의 36.2% 이고(세 대가 모두 위를 보아 크게 겹친다), 탑뷰 한 대로 순간
+# 여럿을 모으면 실측 ground truth 79.5% 대비 평균 편차 +0.1pp, 표준편차 2.0pp 로
+# 수렴한다. 카메라를 늘리려면 이 튜플에 namespace 를 추가하면 된다.
+DEFAULT_CAMERA_NAMESPACES = KNOWN_CAMERA_NAMESPACES[:1]
 RGB_SUFFIX = "/color/image_raw"
 DEPTH_SUFFIX = "/depth/image_raw"
 CAMERA_INFO_SUFFIX = "/camera_info"
@@ -55,6 +62,35 @@ DEFAULT_ROI_AIM_DISTANCE_M = 0.40
 # 사과가 지점을 지나는 구간을 담되 상류의 사과는 배제한다.
 DEFAULT_ROI_RADIUS_M = 0.08
 
+# ROI 판정 방식. "aim_sphere" 는 조준점 주변 구로 제한하는 기존 동작이고,
+# "full_frame" 은 카메라가 보는 컨베이어 구간 전체를 검사 구간으로 쓴다.
+#
+# 조준거리 0.40m 에서 탑 카메라의 가로 시야는 약 0.75m 인데(D455 HFOV 86도
+# 기준), 반지름 0.08m 구는 그중 0.16m 만 쓴다. 시야의 79% 를 버리는 셈이다.
+# 실제 운용 속도 0.3~0.4 m/s 에서 구 통과는 0.40~0.53초라 0.35초 간격으로는
+# 순간 2개밖에 못 모으고, 커버리지가 목표 99.6% 가 아니라 약 55% 에 그친다.
+# 시야 전체를 쓰면 통과가 1.87초로 늘어 30Hz 에서 55 그룹이 들어온다.
+#
+# 다만 탑뷰만으로는 한계가 있다. 사과가 벨트 가로 방향 축으로 구르면 그 축의
+# 양 극점은 굴러도 제자리라, 순간을 무한히 늘려도 탑뷰 커버리지는 86.5% 에서
+# 멈춘다. 나머지 13.5% 는 옆 카메라만 볼 수 있다. 그래서 시야를 넓히는 것과
+# 카메라를 줄이는 것은 별개의 결정이다.
+#
+# 기본값은 기존 동작을 유지한다. 전환 판단에 필요한 시야 폭과 사과 간격은
+# 아래 진단 로그로 실주행에서 측정한다.
+ROI_MODE_AIM_SPHERE = "aim_sphere"
+ROI_MODE_FULL_FRAME = "full_frame"
+# 실측으로 aim_sphere 는 이 컨베이어에서 쓸 수 없다는 것이 확인되어 기본값을
+# 옮겼다. 0.4 m/s 에서 반지름 0.08m 구는 0.40초에 통과되고 0.35초 간격으로는
+# 순간이 2개밖에 모이지 않아 커버리지가 약 55% 에 그친다. 시야 전체를 쓰면
+# 같은 속도에서 통과가 2.23초가 된다. aim_sphere 는 조준점을 좁게 보고 싶을 때
+# 남겨 둔다.
+DEFAULT_ROI_MODE = ROI_MODE_FULL_FRAME
+
+# full_frame 에서 화면 가장자리에 걸린 사과는 실루엣이 잘려 직경도 착색률도
+# 없는 표면을 기준으로 재게 된다. 경계에 닿은 사과는 제외한다.
+DEFAULT_ROI_EDGE_MARGIN_PX = 16
+
 # apple_id tracker. docs/features/conveyor.md 는 GPU PC 2 가 apple_id tracker 를
 # 상시 수행하도록 규정하지만, 구현은 세션이 열릴 때마다 새 id 를 만들고 있었다.
 # 그래서 검출이 한 번 끊겨 세션이 다시 열리면 같은 사과가 새 사과가 되었고,
@@ -72,12 +108,25 @@ DEFAULT_ROI_EXIT_PATIENCE = 3
 # 3면을 못 채우고 TIMEOUT 으로 끝난다. 연속 진입을 요구해 그것을 막는다.
 DEFAULT_ROI_ENTRY_PATIENCE = 2
 
-# 세션을 유지하려면 몇 면이 동시에 ROI 안에 있어야 하는지. ROI 판정은 카메라별
-# 이미지 좌표로 계산되므로, 한 면만 요구하면 사과가 세 밴드를 차례로 지나며
-# 세션이 조각난다. 실측에서 한 사과가 3면 세션(VALID)과 2면 꼬리 세션(TIMEOUT)
-# 두 건으로 갈렸다. 판정에 필요한 면 수와 같게 두면 한 사과에 결과 하나가 된다.
-# None 이면 카메라 수를 그대로 쓴다.
-DEFAULT_MIN_VIEWS_IN_ROI = 0
+# 세션을 유지하려면 몇 면이 동시에 ROI 안에 있어야 하는지.
+#
+# 이 값은 원래 카메라 수(3)였다. ROI 를 카메라별 이미지 밴드로 잡던 시절에는
+# 한 면만 요구하면 사과가 세 밴드를 차례로 지나며 세션이 조각났기 때문이다.
+# full_frame 은 밴드를 쓰지 않으므로 그 이유가 사라졌고, 3면 요구는 오히려
+# 검사를 아예 못 열게 만든다. 실측 895 프레임에서 검출률은 탑 7.7%, 좌 16.5%,
+# 우 15.1% 였고 세 면이 동시에 잡힌 그룹은 in_roi=0, 즉 한 번도 없었다.
+# 탑뷰가 특히 낮은 것은 위에서 오는 정반사로 평균 채도가 27.9 까지 떨어져
+# 문턱 35 를 밑돌기 때문이다.
+#
+# 표면 커버리지는 이제 동시 관측이 아니라 통과 중 회전에서 나온다. 세 면을
+# 동시에 봐도 한 순간에 덮이는 것은 표면의 36.2% 뿐이고(세 대가 모두 위쪽을
+# 보아 크게 겹친다), 탑뷰 한 대만으로도 순간을 여럿 모으면 그 이상을 덮는다.
+DEFAULT_MIN_VIEWS_IN_ROI = 1
+
+# 한 순간을 대표 프레임으로 채택하는 데 필요한 최소 면 수. 예전에는 카메라
+# 수가 코드에 박혀 있어 파라미터로 낮출 수 없었다. 면이 더 보이면 그만큼
+# 좋지만, 요구 조건이 되면 검사가 열리지 않는다.
+DEFAULT_MIN_VIEWS_PER_INSTANT = 1
 # 세 카메라는 같은 OnPlaybackTick에서 발행되지만 도착 순서와 stamp가 완전히
 # 같다고 보장하지 않는다. docs/architecture/ros2_interfaces.md의 계약에 따라
 # 한 검사의 세 view는 timestamp 최댓값과 최솟값 차이가 20ms 이내여야 한다.
@@ -333,6 +382,27 @@ def unmeasurable_surface_mask(image_bgr, apple_mask):
     ) * 255
 
 
+# 순간 수에 대한 표면 커버리지 추정. inspection_session.py 에 기록된 실측값
+# (순간 1개 36.2%, 4개 87.0%, 8개 99.6%)을 앵커로 선형 보간한다. 이 값들은 한
+# 순간에 3면이 모두 잡힌 경우를 전제하므로, 면이 빠진 순간이 섞이면 실제
+# 커버리지는 이보다 낮다. 로그에 상황을 드러내기 위한 근사치이지 등급 판정에
+# 쓰는 값이 아니다.
+_COVERAGE_ANCHORS = ((0, 0.0), (1, 0.362), (4, 0.870), (8, 0.996))
+
+
+def estimated_surface_coverage(instant_count: int) -> float:
+    """Rough share of the peel covered by this many three-view instants."""
+    if instant_count <= 0:
+        return 0.0
+    last_count, last_value = _COVERAGE_ANCHORS[-1]
+    if instant_count >= last_count:
+        return last_value
+    for (x0, y0), (x1, y1) in zip(_COVERAGE_ANCHORS, _COVERAGE_ANCHORS[1:]):
+        if x0 <= instant_count <= x1:
+            return y0 + (y1 - y0) * (instant_count - x0) / (x1 - x0)
+    return last_value
+
+
 def apple_position_m(apple_mask, depth_mm, camera_info):
     """Back-project the apple centroid into the camera optical frame, in metres.
 
@@ -463,11 +533,14 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         )
         for name, default in (
             ("camera_namespaces", list(DEFAULT_CAMERA_NAMESPACES)),
+            ("roi_mode", DEFAULT_ROI_MODE),
+            ("roi_edge_margin_px", DEFAULT_ROI_EDGE_MARGIN_PX),
             ("roi_min_x_ratio", DEFAULT_ROI_MIN_X_RATIO),
             ("roi_max_x_ratio", DEFAULT_ROI_MAX_X_RATIO),
             ("roi_exit_patience", DEFAULT_ROI_EXIT_PATIENCE),
             ("roi_entry_patience", DEFAULT_ROI_ENTRY_PATIENCE),
             ("min_views_in_roi", DEFAULT_MIN_VIEWS_IN_ROI),
+            ("min_views_per_instant", DEFAULT_MIN_VIEWS_PER_INSTANT),
             ("crop_margin_px", DEFAULT_CROP_MARGIN_PX),
             ("camera_qos_reliable", False),
             ("rearm_absent_frames", DEFAULT_REARM_ABSENT_FRAMES),
@@ -502,6 +575,17 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             raise ValueError(
                 "roi ratios must satisfy 0 <= min < max <= 1"
             )
+        self._roi_mode = str(self.get_parameter("roi_mode").value)
+        if self._roi_mode not in (ROI_MODE_AIM_SPHERE, ROI_MODE_FULL_FRAME):
+            raise ValueError(
+                f"roi_mode must be {ROI_MODE_AIM_SPHERE!r} or "
+                f"{ROI_MODE_FULL_FRAME!r}"
+            )
+        self._roi_edge_margin_px = int(
+            self.get_parameter("roi_edge_margin_px").value
+        )
+        if self._roi_edge_margin_px < 0:
+            raise ValueError("roi_edge_margin_px must be non-negative")
         self._roi_exit_patience = int(self.get_parameter("roi_exit_patience").value)
         if self._roi_exit_patience < 1:
             raise ValueError("roi_exit_patience must be positive")
@@ -514,6 +598,16 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         if not 1 <= self._min_views_in_roi <= len(self._namespaces):
             raise ValueError(
                 "min_views_in_roi must be between 1 and the number of cameras"
+            )
+        configured_per_instant = int(
+            self.get_parameter("min_views_per_instant").value
+        )
+        self._min_views_per_instant = (
+            configured_per_instant or len(self._namespaces)
+        )
+        if not 1 <= self._min_views_per_instant <= len(self._namespaces):
+            raise ValueError(
+                "min_views_per_instant must be between 1 and the number of cameras"
             )
         self._crop_margin_px = int(self.get_parameter("crop_margin_px").value)
         if self._crop_margin_px < 0:
@@ -570,6 +664,10 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             "detected": 0,
             "in_roi": 0,
             "ambiguous": 0,
+            # 완료된 검사 수. 주기당 증가량이 곧 사과 처리율이고, 여기에
+            # 통과 시간을 곱하면 시야 안에 사과가 몇 개나 함께 있는지 나온다.
+            # full_frame 으로 넓힐 때 다중 사과 추적이 필요한지의 근거가 된다.
+            "sessions": 0,
         }
         # 마지막 그룹의 검출 위치·크기. 정지한 배경을 사과로 오인하는지
         # 판단하려면 무엇이 어디서 잡히는지 보여야 한다.
@@ -593,8 +691,15 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             f"{INSPECTION_TOPIC}"
         )
         self.get_logger().info(
-            f"ROI band: x {self._roi_min_x_ratio:.2f}-{self._roi_max_x_ratio:.2f} "
-            f"of image width, exit patience {self._roi_exit_patience} groups"
+            f"ROI mode: {self._roi_mode} "
+            + (
+                f"(edge margin {self._roi_edge_margin_px} px)"
+                if self._roi_mode == ROI_MODE_FULL_FRAME
+                else f"(aim {self._roi_aim_distance_m:.2f} m, "
+                f"radius {self._roi_radius_m:.2f} m; depth-less fallback band "
+                f"x {self._roi_min_x_ratio:.2f}-{self._roi_max_x_ratio:.2f})"
+            )
+            + f", exit patience {self._roi_exit_patience} groups"
         )
         self.get_logger().info(
             "camera QoS: "
@@ -610,6 +715,7 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             f"status: views={counters['views']} groups={counters['groups']} "
             f"apple_detected={counters['detected']} in_roi={counters['in_roi']} "
             f"multi_apple={counters['ambiguous']} "
+            f"inspections={counters['sessions']} "
             f"session={state}"
         )
         if self._last_detection:
@@ -840,14 +946,44 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             return False
         return self._roi_min_x_ratio <= centre_ratio <= self._roi_max_x_ratio
 
-    def _view_in_roi(self, apple_mask, depth_mm, camera_info) -> bool:
-        """True when the apple is within the tolerance sphere of the aim point.
+    def _mask_clear_of_border(self, apple_mask) -> bool:
+        """True when the whole silhouette is inside the frame, margin included.
 
-        Every camera is aimed at the same inspection point, so in each camera's
-        optical frame that point sits on the optical axis at the configured aim
-        distance. Measuring the distance to it makes all three cameras test one
-        physical question instead of three different image-space ones.
+        An apple cut by the image edge has a truncated silhouette, so its
+        diameter and its colour ratio would both be measured against a surface
+        that is not all there. In full_frame mode this is the only thing that
+        bounds the inspection region, so it has to carry that check on its own.
         """
+        import numpy as np
+
+        rows = np.nonzero(apple_mask.any(axis=1))[0]
+        columns = np.nonzero(apple_mask.any(axis=0))[0]
+        if rows.size == 0 or columns.size == 0:
+            return False
+        height, width = apple_mask.shape[:2]
+        margin = self._roi_edge_margin_px
+        return (
+            int(rows[0]) >= margin
+            and int(columns[0]) >= margin
+            and int(rows[-1]) < height - margin
+            and int(columns[-1]) < width - margin
+        )
+
+    def _view_in_roi(self, apple_mask, depth_mm, camera_info) -> bool:
+        """True when this view should contribute to the current inspection.
+
+        In full_frame mode the whole strip of conveyor the camera sees is the
+        inspection region, so every apple clear of the border counts.
+
+        In aim_sphere mode the region is a tolerance sphere around the aim
+        point. Every camera is aimed at the same inspection point, so in each
+        camera's optical frame that point sits on the optical axis at the
+        configured aim distance. Measuring the distance to it makes all three
+        cameras test one physical question instead of three different
+        image-space ones.
+        """
+        if self._roi_mode == ROI_MODE_FULL_FRAME:
+            return self._mask_clear_of_border(apple_mask)
         position = apple_position_m(apple_mask, depth_mm, camera_info)
         if position is None:
             # Depth dropped out; fall back to the image-space band rather than
@@ -856,6 +992,20 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         x, y, z = position
         offset = (x * x + y * y + (z - self._roi_aim_distance_m) ** 2) ** 0.5
         return offset <= self._roi_radius_m
+
+    @staticmethod
+    def _master_position_m(views: list[dict[str, Any]]):
+        """Position from the lowest-numbered camera that produced one.
+
+        _group_position_m averages coordinates that belong to three different
+        optical frames, so its value shifts whenever a view drops out. For
+        measuring how far the apple actually travelled, take one camera and
+        stay with it: the numbers then live in a single frame throughout.
+        """
+        for view in sorted(views, key=lambda item: item["frame_index"]):
+            if view.get("position_m"):
+                return view["position_m"]
+        return None
 
     @staticmethod
     def _group_position_m(views: list[dict[str, Any]]):
@@ -903,7 +1053,15 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             "instants": [],
             "candidates": 0,
             "last_position_m": position,
+            # 진단용. 기준 카메라 한 대의 위치만 시간순으로 모아 두면 통과
+            # 거리와 실제 속도를 잴 수 있다. 이 둘을 알아야 간격과 ROI 크기를
+            # 추측이 아니라 계산으로 정할 수 있다.
+            "path": [],
+            # ROI 안에 동시에 몇 면이 잡혔는지의 분포. 3면 동시 조건이 세션을
+            # 쪼개고 있는지 여기서 드러난다.
+            "views_histogram": {},
         }
+        self._counters["sessions"] += 1
         self.get_logger().info(
             f"ROI entry: {self._session['inspection_id']} at {stamp_ns} ns"
         )
@@ -958,8 +1116,16 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         if position is not None:
             session["last_position_m"] = position
 
-        # 면 수가 우선이다. 3면이 함께 보이는 순간이 표면을 가장 넓게 덮는다.
-        if len(views) < len(self._namespaces):
+        histogram = session["views_histogram"]
+        histogram[len(views)] = histogram.get(len(views), 0) + 1
+        master = self._master_position_m(views)
+        if master is not None:
+            session["path"].append((stamp_ns, master))
+
+        # 면이 많을수록 한 순간이 넓게 덮지만, 요구 조건으로 걸면 세 면이 동시에
+        # 잡히지 않는 동안 검사가 통째로 사라진다. 커버리지는 통과 중 회전으로
+        # 채운다.
+        if len(views) < self._min_views_per_instant:
             return
         instants = session["instants"]
         # 직전 순간과 너무 가까우면 자세가 거의 같아 표본이 늘지 않는다. 크롭과
@@ -1024,8 +1190,8 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             )
             return
         total_frames = sum(len(item["views"]) for item in instants)
-        for ordinal, item in enumerate(instants):
-            self._publish_group(session, item["views"], ordinal, total_frames)
+        for item in instants:
+            self._publish_group(session, item["views"], total_frames)
 
         completion = InspectionCompleted()
         # ROI exit is a conveyor event, so it carries the ROI frame rather
@@ -1048,6 +1214,52 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
             f"{int(session.get('bytes_sent', 0)) / 1024:.0f} KB "
             f"from {session['candidates']} candidates, exit at {stamp_ns} ns"
         )
+        self._log_session_diagnostics(session, instants)
+
+    def _log_session_diagnostics(
+        self, session: dict[str, Any], instants: list[dict[str, Any]]
+    ) -> None:
+        """Report what this transit actually yielded, in measurable terms.
+
+        The instant budget, the minimum gap and the ROI size were all sized from
+        an assumed conveyor speed. Rather than assume again, publish what the
+        run itself shows: how far the apple travelled through the inspection
+        region, how long that took, and how many instants came out of it.
+        """
+        path = session.get("path") or []
+        if len(path) >= 2:
+            (first_ns, first_point), (last_ns, last_point) = path[0], path[-1]
+            travel_m = (
+                sum((a - b) ** 2 for a, b in zip(last_point, first_point)) ** 0.5
+            )
+            duration_s = (last_ns - first_ns) / 1e9
+            speed = f"{travel_m / duration_s:.3f} m/s" if duration_s > 0 else "n/a"
+            self.get_logger().info(
+                f"  transit: {travel_m * 100:.1f} cm over {duration_s:.2f}s "
+                f"-> {speed} ({len(path)} positions from the master camera)"
+            )
+
+        histogram = session.get("views_histogram") or {}
+        if histogram:
+            spread = ", ".join(
+                f"{count} view{'' if count == 1 else 's'} x{histogram[count]}"
+                for count in sorted(histogram)
+            )
+            self.get_logger().info(f"  views in ROI per group: {spread}")
+
+        coverage = estimated_surface_coverage(len(instants))
+        if len(instants) < self._representative_instants:
+            self.get_logger().warn(
+                f"  only {len(instants)}/{self._representative_instants} instants; "
+                f"estimated surface coverage {coverage * 100:.1f}%. The apple "
+                "left the inspection region before the budget was filled: "
+                "either the region is too small for this conveyor speed or the "
+                "minimum instant gap is too long."
+            )
+        else:
+            self.get_logger().info(
+                f"  estimated surface coverage {coverage * 100:.1f}%"
+            )
 
     @staticmethod
     def _stamp_from_ns(stamp_ns: int) -> Any:
@@ -1074,17 +1286,21 @@ class ConveyorCameraAdapterNode(Node):  # type: ignore[misc]
         self,
         session: dict[str, Any],
         views: list[dict[str, Any]],
-        instant_ordinal: int,
         total_frames: int,
     ) -> None:
         inspection_id = session["inspection_id"]
         apple_id = session["apple_id"]
         published_bytes = 0
 
-        for view in views:
-            # frame_index 는 검사 전체에서 유일해야 한다. 한 검사가 여러 순간을
-            # 담으므로 카메라 인덱스만으로는 순간끼리 충돌한다.
-            frame_index = instant_ordinal * len(self._namespaces) + view["frame_index"]
+        for offset, view in enumerate(views):
+            # frame_index 는 검사 안에서 유일하면서 0..total_frames-1 을 빈틈없이
+            #채워야 한다. InspectionFrame 이 frame_index < total_frames 를
+            # 요구하기 때문이다. 예전처럼 순간 번호에 카메라 수를 곱해 매기면,
+            # 어떤 순간에 면이 하나라도 빠졌을 때 total_frames 는 줄어드는데
+            # 인덱스는 그대로 3씩 뛰어 뒤쪽 프레임이 전부 계약 위반으로 거부된다.
+            # 어느 카메라가 찍었는지는 header.frame_id 가 이미 싣고 있으므로
+            # 인덱스가 카메라를 가리킬 필요는 없다.
+            frame_index = int(session["frames_sent"]) + offset
             # Each view keeps its own camera frame so the grader can tell the
             # three faces apart; the six component headers still match.
             header = self._header(

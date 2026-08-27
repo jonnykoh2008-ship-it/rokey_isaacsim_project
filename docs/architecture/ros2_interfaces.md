@@ -30,20 +30,24 @@
 
 | 종류 | 이름 | 타입 | 송신/서버 | 수신/클라이언트 |
 |---|---|---|---|---|
-| Topic | `/base_camera/color/image_raw` | `sensor_msgs/msg/Image` (raw) | GPU PC 1 | 개인 PC 1 |
-| Topic | `/base_camera/depth/image_raw` | `sensor_msgs/msg/Image` (raw) | GPU PC 1 | 개인 PC 1 |
-| Topic | `/base_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | GPU PC 1 | 개인 PC 1 |
-| Topic | `/harvest/target` | `appleproj_interfaces/msg/HarvestTarget` | 개인 PC 1 | GPU PC 1 |
-| Topic | `/harvest/perception_status` | `appleproj_interfaces/msg/HarvestPerceptionStatus` | 개인 PC 1 | GPU PC 1·모니터링 |
+| Topic | `/<robot_id>/base_camera/color/image_raw` | `sensor_msgs/msg/Image` (raw) | GPU PC 1 | 개인 PC 1 |
+| Topic | `/<robot_id>/base_camera/depth/image_raw` | `sensor_msgs/msg/Image` (raw) | GPU PC 1 | 개인 PC 1 |
+| Topic | `/<robot_id>/base_camera/camera_info` | `sensor_msgs/msg/CameraInfo` | GPU PC 1 | 개인 PC 1 |
+| Topic | `/<robot_id>/harvest/target` | `appleproj_interfaces/msg/HarvestTarget` | 개인 PC 1 | GPU PC 1 |
+| Topic | `/<robot_id>/harvest/perception_status` | `appleproj_interfaces/msg/HarvestPerceptionStatus` | 개인 PC 1 | GPU PC 1·모니터링 |
 | Topic | `/simulation/state` | `appleproj_interfaces/msg/SimulationState` | GPU PC 1 | 개인 PC 1 |
 | Topic | `/planning_scene` | `appleproj_interfaces/msg/PlanningScene` | GPU PC 1 | 개인 PC 1 |
 | Service | `/planning_scene/get_snapshot` | `appleproj_interfaces/srv/GetPlanningScene` | GPU PC 1 | 개인 PC 1 (debug/RViz) |
-| Action | `/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | GPU PC 1 내부 supervisor |
-| Topic | `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | GPU PC 1 | 개인 PC 1·개인 PC 2 |
+| Action | `/<robot_id>/harvest/robot_motion` | `appleproj_interfaces/action/RobotMotion` | GPU PC 1 | GPU PC 1 내부 supervisor |
+| Topic | `/<robot_id>/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | GPU PC 1 | 개인 PC 1·개인 PC 2 |
 | Topic | `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` | GPU PC 1 | 개인 PC 1 RViz |
 | Topic | `/harvest/planned_path` | `nav_msgs/msg/Path` | GPU PC 1 | 개인 PC 1 RViz |
 | Topic | `/harvest/planned_joint_trajectory` | `trajectory_msgs/msg/JointTrajectory` | GPU PC 1 | 개인 PC 1 RViz/debug tool |
-| Topic | 컨베이어 raw RGB/depth/CameraInfo 토픽 (`TBD`) | `sensor_msgs/msg/Image`, `sensor_msgs/msg/CameraInfo` | GPU PC 1 | GPU PC 2 |
+| Topic | `/conveyor_camera/{color/image_raw,depth/image_raw,camera_info}` | `sensor_msgs/msg/Image`, `sensor_msgs/msg/CameraInfo` | GPU PC 1 | GPU PC 2 |
+| Topic | `/conveyor_camera_01/{color/image_raw,depth/image_raw,camera_info}` | `sensor_msgs/msg/Image`, `sensor_msgs/msg/CameraInfo` | GPU PC 1 | GPU PC 2 |
+| Topic | `/conveyor_camera_02/{color/image_raw,depth/image_raw,camera_info}` | `sensor_msgs/msg/Image`, `sensor_msgs/msg/CameraInfo` | GPU PC 1 | GPU PC 2 |
+| Topic | `/quality/inspection_images` | `appleproj_interfaces/msg/InspectionImage` | GPU PC 2 adapter | GPU PC 2 inference |
+| Topic | `/quality/inspection_completed` | `appleproj_interfaces/msg/InspectionCompleted` | GPU PC 2 adapter | GPU PC 2 inference |
 | Topic | `/quality/results` | `appleproj_interfaces/msg/QualityResult` | GPU PC 2 | 개인 PC 2 |
 | Service | `/quality/retry_inspection` | `appleproj_interfaces/srv/RetryInspection` | GPU PC 1 | 개인 PC 2 |
 | Topic | `/conveyor/checkpoint_events` | `appleproj_interfaces/msg/CheckpointEvent` | GPU PC 1 | 개인 PC 2 |
@@ -63,24 +67,40 @@ GPU PC 1은 실행 시 `--robot-id`로 다음 USD 수확 프로파일을 선택�
 
 각 M0617은 `m0617_rail/root_joint`를 Articulation root로 사용하며, 본체의
 `FixedJoint`로 rail mount에 연결된다. 사과 fixed joint는 각
-`apple_branch_xx` 내부에서 `branchbody`와 `applebody`를 연결한다. 현재 표의
-`/base_camera/...` 센서 topic은 v2.0 호환 계약으로 유지한다. 두 카메라를
-동시에 운용하기 위한 robot별 topic/action/service namespace와 `HarvestTarget`
-내부의 최종 robot/tree 식별 필드는 아직 `TBD`다.
+`apple_branch_xx` 내부에서 `branchbody`와 `applebody`를 연결한다.
+
+센서 topic 도 robot namespace 를 사용한다. `/<robot_id>/base_camera/...` 이며
+base camera 의 TF frame 은 `<robot_id>/base_camera` 다. TF frame 이름에는
+tf2 규칙상 선행 슬래시를 쓰지 않는다.
+
+이름은 `harvest_namespace.py` 의 `HarvestNames` 가 단독으로 결정하고,
+`base_camera_publish.py`, `vision_apple_pick.py`, `base_apple_detector.py` 가
+모두 그 모듈을 import 한다. 발행하는 쪽과 구독하는 쪽이 같은 출처를 쓰므로
+한쪽만 이름이 바뀌는 일이 생기지 않는다.
+
+namespace 가 없던 동안에는 두 로봇을 동시에 띄우면 카메라 두 대가 한 topic
+에 발행하고, 서로 다른 위치의 카메라가 같은 TF frame 을 주장하며, detector
+두 개가 한 `/harvest/target` 에 발행했다. 그 상태에서는 수신 측이 어느 로봇의
+관측인지 구분할 수 없어 한 나무의 사과가 다른 로봇을 움직일 수 있었다.
+
+`HarvestTarget` 내부의 최종 robot/tree 식별 필드는 아직 `TBD`다.
+
+컨베이어, `/clock`, planning scene 은 하나의 세계를 기술하므로 namespace 를
+붙이지 않는다.
 
 ## 공통 표준 인터페이스
 
 | 토픽 | 타입 | 의미 |
 |---|---|---|
 | `/clock` | `rosgraph_msgs/msg/Clock` | Isaac Sim simulation time |
-| `/joint_states` | `sensor_msgs/msg/JointState` | 로봇 관절 상태 |
+| `/<robot_id>/joint_states` | `sensor_msgs/msg/JointState` | 로봇 관절 상태 |
 | `/tf` | `tf2_msgs/msg/TFMessage` | 동적 TF |
 | `/tf_static` | `tf2_msgs/msg/TFMessage` | 고정 TF |
 
 ## 사과 목표
 
 ```text
-토픽: /harvest/target
+토픽: /<robot_id>/harvest/target
 타입: appleproj_interfaces/msg/HarvestTarget
 송신: 개인 PC 1
 수신: GPU PC 1
@@ -114,7 +134,7 @@ confidence·depth·TF 시간 threshold 값은 `TBD`다. 개인 PC 1은 orientati
 pre-grasp pose를 발행하지 않으며, GPU PC 1이 현재 로봇 상태와 planning scene을
 기준으로 계산한다. 동일 `(reset_id, target_id)`에서는 최신 timestamp만 사용하고,
 Action 실행이 시작된 target의 후속 갱신은 새 Goal로 실행하지 않는다. 실패한 target은
-`/harvest/motion_status`로 거부 사유를 반환한다. `/harvest/target`에는 Transient
+`/<robot_id>/harvest/motion_status`로 거부 사유를 반환한다. `/<robot_id>/harvest/target`에는 Transient
 Local을 사용하지 않는다.
 
 GPU PC 1은 아직 시작하지 않은 target을 ID별 대기열에 보관하고 robot base에서
@@ -126,7 +146,7 @@ lifecycle key는 `(reset_id, target_id)`를 사용한다.
 ## HarvestPerceptionStatus
 
 ```text
-토픽: /harvest/perception_status
+토픽: /<robot_id>/harvest/perception_status
 타입: appleproj_interfaces/msg/HarvestPerceptionStatus
 송신: 개인 PC 1
 수신: GPU PC 1·모니터링 노드
@@ -203,32 +223,42 @@ admission에 영향을 주지 않는다.
 
 ## InspectionImage
 
-현재 OpenCV 크기 단일 단계 A는 저장된 RGB 파일을 직접 처리하므로
-`InspectionImage`를 사용하지 않는다. 단계 A 합격 후 GPU PC 2가 컨베이어 raw
-스트림에서 후보 프레임을 수집하고 대표 프레임을 선택해 RGB-D 직경 측정에
-전달할 때 이 메시지를 사용한다. GPU PC 2 내부 토픽 이름/QoS와 별도 cross-PC
-발행 여부는 `TBD`다.
+착색률 품질검사에서 GPU PC 2 adapter는 GPU PC 1의 위·왼쪽·오른쪽 컨베이어
+raw 스트림과 tracker 상태를 이용해 timestamp 간격이 최대 20ms인 3방향 뷰를 구성하고
+`InspectionImage`로 GPU PC 2 inference에 전달한다. inference는 이 메시지를
+목표 착색 mask 생성과 직경 계산에 사용한다.
 
 필드:
 
 - `header`: `/clock` 기준 촬영 시각과 카메라 frame
 - `inspection_id`: 한 번의 품질검사 식별자
 - `apple_id`: 검사 대상 사과 식별자
-- `frame_index`: 해당 검사에서의 프레임 번호
-- `total_frames`: 해당 검사에서 전송할 전체 대표 프레임 수
+- `frame_index`: `순간 순번 x 3 + 뷰 인덱스`. 뷰 인덱스는 위쪽
+  `conv_rsd455`가 0, 왼쪽 `conv_rsd455_01`이 1, 오른쪽 `conv_rsd455_02`가 2다.
+  한 검사가 통과 구간의 여러 순간을 담으므로 뷰 인덱스만으로는 순간끼리
+  충돌한다.
+- `total_frames`: 한 검사에서 실제로 발행한 프레임 수. 순간 8개 x 카메라 3대
+  기준 24이며 상한도 24다. 카메라 수가 아니다.
+
+  한 검사가 약 2MB가 되지만 이 경로는 어댑터와 검사 노드가 같은 PC에 있어
+  네트워크를 건너지 않는다. 실측 495~874 MB/s로 24프레임이 3~4ms에 도착하며
+  500ms deadline의 1% 미만이다.
 - `image`: 압축 RGB 이미지
 - `apple_mask`: lossless mono8 PNG 사과 mask
-- `ignore_mask`: lossless mono8 PNG 평가 제외 mask. 크기 단일 MVP에서는
-  직경 계산에 사용하지 않지만 후속 착색·손상 확장을 위해 유지한다.
+- `ignore_mask`: lossless mono8 PNG 평가 제외 mask. 반사, 과도한 음영, 경계,
+  손상 등 착색률 계산 또는 모델 평가에서 제외할 영역을 표시한다.
 - `aligned_depth`: RGB에 정렬된 16UC1 millimetre compressedDepth PNG
 - `camera_info`: 해당 raw 프레임과 동일한 CameraInfo
 
-모든 구성요소의 timestamp와 frame_id는 동일해야 한다.
+한 `InspectionImage` 안의 모든 구성요소는 timestamp와 frame_id가 동일해야 한다.
+동일 검사의 세 메시지는 timestamp 최댓값과 최솟값 차이가 20ms 이내여야 하며 같은
+`(inspection_id, apple_id)`를 사용한다. 각 메시지는 실제 카메라 촬영 timestamp를
+보존하고 각 카메라의 optical frame_id로 뷰를 구분한다.
 
 ## QualityResult
 
-GPU PC 2가 이미지별 크기 측정과 사과 단위 통합을 완료한 뒤 개인 PC 2로
-전달한다. 현재 MVP 등급은 `diameter_mm`만 사용한다.
+GPU PC 2가 프레임별 착색·손상 추론과 사과 단위 통합을 완료한 뒤 개인 PC 2로
+전달한다. 크기는 품질 등급에 사용하지 않는다.
 
 ```text
 토픽: /quality/results
@@ -242,17 +272,21 @@ GPU PC 2가 이미지별 크기 측정과 사과 단위 통합을 완료한 뒤 
 - `apple_id`
 - `grade`: `HIGH`, `MEDIUM`, `LOW`
 - `confidence`
-- `color_ratio`
-- `diameter_mm`
-- `damage_area_cm2`
-- `frames_used`
-- `frame_indices`
+- `color_ratio`: 유효 뷰별 착색률의 평균. 등급 판정 기준이다.
+- `diameter_mm`: 측정한 직경. 발행하되 등급 판정에는 사용하지 않는다.
+- `damage_area_cm2`: 현재 판정 범위에서 제외했으므로 NaN
+- `frames_used`: 정상 판정에서는 3
+- `frame_indices`: 정상 판정에서는 `[0, 1, 2]`
 - `result_timestamp`
 - `status`: `VALID`, `RECHECK`, `UNCLASSIFIED`, `TIMEOUT`, `LATE_RESULT`, `ID_MISMATCH`, `INSUFFICIENT_VIEWS`
 
-현재 크기 단일 MVP에서 `color_ratio`와 `damage_area_cm2`는 NaN이다.
-화면 검증용 픽셀 직경은 `diameter_mm`에 넣지 않는다. 단계 A의 파일 기반
-OpenCV 도구는 ROS 결과를 발행하지 않고 오버레이 이미지와 CSV만 생성한다.
+현재 범위에서 `color_ratio`와 `diameter_mm`을 유효 측정값으로 발행하고
+`damage_area_cm2`는 NaN으로 유지한다. 등급은 `color_ratio` 하나로 결정하며
+경계값은 `docs/features/quality_grading.md`를 따른다. `damage_area_cm2` 필드는
+후속 확장을 위해 메시지에 남겨 둔다.
+
+세 뷰 중 하나라도 누락되거나 유효하지 않으면 `INSUFFICIENT_VIEWS`로 처리한다.
+카메라에 보이지 않는 바닥 접촉면은 `color_ratio`의 측정 범위에 포함되지 않는다.
 
 카메라 ROI 이탈 후 simulation time 0.5초를 결과 deadline으로 사용한다. deadline까지 결과가 없으면 `TIMEOUT`, 이후 도착한 결과는 `LATE_RESULT`로 기록한다. 컨베이어 2의 tracker ID와 컨베이어 3 checkpoint의 rigid body prim이 일치하지 않으면 `ID_MISMATCH`로 처리한다.
 
@@ -277,11 +311,11 @@ GPU PC 1의 Isaac Sim 컨베이어 I/O 상태를 개인 PC 2로 전달한다.
 ## RobotMotion
 
 GPU PC 1의 수확 supervisor가 planner와 executor를 연결하는 내부 Action으로
-사용한다. v2.0에서 개인 PC 1은 RobotMotion Goal을 보내지 않고 `/harvest/target`
+사용한다. v2.0에서 개인 PC 1은 RobotMotion Goal을 보내지 않고 `/<robot_id>/harvest/target`
 만 발행한다.
 
 ```text
-액션: /harvest/robot_motion
+액션: /<robot_id>/harvest/robot_motion
 타입: appleproj_interfaces/action/RobotMotion
 ```
 
@@ -336,7 +370,7 @@ GPU PC 1이 target 수신, RRT 계획, trajectory 변환, RMPflow 실행 및 Phy
 target 상태 계약(`TBD`)으로 전달한다.
 
 ```text
-토픽: /harvest/motion_status
+토픽: /<robot_id>/harvest/motion_status
 타입: appleproj_interfaces/msg/MotionStatus
 송신: GPU PC 1
 수신: 개인 PC 1·개인 PC 2
@@ -395,7 +429,7 @@ GPU PC 1의 실제 planner는 실행과 독립된 시각화 publisher를 제공�
 | `/harvest/planning_markers` | `visualization_msgs/msg/MarkerArray` | target, pre-grasp, raw/safety obstacle, 선택된 RRT 해, full-link 최소 clearance, 실패 지점 |
 | `/harvest/planned_path` | `nav_msgs/msg/Path` | 검증된 시간 궤적을 FK한 world 기준 물리 TCP 경로 |
 | `/harvest/planned_joint_trajectory` | `trajectory_msgs/msg/JointTrajectory` | 시간 매개화된 팔 6축 RRT 결과 미리보기 |
-| `/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | planning/execution 상태와 오류 |
+| `/<robot_id>/harvest/motion_status` | `appleproj_interfaces/msg/MotionStatus` | planning/execution 상태와 오류 |
 
 모든 시각화 header는 `/clock`과 `frame_id=world`를 사용한다. `planned_path`는
 trajectory 검증에 사용한 60Hz 표본의 `palm` 기반 물리 TCP pose를 담는다.

@@ -7,6 +7,14 @@ import numpy as np
 
 from conveyor_camera_adapter_node import (
     DEFAULT_CAMERA_NAMESPACES,
+    KNOWN_CAMERA_NAMESPACES,
+    DEFAULT_MIN_VIEWS_IN_ROI,
+    DEFAULT_MIN_VIEWS_PER_INSTANT,
+    DEFAULT_ROI_EDGE_MARGIN_PX,
+    DEFAULT_ROI_MODE,
+    ROI_MODE_AIM_SPHERE,
+    ROI_MODE_FULL_FRAME,
+    estimated_surface_coverage,
     apple_crop_box,
     apple_position_m,
     cropped_camera_info,
@@ -114,8 +122,8 @@ class ThreeViewGroupingTest(unittest.TestCase):
     @staticmethod
     def _adapter():
         adapter = ConveyorCameraAdapterNode.__new__(ConveyorCameraAdapterNode)
-        adapter._namespaces = list(DEFAULT_CAMERA_NAMESPACES)
-        adapter._groups = {name: [] for name in DEFAULT_CAMERA_NAMESPACES}
+        adapter._namespaces = list(KNOWN_CAMERA_NAMESPACES)
+        adapter._groups = {name: [] for name in KNOWN_CAMERA_NAMESPACES}
         adapter.processed = []
         adapter._process_group = lambda stamp, group: adapter.processed.append(
             (stamp, sorted(group))
@@ -134,7 +142,7 @@ class ThreeViewGroupingTest(unittest.TestCase):
 
     def _feed_all(self, adapter, offsets, sec: int = 7):
         for namespace, frame_id, offset in zip(
-            DEFAULT_CAMERA_NAMESPACES, QUALITY_CAMERA_OPTICAL_FRAMES, offsets
+            KNOWN_CAMERA_NAMESPACES, QUALITY_CAMERA_OPTICAL_FRAMES, offsets
         ):
             adapter._collect(namespace, self._view(offset, frame_id, sec=sec))
 
@@ -144,7 +152,7 @@ class ThreeViewGroupingTest(unittest.TestCase):
         self.assertEqual(len(adapter.processed), 1)
         stamp_ns, namespaces = adapter.processed[0]
         self.assertEqual(stamp_ns, 7_000_000_000)
-        self.assertEqual(namespaces, sorted(DEFAULT_CAMERA_NAMESPACES))
+        self.assertEqual(namespaces, sorted(KNOWN_CAMERA_NAMESPACES))
 
     def test_stamps_inside_tolerance_still_group(self) -> None:
         adapter = self._adapter()
@@ -159,11 +167,11 @@ class ThreeViewGroupingTest(unittest.TestCase):
     def test_partial_group_is_not_processed(self) -> None:
         adapter = self._adapter()
         adapter._collect(
-            DEFAULT_CAMERA_NAMESPACES[0],
+            KNOWN_CAMERA_NAMESPACES[0],
             self._view(0, QUALITY_CAMERA_OPTICAL_FRAMES[0]),
         )
         adapter._collect(
-            DEFAULT_CAMERA_NAMESPACES[1],
+            KNOWN_CAMERA_NAMESPACES[1],
             self._view(0, QUALITY_CAMERA_OPTICAL_FRAMES[1]),
         )
         self.assertEqual(adapter.processed, [])
@@ -181,12 +189,12 @@ class ThreeViewGroupingTest(unittest.TestCase):
         adapter = self._adapter()
         for sec in range(DEFAULT_GROUP_QUEUE_SIZE + 4):
             adapter._collect(
-                DEFAULT_CAMERA_NAMESPACES[0],
+                KNOWN_CAMERA_NAMESPACES[0],
                 self._view(0, QUALITY_CAMERA_OPTICAL_FRAMES[0], sec=sec),
             )
         self.assertEqual(adapter.processed, [])
         self.assertLessEqual(
-            len(adapter._groups[DEFAULT_CAMERA_NAMESPACES[0]]),
+            len(adapter._groups[KNOWN_CAMERA_NAMESPACES[0]]),
             DEFAULT_GROUP_QUEUE_SIZE,
         )
 
@@ -197,7 +205,17 @@ class RoiSessionTest(unittest.TestCase):
     @staticmethod
     def _adapter():
         adapter = ConveyorCameraAdapterNode.__new__(ConveyorCameraAdapterNode)
-        adapter._namespaces = list(DEFAULT_CAMERA_NAMESPACES)
+        adapter._namespaces = list(KNOWN_CAMERA_NAMESPACES)
+        adapter._roi_mode = ROI_MODE_AIM_SPHERE
+        adapter._roi_edge_margin_px = DEFAULT_ROI_EDGE_MARGIN_PX
+        adapter._counters = {
+            "views": 0,
+            "groups": 0,
+            "detected": 0,
+            "in_roi": 0,
+            "ambiguous": 0,
+            "sessions": 0,
+        }
         adapter._roi_min_x_ratio = 0.25
         adapter._roi_max_x_ratio = 0.75
         adapter._roi_exit_patience = 3
@@ -302,8 +320,10 @@ class ThreeDimensionalRoiTest(unittest.TestCase):
         depth[mask > 0] = int(depth_m * 1000)
         return mask, depth
 
-    def _adapter(self, aim=0.40, radius=0.08):
+    def _adapter(self, aim=0.40, radius=0.08, mode=ROI_MODE_AIM_SPHERE):
         adapter = ConveyorCameraAdapterNode.__new__(ConveyorCameraAdapterNode)
+        adapter._roi_mode = mode
+        adapter._roi_edge_margin_px = DEFAULT_ROI_EDGE_MARGIN_PX
         adapter._roi_aim_distance_m = aim
         adapter._roi_radius_m = radius
         adapter._roi_min_x_ratio = 0.25
@@ -721,6 +741,404 @@ class ViewValidationTest(unittest.TestCase):
         depth = self._message(QUALITY_CAMERA_OPTICAL_FRAMES[0], width=16)
         with self.assertRaises(ValueError):
             ConveyorCameraAdapterNode._validate_view(rgb, depth, rgb)
+
+
+class FullFrameRoiTest(unittest.TestCase):
+    """The aim sphere throws away most of what the camera already sees.
+
+    At 0.40 m the top camera covers roughly 0.75 m of conveyor, but a 0.08 m
+    radius sphere uses 0.16 m of that. At the operating speed of 0.3-0.4 m/s the
+    sphere is crossed in under 0.53 s, which fits two instants at the current
+    gap; the full view is crossed in 1.87 s. full_frame mode makes the whole
+    visible strip the inspection region, bounded only by the image border.
+    """
+
+    @staticmethod
+    def _adapter(mode, margin=DEFAULT_ROI_EDGE_MARGIN_PX):
+        adapter = ConveyorCameraAdapterNode.__new__(ConveyorCameraAdapterNode)
+        adapter._roi_mode = mode
+        adapter._roi_edge_margin_px = margin
+        adapter._roi_aim_distance_m = 0.40
+        adapter._roi_radius_m = 0.08
+        adapter._roi_min_x_ratio = 0.25
+        adapter._roi_max_x_ratio = 0.75
+        return adapter
+
+    @staticmethod
+    def _camera_info():
+        return SimpleNamespace(k=[600.0, 0.0, 640.0, 0.0, 600.0, 360.0, 0.0, 0.0, 1.0])
+
+    @staticmethod
+    def _scene(centre_uv, depth_m=0.40, half=20):
+        mask = np.zeros((720, 1280), dtype=np.uint8)
+        u, v = centre_uv
+        mask[v - half : v + half, u - half : u + half] = 255
+        depth = np.zeros((720, 1280), dtype=np.uint16)
+        depth[mask > 0] = int(depth_m * 1000)
+        return mask, depth
+
+    def test_full_frame_is_the_default(self) -> None:
+        """Measured: the sphere yields two instants at the operating speed.
+
+        At 0.3-0.4 m/s a 0.08 m radius sphere is crossed in 0.40-0.53 s, which
+        fits two instants and about 55% coverage. The full view is crossed in
+        2.23 s. aim_sphere stays available for a deliberately narrow region.
+        """
+        self.assertEqual(DEFAULT_ROI_MODE, ROI_MODE_FULL_FRAME)
+
+    def test_apple_far_from_the_aim_point_is_kept_in_full_frame(self) -> None:
+        """This is the whole point: the sphere rejects it, the full view keeps it."""
+        mask, depth = self._scene((1000, 360))
+        info = self._camera_info()
+        self.assertFalse(
+            self._adapter(ROI_MODE_AIM_SPHERE)._view_in_roi(mask, depth, info)
+        )
+        self.assertTrue(
+            self._adapter(ROI_MODE_FULL_FRAME)._view_in_roi(mask, depth, info)
+        )
+
+    def test_apple_cut_by_the_image_edge_is_rejected(self) -> None:
+        """A truncated silhouette measures a surface that is not all there."""
+        mask = np.zeros((720, 1280), dtype=np.uint8)
+        mask[300:400, 0:40] = 255
+        depth = np.zeros((720, 1280), dtype=np.uint16)
+        self.assertFalse(
+            self._adapter(ROI_MODE_FULL_FRAME)._view_in_roi(
+                mask, depth, self._camera_info()
+            )
+        )
+
+    def test_apple_inside_the_margin_is_rejected(self) -> None:
+        adapter = self._adapter(ROI_MODE_FULL_FRAME, margin=50)
+        mask, depth = self._scene((60, 360), half=20)
+        self.assertFalse(adapter._view_in_roi(mask, depth, self._camera_info()))
+        # The same apple passes once the margin no longer reaches it.
+        relaxed = self._adapter(ROI_MODE_FULL_FRAME, margin=10)
+        self.assertTrue(relaxed._view_in_roi(mask, depth, self._camera_info()))
+
+    def test_full_frame_does_not_need_depth(self) -> None:
+        """Depth dropouts must not shrink the inspection region."""
+        mask, _ = self._scene((640, 360))
+        blank_depth = np.zeros((720, 1280), dtype=np.uint16)
+        self.assertTrue(
+            self._adapter(ROI_MODE_FULL_FRAME)._view_in_roi(
+                mask, blank_depth, self._camera_info()
+            )
+        )
+
+    def test_empty_mask_is_never_in_roi(self) -> None:
+        blank = np.zeros((720, 1280), dtype=np.uint8)
+        depth = np.zeros((720, 1280), dtype=np.uint16)
+        self.assertFalse(
+            self._adapter(ROI_MODE_FULL_FRAME)._view_in_roi(
+                blank, depth, self._camera_info()
+            )
+        )
+
+    def test_unknown_mode_is_rejected_rather_than_silently_ignored(self) -> None:
+        adapter = self._adapter("something_else")
+        mask, depth = self._scene((1000, 360))
+        # An unrecognised mode must not be treated as full_frame by accident.
+        self.assertFalse(adapter._view_in_roi(mask, depth, self._camera_info()))
+
+
+class SurfaceCoverageEstimateTest(unittest.TestCase):
+    """The estimate exists to make a short transit visible in the log."""
+
+    def test_reproduces_the_measured_anchors(self) -> None:
+        self.assertAlmostEqual(estimated_surface_coverage(1), 0.362, places=3)
+        self.assertAlmostEqual(estimated_surface_coverage(4), 0.870, places=3)
+        self.assertAlmostEqual(estimated_surface_coverage(8), 0.996, places=3)
+
+    def test_no_instants_cover_nothing(self) -> None:
+        self.assertEqual(estimated_surface_coverage(0), 0.0)
+        self.assertEqual(estimated_surface_coverage(-3), 0.0)
+
+    def test_increases_with_the_instant_count(self) -> None:
+        values = [estimated_surface_coverage(n) for n in range(0, 10)]
+        self.assertEqual(values, sorted(values))
+
+    def test_saturates_beyond_the_last_anchor(self) -> None:
+        self.assertEqual(
+            estimated_surface_coverage(50), estimated_surface_coverage(8)
+        )
+
+    def test_two_instants_report_far_below_the_target(self) -> None:
+        """0.4 m/s through the sphere yields two instants; the log must show it."""
+        self.assertLess(estimated_surface_coverage(2), 0.7)
+
+
+class MasterPositionTest(unittest.TestCase):
+    """Travel has to be measured in one frame, not an average of three.
+
+    _group_position_m averages coordinates belonging to three different optical
+    frames, so its value moves when a view drops out even though the apple did
+    not. The diagnostic needs a number that only changes when the apple does.
+    """
+
+    @staticmethod
+    def _views(*items):
+        return [
+            {"frame_index": index, "position_m": position}
+            for index, position in items
+        ]
+
+    def test_uses_the_lowest_numbered_camera_that_has_a_position(self) -> None:
+        views = self._views((2, (9.0, 9.0, 9.0)), (0, (1.0, 2.0, 3.0)))
+        self.assertEqual(
+            ConveyorCameraAdapterNode._master_position_m(views), (1.0, 2.0, 3.0)
+        )
+
+    def test_falls_through_to_the_next_camera_without_depth(self) -> None:
+        views = self._views((0, None), (1, (4.0, 5.0, 6.0)))
+        self.assertEqual(
+            ConveyorCameraAdapterNode._master_position_m(views), (4.0, 5.0, 6.0)
+        )
+
+    def test_is_none_when_no_view_has_depth(self) -> None:
+        views = self._views((0, None), (1, None))
+        self.assertIsNone(ConveyorCameraAdapterNode._master_position_m(views))
+
+    def test_stays_put_when_a_later_view_drops_out(self) -> None:
+        """The averaged position shifts here; the master position must not."""
+        full = self._views(
+            (0, (0.0, 0.0, 0.40)), (1, (0.02, 0.0, 0.40)), (2, (0.04, 0.0, 0.40))
+        )
+        reduced = full[:1]
+        self.assertEqual(
+            ConveyorCameraAdapterNode._master_position_m(full),
+            ConveyorCameraAdapterNode._master_position_m(reduced),
+        )
+        self.assertNotEqual(
+            ConveyorCameraAdapterNode._group_position_m(full),
+            ConveyorCameraAdapterNode._group_position_m(reduced),
+        )
+
+
+class SessionDiagnosticsTest(unittest.TestCase):
+    """The log has to state what the run measured, not what was assumed.
+
+    Every sizing constant in this node came from an assumed conveyor speed, and
+    the assumed value (0.055-0.06 m/s) is not the one being run (0.3-0.4 m/s).
+    These lines let the next set of values be computed from a transit instead.
+    """
+
+    def _capture(self, session, instants, budget=8):
+        adapter = ConveyorCameraAdapterNode.__new__(ConveyorCameraAdapterNode)
+        adapter._representative_instants = budget
+        lines = []
+        adapter.get_logger = lambda: SimpleNamespace(
+            info=lambda message: lines.append(("info", message)),
+            warn=lambda message: lines.append(("warn", message)),
+        )
+        adapter._log_session_diagnostics(session, instants)
+        return lines
+
+    @staticmethod
+    def _session(travel_m, duration_ns, histogram=None):
+        return {
+            "inspection_id": "inspection-1",
+            "path": [(0, (0.0, 0.0, 0.40)), (duration_ns, (travel_m, 0.0, 0.40))],
+            "views_histogram": histogram or {3: 4},
+        }
+
+    def test_reports_the_speed_the_run_actually_had(self) -> None:
+        lines = self._capture(self._session(0.16, 400_000_000), [{"stamp_ns": 0}] * 2)
+        transit = [text for level, text in lines if "transit" in text]
+        self.assertEqual(len(transit), 1)
+        self.assertIn("16.0 cm", transit[0])
+        self.assertIn("0.40s", transit[0])
+        self.assertIn("0.400 m/s", transit[0])
+
+    def test_warns_when_the_transit_ended_before_the_budget_filled(self) -> None:
+        lines = self._capture(self._session(0.16, 400_000_000), [{"stamp_ns": 0}] * 2)
+        warnings = [text for level, text in lines if level == "warn"]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("2/8 instants", warnings[0])
+
+    def test_a_full_budget_does_not_warn(self) -> None:
+        lines = self._capture(
+            self._session(0.746, 1_870_000_000), [{"stamp_ns": 0}] * 8
+        )
+        self.assertEqual([text for level, text in lines if level == "warn"], [])
+
+    def test_does_not_round_a_short_run_up_to_complete(self) -> None:
+        """99.6% must not print as 100%; the peel is not fully seen."""
+        lines = self._capture(
+            self._session(0.746, 1_870_000_000), [{"stamp_ns": 0}] * 8
+        )
+        coverage = [text for level, text in lines if "coverage" in text]
+        self.assertTrue(any("99.6%" in text for text in coverage))
+
+    def test_view_counts_are_reported_so_the_three_view_gate_is_visible(self) -> None:
+        lines = self._capture(
+            self._session(0.16, 400_000_000, histogram={1: 5, 3: 2}),
+            [{"stamp_ns": 0}] * 2,
+        )
+        spread = [text for level, text in lines if "views in ROI" in text]
+        self.assertEqual(len(spread), 1)
+        self.assertIn("1 view x5", spread[0])
+        self.assertIn("3 views x2", spread[0])
+
+    def test_a_session_without_positions_still_logs_the_shortfall(self) -> None:
+        """Depth can be absent for a whole transit; the warning still matters."""
+        lines = self._capture({"inspection_id": "x"}, [{"stamp_ns": 0}])
+        self.assertEqual(
+            [text for level, text in lines if "transit" in text], []
+        )
+        self.assertTrue(any(level == "warn" for level, _ in lines))
+
+    def test_a_single_position_cannot_produce_a_speed(self) -> None:
+        session = {
+            "inspection_id": "x",
+            "path": [(0, (0.0, 0.0, 0.40))],
+            "views_histogram": {3: 1},
+        }
+        lines = self._capture(session, [{"stamp_ns": 0}] * 8)
+        self.assertEqual([text for level, text in lines if "transit" in text], [])
+
+
+class ViewCountGatesTest(unittest.TestCase):
+    """Requiring every camera at once stopped inspections from opening at all.
+
+    Measured over 895 published frames: the top camera detected an apple in
+    7.7% of them, left in 16.5%, right in 15.1%, and the three never coincided
+    inside the ROI (in_roi stayed 0 for the whole run). The top view is the
+    worst because the overhead highlight drags its mean saturation to 27.9,
+    under the detector's floor of 35.
+
+    Coverage now comes from rotation across the transit rather than from
+    simultaneous views: three cameras at one instant still only reach 36.2% of
+    the peel, because all three look down from above and overlap heavily.
+    """
+
+    def test_defaults_do_not_require_every_camera(self) -> None:
+        self.assertEqual(DEFAULT_MIN_VIEWS_IN_ROI, 1)
+        self.assertEqual(DEFAULT_MIN_VIEWS_PER_INSTANT, 1)
+
+    @staticmethod
+    def _adapter(per_instant):
+        adapter = ConveyorCameraAdapterNode.__new__(ConveyorCameraAdapterNode)
+        adapter._namespaces = list(KNOWN_CAMERA_NAMESPACES)
+        adapter._min_views_per_instant = per_instant
+        adapter._representative_instants = 8
+        adapter._min_instant_gap_ns = 0
+        adapter._crop_margin_px = 0
+        adapter._session = {
+            "inspection_id": "i", "apple_id": "a", "candidates": 0,
+            "instants": [], "last_position_m": None, "path": [],
+            "views_histogram": {}, "frames_sent": 0,
+        }
+        adapter._group_position_m = lambda views: None
+        adapter._master_position_m = lambda views: None
+        adapter._view_sharpness = lambda image: 100.0
+        adapter._crop_view = lambda view: {"frame_index": view["frame_index"]}
+        return adapter
+
+    @staticmethod
+    def _views(count):
+        return [
+            {
+                "frame_index": i,
+                "position_m": None,
+                "confidence": 0.9,
+                "image": None,
+            }
+            for i in range(count)
+        ]
+
+    def test_a_single_view_instant_is_kept_when_one_is_enough(self) -> None:
+        adapter = self._adapter(per_instant=1)
+        adapter._consider_candidate(1_000, self._views(1))
+        self.assertEqual(len(adapter._session["instants"]), 1)
+
+    def test_a_single_view_instant_is_dropped_when_three_are_required(self) -> None:
+        adapter = self._adapter(per_instant=3)
+        adapter._consider_candidate(1_000, self._views(1))
+        self.assertEqual(adapter._session["instants"], [])
+
+    def test_a_full_group_is_kept_under_either_setting(self) -> None:
+        for per_instant in (1, 3):
+            adapter = self._adapter(per_instant=per_instant)
+            adapter._consider_candidate(1_000, self._views(3))
+            self.assertEqual(len(adapter._session["instants"]), 1)
+
+
+class FrameIndexContractTest(unittest.TestCase):
+    """frame_index must fill 0..total_frames-1 with no holes.
+
+    InspectionFrame rejects frame_index >= total_frames. The old scheme,
+    instant_ordinal * cameras + view_index, only satisfied that while every
+    instant carried every camera. Once an instant can hold one or two views,
+    total_frames shrinks but the stride stays at three, so the tail of the
+    inspection is refused by the receiver and the session never completes.
+    """
+
+    @staticmethod
+    def _publish(view_counts):
+        """Run the real _publish_group over instants of the given sizes."""
+        import conveyor_camera_adapter_node as module
+
+        adapter = ConveyorCameraAdapterNode.__new__(ConveyorCameraAdapterNode)
+        adapter._namespaces = list(KNOWN_CAMERA_NAMESPACES)
+        published = []
+        adapter._inspection_publisher = SimpleNamespace(
+            publish=lambda message: published.append(message)
+        )
+        adapter.get_logger = lambda: SimpleNamespace(debug=lambda *_: None)
+        adapter._header = lambda stamp, frame_id: SimpleNamespace(
+            stamp=stamp, frame_id=frame_id
+        )
+        adapter._compressed = lambda header, data, fmt: SimpleNamespace(data=b"x")
+        session = {"inspection_id": "i", "apple_id": "a", "frames_sent": 0}
+        total = sum(view_counts)
+
+        original = module.InspectionImage
+        module.InspectionImage = lambda: SimpleNamespace(
+            camera_info=SimpleNamespace(header=None)
+        )
+        original_encode = module.encode_image
+        module.encode_image = lambda suffix, array: b"x"
+        try:
+            for count in view_counts:
+                views = [
+                    {
+                        "frame_index": i,
+                        "rgb_message_stamp": 0,
+                        "rgb_message_frame_id": QUALITY_CAMERA_OPTICAL_FRAMES[i],
+                        "confidence": 0.9,
+                        "image": None,
+                        "apple_mask": None,
+                        "depth_mm": None,
+                        "ignore_mask": None,
+                        "camera_info": SimpleNamespace(header=None),
+                    }
+                    for i in range(count)
+                ]
+                adapter._publish_group(session, views, total)
+        finally:
+            module.InspectionImage = original
+            module.encode_image = original_encode
+        return [message.frame_index for message in published], total
+
+    def test_a_uniform_inspection_fills_the_range(self) -> None:
+        indices, total = self._publish([3, 3, 3])
+        self.assertEqual(indices, list(range(total)))
+
+    def test_uneven_instants_still_fill_the_range(self) -> None:
+        """This is the case the old stride-by-camera-count scheme broke on."""
+        indices, total = self._publish([1, 3, 2, 1])
+        self.assertEqual(total, 7)
+        self.assertEqual(indices, list(range(7)))
+
+    def test_single_view_instants_fill_the_range(self) -> None:
+        indices, total = self._publish([1, 1, 1, 1, 1, 1, 1, 1])
+        self.assertEqual(indices, list(range(8)))
+
+    def test_every_index_satisfies_the_receiver_contract(self) -> None:
+        indices, total = self._publish([1, 3, 2, 1])
+        self.assertTrue(all(0 <= index < total for index in indices))
+        self.assertEqual(len(set(indices)), len(indices))
 
 
 if __name__ == "__main__":

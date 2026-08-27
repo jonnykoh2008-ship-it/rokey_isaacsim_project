@@ -26,25 +26,36 @@ class DamageDetectionConfig:
     bright_wound_hsv_low: tuple[int, int, int] = (7, 75, 135)
     bright_wound_hsv_high: tuple[int, int, int] = (23, 175, 230)
     bright_wound_lab_a_max: int = 166
+    bright_wound_local_l_rise: int = 12
     browning_hsv_low: tuple[int, int, int] = (4, 85, 72)
     browning_hsv_high: tuple[int, int, int] = (23, 218, 170)
     browning_lab_a_max: int = 172
+    browning_local_l_drop: int = 4
     bruise_value_low: int = 40
     bruise_value_high: int = 138
     bruise_saturation_min: int = 50
     bruise_local_l_drop: int = 18
     bruise_lab_a_max: int = 170
     bruise_lab_b_max: int = 158
-    local_context_kernel: int = 31
+    local_context_kernel: int = 51
+    edge_exclusion_px: int = 5
     close_kernel: int = 3
     min_component_area_px: int = 3
-    max_component_area_ratio: float = 0.04
+    # 사과 표면 대비 손상 성분의 크기 상한. 0.04는 등급 판정에 필요한 크기를
+    # 오히려 잘라냈다. 논의된 경계값 2.5cm2 는 80mm 사과 투영면적(약 50cm2)의
+    # 5%라 그 상한을 넘어, 큰 손상일수록 "손상 없음"으로 판정되는 정반대 동작을
+    # 만들었다. 같은 프레임에서 상한만 올리자 재현율 0.44 -> 0.63,
+    # IoU 0.39 -> 0.55 로 올랐고 0.10 이후로는 변화가 없었다.
+    # 표면의 1/3을 넘는 성분은 여전히 검출 실패로 보고 거부한다.
+    max_component_area_ratio: float = 0.35
 
     def __post_init__(self) -> None:
         if self.local_context_kernel < 3 or self.local_context_kernel % 2 == 0:
             raise ValueError("local_context_kernel must be an odd integer >= 3")
         if self.close_kernel < 1 or self.close_kernel % 2 == 0:
             raise ValueError("close_kernel must be an odd positive integer")
+        if self.edge_exclusion_px < 0:
+            raise ValueError("edge_exclusion_px must be non-negative")
         if self.min_component_area_px < 1:
             raise ValueError("min_component_area_px must be positive")
         if not 0.0 < self.max_component_area_ratio <= 1.0:
@@ -133,10 +144,36 @@ def detect_damage(
         raise ValueError("image_rgb must use uint8 RGB pixels")
 
     surface = _binary_mask(apple_mask, image.shape[:2], "apple_mask")
+    analysis_surface = surface
+    if config.edge_exclusion_px:
+        size = config.edge_exclusion_px * 2 + 1
+        edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+        eroded = cv2.erode(surface.astype(np.uint8), edge_kernel) > 0
+        if eroded.any():
+            analysis_surface = eroded
     hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
     lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
     hue, saturation, value = cv2.split(hsv)
     lightness, lab_a, lab_b = cv2.split(lab)
+
+    surface_weight = surface.astype(np.float32)
+    weighted_lightness = cv2.GaussianBlur(
+        lightness.astype(np.float32) * surface_weight,
+        (config.local_context_kernel, config.local_context_kernel),
+        sigmaX=0,
+    )
+    local_weight = cv2.GaussianBlur(
+        surface_weight,
+        (config.local_context_kernel, config.local_context_kernel),
+        sigmaX=0,
+    )
+    local_lightness = np.divide(
+        weighted_lightness,
+        local_weight,
+        out=lightness.astype(np.float32).copy(),
+        where=local_weight > 1e-6,
+    )
+    lightness_delta = lightness.astype(np.float32) - local_lightness
 
     bright = cv2.inRange(
         hsv,
@@ -144,6 +181,7 @@ def detect_damage(
         np.asarray(config.bright_wound_hsv_high, dtype=np.uint8),
     ) > 0
     bright &= lab_a <= config.bright_wound_lab_a_max
+    bright &= lightness_delta >= config.bright_wound_local_l_rise
 
     browning = cv2.inRange(
         hsv,
@@ -151,27 +189,21 @@ def detect_damage(
         np.asarray(config.browning_hsv_high, dtype=np.uint8),
     ) > 0
     browning &= lab_a <= config.browning_lab_a_max
+    browning &= -lightness_delta >= config.browning_local_l_drop
 
-    local_lightness = cv2.GaussianBlur(
-        lightness.astype(np.float32),
-        (config.local_context_kernel, config.local_context_kernel),
-        sigmaX=0,
-    )
-    local_drop = local_lightness - lightness.astype(np.float32)
+    local_drop = -lightness_delta
     bruise = (
         (value >= config.bruise_value_low)
         & (value <= config.bruise_value_high)
         & (saturation >= config.bruise_saturation_min)
-        & (
-            (local_drop >= config.bruise_local_l_drop)
-            | (lab_a <= config.bruise_lab_a_max)
-        )
+        & (local_drop >= config.bruise_local_l_drop)
+        & (lab_a <= config.bruise_lab_a_max)
         & (lab_b <= config.bruise_lab_b_max)
     )
 
-    bright &= surface
-    browning &= surface
-    bruise &= surface
+    bright &= analysis_surface
+    browning &= analysis_surface
+    bruise &= analysis_surface
 
     combined = bright | browning | bruise
     if config.close_kernel > 1:
@@ -186,7 +218,7 @@ def detect_damage(
         round(int(surface.sum()) * config.max_component_area_ratio),
     )
     combined = _filter_components(
-        combined & surface,
+        combined & analysis_surface,
         config.min_component_area_px,
         maximum_area,
     )

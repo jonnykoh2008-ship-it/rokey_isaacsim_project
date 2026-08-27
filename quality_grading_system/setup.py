@@ -12,6 +12,8 @@ setup(
         "conveyor_camera_adapter_node",
         "depth_geometry",
         "inspection_session",
+        # 착색 기준 판정 경로.
+        "opencv_color_predictor",
         "opencv_size_grader",
         "predictor",
         "quality_inspection_node",

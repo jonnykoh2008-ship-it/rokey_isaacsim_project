@@ -37,9 +37,22 @@ frame과 최종 ROS namespace는 통합 계약에서 `TBD`다.
 - `arm_camera`
 - `base_rsd455_01` (robot_01의 USD camera 이름)
 - `base_rsd455_02` (robot_02의 USD camera 이름)
+- `quality_camera_top_optical_frame`
+- `quality_camera_left_optical_frame`
+- `quality_camera_right_optical_frame`
+- `conveyor_inspection_roi`
 - `tree_<id>`
 - `apple_<id>`
 - `conveyor_<id>`
+
+컨베이어 2의 품질검사 카메라는 3대이며 각각 고유한 optical frame을 가진다. 세
+frame 모두 `world`를 부모로 `/tf_static`에 발행한다. 하나의 `InspectionImage`는
+한 카메라에서 나오므로 그 메시지의 여섯 header는 모두 같은 optical frame을
+사용한다. GPU PC 2는 세 frame 중 하나가 아니면 프레임을 거부한다.
+
+`conveyor_inspection_roi`는 검사 ROI 자체의 frame이다. ROI 이탈은 카메라 사건이
+아니라 컨베이어의 물리 사건이므로 `InspectionCompleted`는 카메라 optical frame이
+아니라 이 frame을 사용한다.
 
 영상 target의 최종 `header.frame_id`는 `world`다. 개인 PC 1은 원본
 camera-frame 검출점과 촬영 timestamp를 보존한 뒤, 해당 timestamp에 가장 가까운
