@@ -2071,9 +2071,13 @@ def conveyor_place_pose(stage):
         )
         box = cache.ComputeWorldBound(plate).ComputeAlignedRange()
         center_x = 0.5 * (float(box.GetMin()[0]) + float(box.GetMax()[0]))
+        center_y = 0.5 * (float(box.GetMin()[1]) + float(box.GetMax()[1]))
         top_z = float(box.GetMax()[2])
-        # y=0.30: 이송 방향(-Y) 기준 탑뷰 카메라(y=-0.03) 앞쪽.
-        center = np.array([center_x, 0.30, top_z], dtype=float)
+        # 평면 중심(y=0.586)에 놓는다. 카메라 쪽(y=0.30)으로 당겨 봤더니
+        # robot_01 base 에서 1.57 m 로 팔 길이를 넘어 IK 해가 없었다.
+        # 평면이 롤러 위로 올라간 지금은 중심에 놓아도 -Y 이송으로
+        # 카메라(y=-0.03)까지 흘러가므로 당길 이유가 없다.
+        center = np.array([center_x, center_y, top_z], dtype=float)
     elif stage.GetPrimAtPath(RUNTIME_CONVEYOR_COLLIDER_PATH).IsValid():
         prim = stage.GetPrimAtPath(RUNTIME_CONVEYOR_COLLIDER_PATH)
         center = compute_live_prim_center(stage, RUNTIME_CONVEYOR_COLLIDER_PATH)
