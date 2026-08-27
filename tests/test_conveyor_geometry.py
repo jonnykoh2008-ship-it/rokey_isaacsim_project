@@ -26,6 +26,9 @@ def load_geometry_helpers():
             "compute_conveyor_target_geometry",
             "compute_direct_neutral_transfer",
             "select_conveyor_surface_layer",
+            "conveyor_surface_velocity_vector",
+            "conveyor_transport_velocity",
+            "apple_on_conveyor_surface",
         }:
             nodes.append(node)
     namespace = {"np": np}
@@ -34,12 +37,20 @@ def load_geometry_helpers():
         namespace["compute_conveyor_target_geometry"],
         namespace["compute_direct_neutral_transfer"],
         namespace["select_conveyor_surface_layer"],
+        namespace["conveyor_surface_velocity_vector"],
+        namespace["conveyor_transport_velocity"],
+        namespace["apple_on_conveyor_surface"],
     )
 
 
-compute_geometry, compute_neutral_transfer, select_surface_layer = (
-    load_geometry_helpers()
-)
+(
+    compute_geometry,
+    compute_neutral_transfer,
+    select_surface_layer,
+    compute_surface_velocity,
+    compute_transport_velocity,
+    apple_on_surface,
+) = load_geometry_helpers()
 
 
 class FakeBox:
@@ -138,3 +149,52 @@ def test_surface_layer_keeps_changed_width_without_using_high_frame_plane():
 def test_surface_layer_rejects_empty_candidates():
     with pytest.raises(ValueError, match="비어"):
         select_surface_layer([])
+
+
+def test_conveyor_speed_drives_world_surface_velocity():
+    velocity = compute_surface_velocity([2.0, 0.0, 0.0], 0.30)
+
+    np.testing.assert_allclose(velocity, [0.30, 0.0, 0.0])
+    with pytest.raises(ValueError, match="0 이상의"):
+        compute_surface_velocity([1.0, 0.0, 0.0], -0.1)
+    with pytest.raises(ValueError, match="진행 방향"):
+        compute_surface_velocity([0.0, 0.0, 0.0], 0.30)
+
+
+def test_conveyor_transport_fallback_changes_only_travel_axis_velocity():
+    corrected = compute_transport_velocity(
+        current_velocity=[0.02, -0.04, -0.10],
+        conveyor_direction=[1.0, 0.0, 0.0],
+        speed_mps=0.30,
+    )
+
+    np.testing.assert_allclose(corrected, [0.30, -0.04, -0.10])
+
+
+def test_geometric_belt_contact_accepts_apple_on_actual_surface_only():
+    minimum = [-1.0, -0.4, 0.50]
+    maximum = [1.0, 0.4, 0.54]
+
+    assert apple_on_surface([0.0, 0.0, 0.58], minimum, maximum, 0.04)
+    assert not apple_on_surface([0.0, 0.0, 0.70], minimum, maximum, 0.04)
+    assert not apple_on_surface([1.1, 0.0, 0.58], minimum, maximum, 0.04)
+
+
+def test_isaac_runtime_applies_surface_velocity_on_start_and_reset():
+    harvest_source = (PROJECT_DIR / "apple_pick.py").read_text(encoding="utf-8")
+    executor_source = (PROJECT_DIR / "vision_apple_pick.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "PhysxSurfaceVelocityAPI.Apply(collider)" in harvest_source
+    assert "CreateSurfaceVelocityLocalSpaceAttr().Set(False)" in harvest_source
+    assert "self._configure_surface_velocity()" in executor_source
+    lifecycle_source = executor_source.split(
+        "class ConveyorLifecycleRuntime:", 1
+    )[1].split("class MotionEngine:", 1)[0]
+    reset_source = lifecycle_source.split("    def reset(self):", 1)[1].split(
+        "    def close(self):", 1
+    )[0]
+    assert "self._configure_surface_velocity()" in reset_source
+    assert "get_physx_simulation_interface().wake_up(" in lifecycle_source
+    assert "conveyor_transport_velocity(" in lifecycle_source

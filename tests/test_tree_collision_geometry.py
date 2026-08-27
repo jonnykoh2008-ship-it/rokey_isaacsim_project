@@ -80,3 +80,49 @@ def test_rotated_branch_uses_local_axis_not_world_axis():
 
     np.testing.assert_allclose(center, [0.4, -0.2, 1.1], atol=1e-9)
     assert radius == pytest.approx(0.03, abs=1e-6)
+
+
+def test_harvest_branchbody_is_excluded_from_physx_and_planning_collision():
+    source = (PROJECT_DIR / "apple_pick.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    collect_function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_collect_tree_planning_geometry"
+    )
+    collect_source = ast.get_source_segment(source, collect_function)
+
+    assert "disable_branchbody_collisions(stage)" in source
+    assert "collision.CreateCollisionEnabledAttr(False).Set(False)" in source
+    assert "for root_path in (TREE_ROOT_PATH,):" in collect_source
+    assert "*BRANCH_BODY_PATHS" not in collect_source
+
+
+def test_empty_tree_proxy_set_has_infinite_clearance_instead_of_min_error():
+    source = (PROJECT_DIR / "apple_pick.py").read_text(encoding="utf-8")
+
+    assert 'return float("inf"), "no_planning_proxy"' in source
+    assert 'return float("inf"), "no_tree_proxy"' in source
+
+
+def test_unified_component_160_is_excluded_from_physx_and_planning():
+    source = (PROJECT_DIR / "apple_pick.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    functions = {
+        node.name: ast.get_source_segment(source, node)
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {
+            "configure_unified_tree_physx_colliders",
+            "_collect_tree_planning_geometry",
+        }
+    }
+
+    assert "EXCLUDED_UNIFIED_TREE_COMPONENT_INDICES = frozenset({160})" in source
+    assert "component_index in EXCLUDED_UNIFIED_TREE_COMPONENT_INDICES" in functions[
+        "configure_unified_tree_physx_colliders"
+    ]
+    assert "component_index in EXCLUDED_UNIFIED_TREE_COMPONENT_INDICES" in functions[
+        "_collect_tree_planning_geometry"
+    ]

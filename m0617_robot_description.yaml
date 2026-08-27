@@ -26,7 +26,11 @@ jerk_limits: [2000.0, 2000.0, 2500.0, 4000.0, 4000.0, 4000.0]
 # Lula IK와 RMPflow가 함께 사용하는 로봇 충돌 근사 형상이다. base_link부터
 # link_6까지는 URDF collision DAE의 삼각형 표면을 PCA 장축을 따라 약 50 mm
 # 간격으로 분할하고, 각 구가 담당하는 표면까지의 최대 거리에 10 mm를 더했다.
-# collision mesh가 없는 가상 gripper_frame만 조립 USD의 파지 범위를 근사한다.
+# collision mesh가 없는 가상 gripper_frame은 기존 palm/TCP 구 2개만 유지한다.
+# 세 손가락 형상 sphere를 여기에 추가하면 Lula의 나무 obstacle이 커져 기존의
+# 안전한 경로까지 막을 수 있다. 목표 사과에 대한 staging 검사는 apple_pick.py가
+# 실행 중인 실제 gripper collision mesh의 TCP 반경을 측정해 수학적으로 수행하며,
+# Stage 또는 planner에 추가 collider/proxy를 만들지 않는다.
 collision_spheres:
     # base_link: PCA axis [0.119698, 0.992370, 0.029575]
     - base_link:
